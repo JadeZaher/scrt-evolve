@@ -1,0 +1,40 @@
+# Demo: fine-tune gemma to be better at the scrt CLI memory-traversal interface.
+# Teacher = gpt-oss-20b via LM Studio (OpenAI-compatible, local, no auth).
+# Corpus = the scrt-cli repo (source of truth for the mp-* commands).
+
+[evolve]
+model_path = "C:/Users/atooz/.lmstudio/models/lmstudio-community/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf"
+corpus_dir = "C:/Users/atooz/Programming/ai-utils-memory/scrt-cli"
+work_dir   = "C:/Users/atooz/Programming/ai-utils-memory/scrt-evolve/demo/work"
+
+[discover]
+seed = "corpus"
+max_passages = 24
+dedup = "simhash"
+cluster = true
+# Target the memory-traversal / mind-palace interface specifically.
+corpus_patterns = [
+  "mp-stash", "mp-compose", "mp-intersect", "mp-graph", "mp-link",
+  "mp-similar", "mp-prune", "mind.?palace", "stash", "traversal",
+]
+
+[generate]
+backend = "api"
+# Mixed dataset: prose Q&A + structured tool calls + runnable CLI commands.
+kinds = ["qa", "instruction", "tool_call", "cli"]
+per_passage = 3
+tool_format = "gemma"      # render tool calls in Gemma's native tool_code block
+  [generate.api]
+  base_url = "http://localhost:1234/v1"
+  model = "openai/gpt-oss-20b"
+  # No api_key_env: LM Studio ignores auth (local endpoint).
+  turns = 1
+
+[train]
+preset = "lora"
+  [train.lora]
+  rank = 16
+  alpha = 32
+  target_modules = ["q_proj", "v_proj"]
+  lr = 2e-4
+  epochs = 1

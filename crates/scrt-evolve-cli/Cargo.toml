@@ -1,0 +1,25 @@
+[package]
+name = "scrt-evolve-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Thin CLI shim over the scrt-evolve SDK: discover | generate | train | run | init."
+
+[[bin]]
+name = "scrt-evolve"
+path = "src/main.rs"
+
+[features]
+default = []
+# Forward the SDK's `train` feature so `cargo build -p scrt-evolve-cli
+# --features train` enables candle end-to-end.
+train = ["scrt-evolve/train"]
+
+[dependencies]
+scrt-evolve = { path = "../scrt-evolve" }
+clap.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true

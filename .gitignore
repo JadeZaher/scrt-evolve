@@ -1,0 +1,17 @@
+# Rust build artifacts
+/target/
+
+# Backtrace / debug
+*.pdb
+
+# Environment
+.env
+.env.local
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+
+# OMC orchestration scratch state
+.omc/

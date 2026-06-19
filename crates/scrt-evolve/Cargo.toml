@@ -1,0 +1,37 @@
+[package]
+name = "scrt-evolve"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Make a model better at its own corpus, with no human labeling — discover → generate → train over a corpus + scrt mind-palace."
+
+[features]
+default = []
+# `train` opts into candle. A default build pulls NONE of it.
+train = ["dep:candle-core", "dep:candle-nn", "dep:safetensors", "dep:tokenizers"]
+# `pyo3` exposes the dataset + training-step seam to Python tooling.
+# A default build does NOT require Python headers.
+pyo3 = ["dep:pyo3"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+reqwest.workspace = true
+
+# scrt-core: retrieval engine, called in-process by the discover stage.
+scrt-core.workspace = true
+
+# ── ML (train feature, off by default) ──────────────────────────────────
+candle-core = { workspace = true, optional = true }
+candle-nn = { workspace = true, optional = true }
+safetensors = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+
+# ── Python bridge (pyo3 feature, off by default) ────────────────────────
+pyo3 = { workspace = true, optional = true }

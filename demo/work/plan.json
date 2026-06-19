@@ -1,0 +1,37 @@
+{
+  "round": 0,
+  "specs": [
+    {
+      "modality": "qa",
+      "prompt": "Generate short question/answer pairs that explain key scrt concepts such as mind‑palace structure, simhash usage for node comparison, traversal of palace graphs, and the purpose of stashes. Each Q&A should be self‑contained, use no code blocks, and focus on conceptual clarity suitable for a user familiar with command‑line tools.",
+      "count": 12,
+      "target_tools": [],
+      "rationale": "High need for conceptual grounding; QA is the top modality.",
+      "passage_shape": "conceptual"
+    },
+    {
+      "modality": "tool_call",
+      "prompt": "Create examples of structured tool calls that a user would emit when working with scrt. Include workflows that: 1) search code using `scrt_search` with various flag combinations, 2) stash results into a named slot via `scrt_stash`, 3) list stashes with `scrt_list_stashes`, 4) retrieve a stash with `scrt_get_stash`, 5) drop a stash with `scrt_drop_stash`, and 6) find similar stashes using `scrt_similar`. Each example should provide realistic arguments reflecting the most common flag co‑occurrences (e.g., --in, --mp-compose, --score).",
+      "count": 18,
+      "target_tools": [
+        "scrt_search",
+        "scrt_stash",
+        "scrt_list_stashes",
+        "scrt_get_stash",
+        "scrt_drop_stash",
+        "scrt_similar"
+      ],
+      "rationale": "Tool calls dominate the corpus; must cover all mandatory tools and high‑frequency flag combos.",
+      "passage_shape": "code"
+    },
+    {
+      "modality": "cli",
+      "prompt": "Write concise command‑line examples that a user would run in a terminal to perform common scrt tasks. Cover: searching with --in and --mp-compose, stashing results with --mp-stash, listing stashes, retrieving a stash, dropping a stash, and finding similar stashes with --mp-similar. Each example should be a single line starting with `scrt` and include realistic flag values.",
+      "count": 10,
+      "target_tools": [],
+      "rationale": "CLI references are present in the corpus; provide direct runnable examples.",
+      "passage_shape": "cli_ref"
+    }
+  ],
+  "strategy": "Cover scrt concepts with concise QA, then provide practical tool‑call and CLI examples that reflect the high‑frequency workflows in the corpus while ensuring mandatory stashing, searching, similarity, and traversal coverage."
+}

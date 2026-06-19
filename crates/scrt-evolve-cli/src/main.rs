@@ -1,0 +1,480 @@
+//! `scrt-evolve` — thin CLI shim over the scrt-evolve SDK.
+//!
+//! Subcommands: `init | discover | generate | export | train | run`. Each
+//! reads/writes the work-dir artifacts so stages are independently runnable:
+//! `discover` → `discovered.json`, `generate` → `dataset.jsonl`, `export` →
+//! llama.cpp fine-tune files. `train` (candle-native) is still a track-04 seam.
+
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use scrt_evolve::{EvolveConfig, WorkDir};
+
+#[derive(Parser)]
+#[command(
+    name = "scrt-evolve",
+    version,
+    about = "Make a model better at its own corpus — discover → generate → train."
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Scaffold a commented evolve.toml in the current directory.
+    Init {
+        #[arg(long, default_value = "evolve.toml")]
+        path: PathBuf,
+    },
+    /// Discover context from the corpus + palace → work_dir/discovered.json.
+    Discover {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+    },
+    /// Interview the human on training direction → work_dir/directive.json.
+    /// Prints the question set; answers are supplied via --answer id=value
+    /// (repeatable) for non-interactive use.
+    Interview {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        #[arg(long = "in")]
+        input: Option<PathBuf>,
+        /// Answer a question: --answer goal="tool-calling fluency" (repeatable).
+        #[arg(long = "answer", value_name = "ID=VALUE")]
+        answers: Vec<String>,
+        /// Skip the LLM follow-up questions (core questions only).
+        #[arg(long)]
+        core_only: bool,
+    },
+    /// Plan generation: planner LLM analyzes signals + directive → plan.json.
+    Plan {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// Override the discovered-context input (default: work_dir/discovered.json).
+        #[arg(long = "in")]
+        input: Option<PathBuf>,
+    },
+    /// Generate a dataset from discovered context → work_dir/dataset.jsonl.
+    Generate {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// Override the discovered-context input (default: work_dir/discovered.json).
+        #[arg(long = "in")]
+        input: Option<PathBuf>,
+        /// Override the configured backend (local | api).
+        #[arg(long)]
+        backend: Option<String>,
+        /// Self-route: let the planner decide modalities + write its own prompts
+        /// (uses work_dir/plan.json if present, else plans first). Runs the
+        /// gap-critic loop for this many follow-up rounds.
+        #[arg(long)]
+        self_route: bool,
+        /// Number of gap-critic follow-up rounds when --self-route is set.
+        #[arg(long, default_value_t = 1)]
+        gap_rounds: usize,
+    },
+    /// Export the dataset to llama.cpp fine-tune format (for GGUF models).
+    Export {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// Override the dataset input (default: work_dir/dataset.jsonl).
+        #[arg(long)]
+        data: Option<PathBuf>,
+        /// The base GGUF model to adapt (default: [evolve].model_path).
+        #[arg(long)]
+        model: Option<PathBuf>,
+    },
+    /// Train a model from a dataset → adapter / weights (candle, track 04).
+    Train {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        data: Option<PathBuf>,
+        #[arg(long)]
+        preset: Option<String>,
+    },
+    /// Run discover → generate (→ export) in one shot.
+    Run {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// Also export to llama.cpp fine-tune format after generating.
+        #[arg(long)]
+        export: bool,
+    },
+    /// Point at a PROJECT directory: auto-detect its mpg palace + corpus and run
+    /// the whole self-routing pipeline (discover → plan → generate → export).
+    Evolve {
+        /// The project directory to evolve a model against.
+        project: PathBuf,
+        /// Optional base evolve.toml supplying [generate]/[train] settings
+        /// (corpus_dir/palace_path are auto-detected and override the base).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Gap-critic follow-up rounds.
+        #[arg(long, default_value_t = 1)]
+        gap_rounds: usize,
+        /// Also export to llama.cpp format after generating.
+        #[arg(long)]
+        export: bool,
+    },
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Init { path } => cmd_init(&path),
+        Command::Discover { config } => {
+            let cfg = EvolveConfig::load(&config)?;
+            cmd_discover(&cfg)
+        }
+        Command::Interview { config, input, answers, core_only } => {
+            let cfg = EvolveConfig::load(&config)?;
+            cmd_interview(&cfg, input, answers, core_only)
+        }
+        Command::Plan { config, input } => {
+            let cfg = EvolveConfig::load(&config)?;
+            cmd_plan(&cfg, input)
+        }
+        Command::Generate { config, input, backend, self_route, gap_rounds } => {
+            let mut cfg = EvolveConfig::load(&config)?;
+            if let Some(b) = backend {
+                cfg.generate.get_or_insert_with(Default::default).backend = b;
+            }
+            if self_route {
+                cmd_generate_self_routed(&cfg, input, gap_rounds)
+            } else {
+                cmd_generate(&cfg, input)
+            }
+        }
+        Command::Export { config, data, model } => {
+            let cfg = EvolveConfig::load(&config)?;
+            cmd_export(&cfg, data, model)
+        }
+        Command::Train { config, data, preset } => {
+            let mut cfg = EvolveConfig::load(&config)?;
+            if let Some(p) = preset {
+                cfg.train.get_or_insert_with(Default::default).preset = p;
+            }
+            cmd_train(&cfg, data)
+        }
+        Command::Run { config, export } => {
+            let cfg = EvolveConfig::load(&config)?;
+            cmd_discover(&cfg)?;
+            cmd_generate(&cfg, None)?;
+            if export {
+                cmd_export(&cfg, None, None)?;
+            }
+            Ok(())
+        }
+        Command::Evolve { project, config, gap_rounds, export } => {
+            cmd_evolve(&project, config, gap_rounds, export)
+        }
+    }
+}
+
+fn cmd_init(path: &PathBuf) -> Result<()> {
+    let report = scrt_evolve::scaffold::init(path)?;
+    println!("wrote scaffold to {}", path.display());
+    if report.model_path_missing {
+        eprintln!(
+            "warning: the scaffolded `model_path` does not exist yet — \
+             edit [evolve].model_path in {} to point at your model directory \
+             before running.",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn cmd_discover(cfg: &EvolveConfig) -> Result<()> {
+    let wd = WorkDir::from_config(cfg);
+    wd.ensure()?;
+    let ctx = scrt_evolve::discover::run(cfg)?;
+    let path = wd.discovered_json();
+    let json = serde_json::to_string_pretty(&ctx)?;
+    std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
+    println!(
+        "discover: {} passages, {} anchors → {}",
+        ctx.passages.len(),
+        ctx.anchors.len(),
+        path.display()
+    );
+    Ok(())
+}
+
+fn load_discovered(
+    wd: &WorkDir,
+    input: Option<PathBuf>,
+) -> Result<scrt_evolve::DiscoveredContext> {
+    let in_path = input.unwrap_or_else(|| wd.discovered_json());
+    let text = std::fs::read_to_string(&in_path)
+        .with_context(|| format!("reading discovered context {}", in_path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("parsing {}", in_path.display()))
+}
+
+fn cmd_generate(cfg: &EvolveConfig, input: Option<PathBuf>) -> Result<()> {
+    let wd = WorkDir::from_config(cfg);
+    wd.ensure()?;
+    let ctx = load_discovered(&wd, input)?;
+
+    let dataset = scrt_evolve::generate::run(cfg, &ctx)?;
+    let out = wd.dataset_jsonl();
+    dataset.write_jsonl(&out)?;
+    println!("generate: {} rows → {}", dataset.len(), out.display());
+    Ok(())
+}
+
+/// Load the directive from work_dir/directive.json if present; else an empty
+/// directive (pure signal-driven planning). Warns when none is found so the
+/// human knows they ran without stating direction.
+fn load_directive(wd: &WorkDir) -> scrt_evolve::TrainingDirective {
+    let path = wd.root().join("directive.json");
+    match scrt_evolve::TrainingDirective::read(&path) {
+        Ok(d) => {
+            println!("using training directive: {}", path.display());
+            d
+        }
+        Err(_) => {
+            eprintln!(
+                "note: no directive.json — planning from signals only. Run \
+                 `scrt-evolve interview` to state training direction."
+            );
+            scrt_evolve::TrainingDirective::default()
+        }
+    }
+}
+
+fn cmd_interview(
+    cfg: &EvolveConfig,
+    input: Option<PathBuf>,
+    answers: Vec<String>,
+    core_only: bool,
+) -> Result<()> {
+    let wd = WorkDir::from_config(cfg);
+    wd.ensure()?;
+    let ctx = load_discovered(&wd, input)?;
+
+    let questions = if core_only {
+        scrt_evolve::interview::core_questions()
+    } else {
+        scrt_evolve::interview::build(cfg, &ctx)
+    };
+
+    // Parse --answer id=value pairs.
+    let mut answer_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for a in &answers {
+        if let Some((id, val)) = a.split_once('=') {
+            answer_map.insert(id.trim().to_string(), val.trim().to_string());
+        }
+    }
+
+    // If no answers were supplied, print the questions so the human can answer
+    // them (interactive terminals can pipe answers back via --answer).
+    if answer_map.is_empty() {
+        println!("# Evolution interview — answer with: --answer <id>=<value>\n");
+        for q in &questions {
+            let opts = if q.options.is_empty() {
+                String::new()
+            } else {
+                format!("  options: [{}]{}", q.options.join(", "), if q.multi { " (multi, comma-separated)" } else { "" })
+            };
+            println!("[{}] {}\n{}\n", q.id, q.text, opts);
+        }
+        println!("(no --answer given; not writing directive.json)");
+        return Ok(());
+    }
+
+    // Assemble the directive from whatever answers we got.
+    let qa: Vec<(scrt_evolve::interview::Question, String)> = questions
+        .into_iter()
+        .filter_map(|q| answer_map.get(&q.id).map(|v| (q.clone(), v.clone())))
+        .collect();
+    let directive = scrt_evolve::interview::assemble_directive(&qa);
+
+    let path = wd.root().join("directive.json");
+    directive.write(&path)?;
+    println!("wrote training directive → {}", path.display());
+    println!("{}", directive.prompt_block());
+    Ok(())
+}
+
+fn cmd_plan(cfg: &EvolveConfig, input: Option<PathBuf>) -> Result<()> {
+    let wd = WorkDir::from_config(cfg);
+    wd.ensure()?;
+    let ctx = load_discovered(&wd, input)?;
+    let directive = load_directive(&wd);
+
+    let plan = scrt_evolve::plan::planner::run(cfg, &ctx, &directive)?;
+    let out = wd.root().join("plan.json");
+    plan.write(&out)?;
+    println!(
+        "plan: {} specs ({} examples planned) → {}",
+        plan.specs.len(),
+        plan.total_count(),
+        out.display()
+    );
+    println!("strategy: {}", plan.strategy);
+    for s in &plan.specs {
+        println!(
+            "  - {:11} x{:<4} {}{}",
+            s.modality,
+            s.count,
+            if s.target_tools.is_empty() {
+                String::new()
+            } else {
+                format!("[{}] ", s.target_tools.join(","))
+            },
+            s.rationale.chars().take(80).collect::<String>()
+        );
+    }
+    Ok(())
+}
+
+fn cmd_generate_self_routed(
+    cfg: &EvolveConfig,
+    input: Option<PathBuf>,
+    gap_rounds: usize,
+) -> Result<()> {
+    let wd = WorkDir::from_config(cfg);
+    wd.ensure()?;
+    let ctx = load_discovered(&wd, input)?;
+    let directive = load_directive(&wd);
+
+    println!("self-route: planning + generating ({gap_rounds} gap round(s))…");
+    let result = scrt_evolve::plan::generate_self_routed(cfg, &ctx, &directive, gap_rounds)?;
+
+    // Persist the merged plan + dataset.
+    let plan_path = wd.root().join("plan.json");
+    result.plan.write(&plan_path)?;
+    let out = wd.dataset_jsonl();
+    result.dataset.write_jsonl(&out)?;
+
+    println!(
+        "self-route: {} specs across {} round(s), {} rows → {}",
+        result.plan.specs.len(),
+        result.plan.round + 1,
+        result.dataset.len(),
+        out.display()
+    );
+    println!("plan → {}", plan_path.display());
+    Ok(())
+}
+
+fn cmd_evolve(
+    project: &PathBuf,
+    config: Option<PathBuf>,
+    gap_rounds: usize,
+    export: bool,
+) -> Result<()> {
+    // 1. Resolve the project: auto-detect its mpg palace + corpus.
+    let layout = scrt_evolve::project::resolve(project)?;
+    println!("evolve: project = {}", layout.root.display());
+    println!("evolve: {}", layout.palace_note);
+
+    // 2. Build a config: corpus/palace auto-set, base supplies generate/train.
+    let base = match &config {
+        Some(p) => Some(EvolveConfig::load(p)?),
+        None => None,
+    };
+    let cfg = scrt_evolve::project::config_for_project(&layout, base);
+    let wd = WorkDir::from_config(&cfg);
+    wd.ensure()?;
+
+    // 3. Discover from the project corpus (+ palace if detected).
+    cmd_discover(&cfg)?;
+
+    // 4. Directive: reuse if present, else tell the human to interview.
+    let dir_path = wd.root().join("directive.json");
+    let directive = if dir_path.exists() {
+        scrt_evolve::TrainingDirective::read(&dir_path)?
+    } else {
+        eprintln!(
+            "evolve: no directive.json in {} — proceeding from signals only. \
+             Run `scrt-evolve interview` first to state training direction.",
+            wd.root().display()
+        );
+        scrt_evolve::TrainingDirective::default()
+    };
+
+    // 5. Self-route: plan (directive-driven) → generate → gap-critic loop.
+    let ctx = load_discovered(&wd, None)?;
+    println!("evolve: self-routing ({gap_rounds} gap round(s))…");
+    let result = scrt_evolve::plan::generate_self_routed(&cfg, &ctx, &directive, gap_rounds)?;
+    result.plan.write(wd.root().join("plan.json"))?;
+    let out = wd.dataset_jsonl();
+    result.dataset.write_jsonl(&out)?;
+    println!(
+        "evolve: {} specs / {} round(s), {} rows → {}",
+        result.plan.specs.len(),
+        result.plan.round + 1,
+        result.dataset.len(),
+        out.display()
+    );
+
+    // 6. Optional export.
+    if export {
+        cmd_export(&cfg, None, None)?;
+    }
+    Ok(())
+}
+
+/// Load the dataset and run training, printing the report. Thin shim — all
+/// orchestration lives in `scrt_evolve::train::run` (styleguide §1).
+fn cmd_train(cfg: &EvolveConfig, data: Option<PathBuf>) -> Result<()> {
+    let wd = WorkDir::from_config(cfg);
+    let data_path = data.unwrap_or_else(|| wd.dataset_jsonl());
+    let dataset = scrt_evolve::Dataset::read_jsonl(&data_path)
+        .with_context(|| format!("reading dataset {}", data_path.display()))?;
+
+    let report = scrt_evolve::train::run(cfg, &dataset)?;
+    println!(
+        "train: preset={} steps={} final_loss={}",
+        report.preset,
+        report.steps,
+        report
+            .final_loss
+            .map(|l| format!("{l:.4}"))
+            .unwrap_or_else(|| "n/a".to_string()),
+    );
+    if let Some(artifact) = &report.artifact {
+        println!("train: artifact → {}", artifact.display());
+    }
+    Ok(())
+}
+
+fn cmd_export(cfg: &EvolveConfig, data: Option<PathBuf>, model: Option<PathBuf>) -> Result<()> {
+    let wd = WorkDir::from_config(cfg);
+    let data_path = data.unwrap_or_else(|| wd.dataset_jsonl());
+    let dataset = scrt_evolve::Dataset::read_jsonl(&data_path)
+        .with_context(|| format!("reading dataset {}", data_path.display()))?;
+    let model_gguf = model
+        .or_else(|| cfg.evolve.model_path.clone())
+        .ok_or_else(|| anyhow::anyhow!("export: pass --model or set [evolve].model_path"))?;
+
+    let tool_format = scrt_evolve::ToolFormat::parse(
+        &cfg.generate.as_ref().map(|g| g.tool_format.clone()).unwrap_or_else(|| "gemma".into()),
+    );
+    let report = scrt_evolve::export_llamacpp(&dataset, wd.root(), &model_gguf, tool_format)?;
+    println!(
+        "export: {} examples → {} and {}",
+        report.example_count,
+        report.train_txt.display(),
+        report.chat_jsonl.display()
+    );
+    println!("\nllama.cpp fine-tune command:\n{}", report.suggested_command);
+    Ok(())
+}

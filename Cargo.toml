@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/scrt-evolve",
+    "crates/scrt-evolve-cli",
+]
+
+# A plain `cargo build` builds the SDK + CLI with NO ML and NO Python.
+# The `train` feature (candle) and `pyo3` feature (Python bridge) are opt-in
+# and built explicitly with `--features` / `-p` — mirroring how the scrt
+# workspace gates its `scrt-py` / `scrt-napi` FFI crates.
+default-members = [
+    "crates/scrt-evolve",
+    "crates/scrt-evolve-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.79"
+license = "MIT"
+repository = "https://github.com/JadeZaher/scrt-evolve"
+authors = ["scrt-evolve contributors"]
+
+# ── Shared dependency versions ──────────────────────────────────────────
+# Pinned here, referenced as `dep.workspace = true` in member crates so the
+# whole tree resolves one version of each. Rationale lives in DESIGN.md.
+[workspace.dependencies]
+# Config (toml) + the JSONL dataset contract.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+# Error ergonomics.
+anyhow = "1"
+thiserror = "2"
+# CLI arg parsing.
+clap = { version = "4", features = ["derive"] }
+# HTTP for the API GenBackend (rustls to avoid a system OpenSSL dependency).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
+
+# scrt-core — the retrieval engine, consumed as an in-process Rust crate.
+# Interim git dep pinned to a commit until scrt is published.
+# -> later: scrt-core = "0.1"   (crates.io) — swap tracked in track 08.
+scrt-core = { git = "https://github.com/JadeZaher/scrt-cli.git", package = "scrt-core", rev = "c768549" }
+
+# ML — candle, gated behind the `train` feature, OFF by default.
+candle-core = "0.8"
+candle-nn = "0.8"
+safetensors = "0.4"
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+
+# Python bridge — gated behind the `pyo3` feature, OFF by default.
+pyo3 = { version = "0.22", features = ["extension-module"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
