@@ -96,6 +96,15 @@ pub struct DiscoverConfig {
     /// so a corpus sweep finds something without configuration.
     #[serde(default = "default_corpus_patterns")]
     pub corpus_patterns: Vec<String>,
+    /// When `seed` includes `palace`, restrict seeding to stashes whose name,
+    /// note, search pattern, or any tag contains this case-insensitive
+    /// substring (scrt's `--mp-list-search`). `None` ⇒ all stashes seed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub palace_search: Option<String>,
+    /// When `seed` includes `palace`, restrict seeding to stashes carrying ALL
+    /// of these tags. Composes with `palace_search`. Empty ⇒ no tag filter.
+    #[serde(default)]
+    pub palace_tags: Vec<String>,
 }
 
 fn default_seed() -> String {
@@ -128,6 +137,8 @@ impl Default for DiscoverConfig {
             dedup: default_dedup(),
             cluster: default_cluster(),
             corpus_patterns: default_corpus_patterns(),
+            palace_search: None,
+            palace_tags: Vec::new(),
         }
     }
 }

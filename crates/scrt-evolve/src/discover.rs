@@ -138,7 +138,15 @@ fn build_seeds(dcfg: &DiscoverConfig, palace: Option<&FilePalace>) -> Vec<Seed> 
 
     if matches!(dcfg.seed.as_str(), "palace" | "both") {
         if let Some(p) = palace {
-            for (name, stash) in &p.data().stashes {
+            // Optionally narrow which stashes seed via scrt's `--mp-list-search`
+            // (substring over name/note/pattern/tags) and tag filter. Empty
+            // filters ⇒ every stash seeds, preserving prior behavior.
+            let selected = scrt_core::palace::ops::list_stashes(
+                p.data(),
+                &dcfg.palace_tags,
+                dcfg.palace_search.as_deref(),
+            );
+            for stash in selected {
                 // Prefer the stash's own search pattern; fall back to the note.
                 let pat = if !stash.search.pattern.trim().is_empty() {
                     stash.search.pattern.clone()
@@ -147,7 +155,7 @@ fn build_seeds(dcfg: &DiscoverConfig, palace: Option<&FilePalace>) -> Vec<Seed> 
                 };
                 if !pat.trim().is_empty() {
                     seeds.push(Seed {
-                        origin: name.clone(),
+                        origin: stash.name.clone(),
                         pattern: pat,
                     });
                 }

@@ -580,6 +580,8 @@ fn cmd_train(cfg: &EvolveConfig, data: Option<PathBuf>) -> Result<()> {
 /// (`python/scrt_evolve_train`). Loads a real HuggingFace causal-LM via
 /// `transformers` and LoRA-trains it on the dataset.jsonl. The candle path
 /// (`cmd_train`) is the fixture; this is the one that handles RoPE/GQA models.
+// Args mirror the `train` subcommand's flags 1:1; bundling them buys nothing.
+#[allow(clippy::too_many_arguments)]
 fn cmd_train_transformers(
     cfg: &EvolveConfig,
     data: Option<PathBuf>,
@@ -662,6 +664,8 @@ fn cmd_train_transformers(
 /// Reads base model path from cfg.evolve.model_path; adapter dir defaults to
 /// work_dir/adapter. All generation flags are passed through transparently.
 /// Mirrors the structure of cmd_train_transformers exactly.
+// Args mirror the `infer` subcommand's flags 1:1; bundling them buys nothing.
+#[allow(clippy::too_many_arguments)]
 fn cmd_infer(
     cfg: &EvolveConfig,
     adapter: Option<PathBuf>,

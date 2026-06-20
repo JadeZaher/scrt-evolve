@@ -41,7 +41,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # scrt-core — the retrieval engine, consumed as an in-process Rust crate.
 # Interim git dep pinned to a commit until scrt is published.
 # -> later: scrt-core = "0.1"   (crates.io) — swap tracked in track 08.
-scrt-core = { git = "https://github.com/JadeZaher/scrt-cli.git", package = "scrt-core", rev = "c768549" }
+scrt-core = { git = "https://github.com/JadeZaher/scrt-cli.git", package = "scrt-core", rev = "b22139d" }
 
 # ML — candle, gated behind the `train` feature, OFF by default.
 candle-core = "0.8"

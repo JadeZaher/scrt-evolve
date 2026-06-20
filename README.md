@@ -145,6 +145,13 @@ model_path  = "/models/my-model"      # the one required thing
 corpus_dir  = "./src"
 palace_path = ".mpg/mind-palace.json"
 
+[discover]
+seed = "palace"                        # palace | corpus | both
+palace_search = "auth"                 # only seed from stashes matching this
+                                       # (scrt's --mp-list-search; name/note/
+                                       # pattern/tag substring). omit ⇒ all stashes
+palace_tags = ["security"]             # and/or restrict to stashes with these tags
+
 [generate]
 backend = "api"                        # local | api
   [generate.api]
