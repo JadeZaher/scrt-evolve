@@ -162,6 +162,40 @@ enum Command {
         #[arg(long)]
         python: Option<String>,
     },
+    /// Merge a LoRA adapter into the base model and export a quantized GGUF
+    /// (for LM Studio / llama.cpp).
+    ///
+    /// Shells out to `python -m scrt_evolve_gguf`: merge (reusing the trainer's
+    /// LoRALinear) → `convert_hf_to_gguf.py` (f16) → `llama-quantize` (the
+    /// `--quant` type). Needs a llama.cpp checkout (auto-detected, or
+    /// `--llama-cpp`). Base model is read from [evolve].model_path.
+    ExportGguf {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// Adapter dir (adapter.safetensors + adapter_config.json).
+        /// Default: work_dir/adapter. Omit-adapter is not supported here —
+        /// pass the dir explicitly to override the default.
+        #[arg(long)]
+        adapter: Option<PathBuf>,
+        /// Output .gguf path. Default: work_dir/<model>-<quant>.gguf.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Quantization type: Q2_K | Q3_K_S | Q3_K_M | Q3_K_L | Q4_0 | Q4_K_M |
+        /// Q5_K_M | Q6_K | Q8_0 | f16 | none. Default Q4_K_M.
+        #[arg(long, default_value = "Q4_K_M")]
+        quant: String,
+        /// Path to a llama.cpp checkout (with convert_hf_to_gguf.py +
+        /// llama-quantize). Auto-detected if omitted (~/.unsloth/llama.cpp,
+        /// ~/llama.cpp, $LLAMA_CPP).
+        #[arg(long)]
+        llama_cpp: Option<PathBuf>,
+        /// Keep the intermediate merged HF dir and f16 GGUF.
+        #[arg(long)]
+        keep_intermediates: bool,
+        /// Python interpreter (torch + transformers + safetensors + gguf).
+        #[arg(long)]
+        python: Option<String>,
+    },
     /// Point at a PROJECT directory: auto-detect its mpg palace + corpus and run
     /// the whole self-routing pipeline (discover → plan → generate → export).
     Evolve {
@@ -279,6 +313,26 @@ fn run() -> Result<()> {
                 max_new_tokens,
                 temperature,
                 chat,
+                python,
+            )
+        }
+        Command::ExportGguf {
+            config,
+            adapter,
+            out,
+            quant,
+            llama_cpp,
+            keep_intermediates,
+            python,
+        } => {
+            let cfg = EvolveConfig::load(&config)?;
+            cmd_export_gguf(
+                &cfg,
+                adapter,
+                out,
+                &quant,
+                llama_cpp,
+                keep_intermediates,
                 python,
             )
         }
@@ -724,6 +778,68 @@ fn cmd_infer(
         .with_context(|| format!("launching `{py} -m scrt_evolve_infer`"))?;
     if !status.success() {
         anyhow::bail!("infer: python process exited with {status}");
+    }
+    Ok(())
+}
+
+/// Merge a LoRA adapter into the base model and export a quantized GGUF by
+/// shelling out to `python -m scrt_evolve_gguf` (merge → convert → quantize).
+#[allow(clippy::too_many_arguments)]
+fn cmd_export_gguf(
+    cfg: &EvolveConfig,
+    adapter: Option<PathBuf>,
+    out: Option<PathBuf>,
+    quant: &str,
+    llama_cpp: Option<PathBuf>,
+    keep_intermediates: bool,
+    python: Option<String>,
+) -> Result<()> {
+    let model_path =
+        cfg.evolve.model_path.clone().ok_or_else(|| {
+            anyhow::anyhow!("export-gguf: set [evolve].model_path in evolve.toml")
+        })?;
+
+    let wd = WorkDir::from_config(cfg);
+    let adapter_dir = adapter.unwrap_or_else(|| wd.root().join("adapter"));
+
+    let pkg_parent = find_python_pkg_dir()
+        .ok_or_else(|| anyhow::anyhow!("export-gguf: could not locate python/ dir"))?;
+
+    let py = python.unwrap_or_else(|| "python".to_string());
+    let mut cmd = std::process::Command::new(&py);
+    cmd.arg("-m")
+        .arg("scrt_evolve_gguf")
+        .arg("--model")
+        .arg(&model_path)
+        .arg("--adapter")
+        .arg(&adapter_dir)
+        .arg("--quant")
+        .arg(quant)
+        .env("PYTHONPATH", &pkg_parent);
+
+    if let Some(o) = &out {
+        cmd.arg("--out").arg(o);
+    }
+    if let Some(lc) = &llama_cpp {
+        cmd.arg("--llama-cpp").arg(lc);
+    }
+    if keep_intermediates {
+        cmd.arg("--keep-merged").arg("--keep-f16");
+    }
+
+    println!(
+        "export-gguf: {} -m scrt_evolve_gguf  (model={}, adapter={}, quant={})",
+        py,
+        model_path.display(),
+        adapter_dir.display(),
+        quant,
+    );
+
+    let status = cmd
+        .status()
+        .with_context(|| format!("launching `{py} -m scrt_evolve_gguf`"))?;
+    if !status.success() {
+        anyhow::bail!("export-gguf: python process exited with {status}");
     }
     Ok(())
 }

@@ -119,6 +119,9 @@ scrt-evolve train    --backend candle --preset lora                        # fix
 
 # run the resulting adapter, base vs tuned side by side
 scrt-evolve infer --prompt "What does scrt --mp-stash do?" --ab
+
+# merge the adapter into the base and export a quantized GGUF for LM Studio
+scrt-evolve export-gguf --quant Q4_K_M     # Q2_K…Q8_0 | f16 | none
 ```
 
 Everything the CLI does is also a library call — scrt-evolve is an SDK
