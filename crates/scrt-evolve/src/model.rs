@@ -377,7 +377,15 @@ mod train_impl {
                 .field("model_path", &self.model_path)
                 .field("config", &self.config)
                 .field("target_modules", &self.target_modules)
-                .field("num_vars", &self.var_map.data().lock().unwrap().len())
+                .field(
+                    "num_vars",
+                    &self
+                        .var_map
+                        .data()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .len(),
+                )
                 .finish_non_exhaustive()
         }
     }
@@ -502,7 +510,11 @@ mod train_impl {
         /// (e.g. `["q_proj", "v_proj"]`). Track 04 uses this to enumerate the
         /// modules a LoRA adapter wraps. Output is sorted for determinism.
         pub fn target_module_names(&self, targets: &[String]) -> Vec<String> {
-            let data = self.var_map.data().lock().unwrap();
+            let data = self
+                .var_map
+                .data()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let mut out: Vec<String> = data
                 .keys()
                 .filter(|name| {
@@ -546,14 +558,14 @@ mod train_impl {
     /// a weight does not shift the others' values for a given seed+config.
     fn seed_varmap(var_map: &mut VarMap, seed: u64, device: &Device) -> Result<(), ModelError> {
         let names: Vec<String> = {
-            let data = var_map.data().lock().unwrap();
+            let data = var_map.data().lock().unwrap_or_else(|e| e.into_inner());
             let mut n: Vec<String> = data.keys().cloned().collect();
             n.sort();
             n
         };
         for (ord, name) in names.iter().enumerate() {
             let (elem_count, shape) = {
-                let data = var_map.data().lock().unwrap();
+                let data = var_map.data().lock().unwrap_or_else(|e| e.into_inner());
                 let var = data
                     .get(name)
                     .ok_or_else(|| ModelError::Shape(format!("var vanished: {name}")))?;

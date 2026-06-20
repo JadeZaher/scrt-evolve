@@ -7,7 +7,10 @@ use scrt_evolve::EvolveConfig;
 /// + a per-test suffix is enough isolation for these tests).
 fn temp_path(suffix: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("scrt-evolve-test-{}-{suffix}.toml", std::process::id()));
+    p.push(format!(
+        "scrt-evolve-test-{}-{suffix}.toml",
+        std::process::id()
+    ));
     let _ = std::fs::remove_file(&p);
     p
 }

@@ -23,8 +23,7 @@ fn resolves_artifact_paths_under_default_work_dir() {
 
 #[test]
 fn honors_custom_work_dir() {
-    let cfg =
-        EvolveConfig::from_toml_str("[evolve]\nwork_dir = \"/tmp/run-42\"").unwrap();
+    let cfg = EvolveConfig::from_toml_str("[evolve]\nwork_dir = \"/tmp/run-42\"").unwrap();
     let wd = WorkDir::from_config(&cfg);
     assert_eq!(wd.root(), std::path::Path::new("/tmp/run-42"));
     assert_eq!(

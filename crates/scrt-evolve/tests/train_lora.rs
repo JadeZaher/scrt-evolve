@@ -86,7 +86,11 @@ fn overfit_tiny_batch_loss_decreases() {
 
     let first = first_loss.expect("a first-step loss");
     let final_loss = report.final_loss.expect("a final loss");
-    assert!(report.steps > 1, "expected multiple steps, got {}", report.steps);
+    assert!(
+        report.steps > 1,
+        "expected multiple steps, got {}",
+        report.steps
+    );
     assert!(
         final_loss < first,
         "loss must decrease: first={first} final={final_loss}"
@@ -98,7 +102,10 @@ fn overfit_tiny_batch_loss_decreases() {
         .train_detailed(&model2, &tiny_dataset(), &lcfg, None)
         .expect("train2");
     assert_eq!(first2, first_loss, "first loss must be deterministic");
-    assert_eq!(report2.final_loss, report.final_loss, "final loss deterministic");
+    assert_eq!(
+        report2.final_loss, report.final_loss,
+        "final loss deterministic"
+    );
 }
 
 #[test]
@@ -142,9 +149,8 @@ fn train_run_driver_routes_lora() {
 
     let mut cfg = EvolveConfig::default();
     cfg.evolve.model_path = Some(missing.clone());
-    cfg.evolve.work_dir = Some(
-        std::env::temp_dir().join(format!("scrt_evolve_driver_wd_{}", std::process::id())),
-    );
+    cfg.evolve.work_dir =
+        Some(std::env::temp_dir().join(format!("scrt_evolve_driver_wd_{}", std::process::id())));
     cfg.train = Some(TrainConfig {
         preset: "lora".to_string(),
         lora: Some(lora_cfg(4, 8, 1)),

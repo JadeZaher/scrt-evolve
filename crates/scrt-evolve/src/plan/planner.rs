@@ -69,7 +69,12 @@ fn user_prompt(signals: &Signals, ctx: &DiscoveredContext) -> String {
     for (i, p) in ctx.passages.iter().take(3).enumerate() {
         samples.push_str(&format!(
             "[sample {i} | shape={} | {}]\n{}\n\n",
-            signals.corpus_shape.per_passage.get(i).cloned().unwrap_or_default(),
+            signals
+                .corpus_shape
+                .per_passage
+                .get(i)
+                .cloned()
+                .unwrap_or_default(),
             p.source,
             p.text.chars().take(180).collect::<String>()
         ));
@@ -100,9 +105,7 @@ pub fn parse_plan(raw: &str) -> anyhow::Result<GenPlan> {
     if let Some(arr) = value.get("specs").and_then(|s| s.as_array()) {
         for v in arr {
             match serde_json::from_value::<GenSpec>(v.clone()) {
-                Ok(spec) if is_valid_modality(&spec.modality) && spec.count > 0 => {
-                    specs.push(spec)
-                }
+                Ok(spec) if is_valid_modality(&spec.modality) && spec.count > 0 => specs.push(spec),
                 _ => continue,
             }
         }
@@ -110,7 +113,11 @@ pub fn parse_plan(raw: &str) -> anyhow::Result<GenPlan> {
     if specs.is_empty() {
         anyhow::bail!("planner: produced no valid specs\nraw: {raw}");
     }
-    Ok(GenPlan { round: 0, specs, strategy })
+    Ok(GenPlan {
+        round: 0,
+        specs,
+        strategy,
+    })
 }
 
 fn is_valid_modality(m: &str) -> bool {

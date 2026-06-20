@@ -75,10 +75,7 @@ pub struct ScaffoldReport {
 pub fn init(path: impl AsRef<Path>) -> anyhow::Result<ScaffoldReport> {
     let path = path.as_ref();
     if path.exists() {
-        anyhow::bail!(
-            "{} already exists — refusing to overwrite",
-            path.display()
-        );
+        anyhow::bail!("{} already exists — refusing to overwrite", path.display());
     }
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -97,7 +94,5 @@ pub fn init(path: impl AsRef<Path>) -> anyhow::Result<ScaffoldReport> {
         .map(|p| !p.exists())
         .unwrap_or(true);
 
-    Ok(ScaffoldReport {
-        model_path_missing,
-    })
+    Ok(ScaffoldReport { model_path_missing })
 }

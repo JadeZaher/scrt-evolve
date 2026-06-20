@@ -22,13 +22,22 @@ pub struct ChatMessage {
 
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: "system".into(), content: content.into() }
+        Self {
+            role: "system".into(),
+            content: content.into(),
+        }
     }
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: content.into() }
+        Self {
+            role: "user".into(),
+            content: content.into(),
+        }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: "assistant".into(), content: content.into() }
+        Self {
+            role: "assistant".into(),
+            content: content.into(),
+        }
     }
 }
 
@@ -50,10 +59,9 @@ impl ApiEndpoint<HttpTransport> {
     /// clear error, not a panic). An empty/placeholder key is allowed for
     /// local endpoints (LM Studio, vLLM) that ignore auth.
     pub fn from_config(gcfg: &GenerateConfig) -> anyhow::Result<Self> {
-        let api = gcfg
-            .api
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("generate: backend=\"api\" needs a [generate.api] block"))?;
+        let api = gcfg.api.clone().ok_or_else(|| {
+            anyhow::anyhow!("generate: backend=\"api\" needs a [generate.api] block")
+        })?;
         let base_url = api
             .base_url
             .clone()
@@ -78,7 +86,11 @@ impl ApiEndpoint<HttpTransport> {
 
         let turns = api.turns.max(1);
         Ok(Self {
-            transport: HttpTransport { base_url, model, api_key },
+            transport: HttpTransport {
+                base_url,
+                model,
+                api_key,
+            },
             turns,
         })
     }
@@ -88,7 +100,10 @@ impl<T: ChatTransport> ApiEndpoint<T> {
     /// Construct with an explicit transport (used by tests and by callers that
     /// want a custom transport).
     pub fn with_transport(transport: T, turns: usize) -> Self {
-        Self { transport, turns: turns.max(1) }
+        Self {
+            transport,
+            turns: turns.max(1),
+        }
     }
 
     /// Consume the endpoint, yielding its transport (so the planner/critic can
@@ -107,10 +122,7 @@ impl<T: ChatTransport> GenBackend for ApiEndpoint<T> {
         // format, only steer *what* to generate within it. This is what keeps
         // self-routing from breaking the parser.
         let (base_system, user) = match ctx.mode {
-            GenMode::Prose => (
-                prompts::system_prompt(ctx.kinds),
-                prompts::user_prompt(ctx),
-            ),
+            GenMode::Prose => (prompts::system_prompt(ctx.kinds), prompts::user_prompt(ctx)),
             GenMode::ToolCall => (
                 prompts::tool_call_system_prompt(&toolspec::tools_prompt_block(ctx.tools)),
                 prompts::tool_call_user_prompt(ctx),

@@ -15,3 +15,18 @@ Thumbs.db
 
 # OMC orchestration scratch state
 .omc/
+
+# scrt mind-palace working memory (local scratch, not a project artifact)
+.mpg/
+
+# Conductor session scratch log
+conductor/.conductor_session_log
+
+# Python bytecode caches
+__pycache__/
+*.pyc
+
+# Scratch run dirs keep their config but ignore artifacts (see run-*/.gitignore);
+# belt-and-suspenders for any model weights / datasets that land at the root.
+*.safetensors
+*.gguf

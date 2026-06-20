@@ -1,0 +1,40 @@
+# Real end-to-end run: evolve TinyLlama-1.1B toward the scrt mind-palace (mp-*)
+# interface. Teacher = liquid/lfm2.5-1.2b served by LM Studio (OpenAI-compatible,
+# local, no auth). Corpus = the scrt-cli repo (source of truth for mp-* commands).
+# Training itself runs through the ported transformers LoRA trainer (real RoPE/GQA
+# model); the candle `train` feature is the fixture/mechanical path only.
+
+[evolve]
+model_path = "C:/Users/atooz/.cache/huggingface/hub/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6"
+corpus_dir = "C:/Users/atooz/Programming/ai-utils-memory/scrt-cli"
+work_dir   = "C:/Users/atooz/Programming/ai-utils-memory/scrt-evolve/run-tinyllama/work"
+
+[discover]
+seed = "corpus"
+max_passages = 120
+dedup = "simhash"
+cluster = true
+corpus_patterns = [
+  "mp-stash", "mp-compose", "mp-intersect", "mp-graph", "mp-link",
+  "mp-similar", "mp-prune", "mp-from", "mp-ttl", "mp-tag", "mp-related",
+  "mind.?palace", "stash", "traversal", "scrt ", "--in", "--effort", "window.?curve",
+]
+
+[generate]
+backend = "api"
+kinds = ["qa", "instruction"]
+per_passage = 4
+  [generate.api]
+  base_url = "http://localhost:1234/v1"
+  model = "liquid/lfm2.5-1.2b"
+  # No api_key_env: LM Studio ignores auth (local endpoint).
+  turns = 1
+
+[train]
+preset = "lora"
+  [train.lora]
+  rank = 16
+  alpha = 32
+  target_modules = ["q_proj", "v_proj"]
+  lr = 2e-4
+  epochs = 1

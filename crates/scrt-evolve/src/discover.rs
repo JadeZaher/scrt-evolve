@@ -61,14 +61,20 @@ pub fn run(cfg: &EvolveConfig) -> anyhow::Result<DiscoveredContext> {
         .clone()
         .ok_or_else(|| anyhow::anyhow!("discover: `[evolve].corpus_dir` is required"))?;
     if !corpus_dir.exists() {
-        anyhow::bail!("discover: corpus_dir does not exist: {}", corpus_dir.display());
+        anyhow::bail!(
+            "discover: corpus_dir does not exist: {}",
+            corpus_dir.display()
+        );
     }
 
     // Load the palace if discovery seeds from it.
     let seeds_from_palace = matches!(dcfg.seed.as_str(), "palace" | "both");
     let palace = if seeds_from_palace {
         let path = cfg.evolve.palace_path.clone().ok_or_else(|| {
-            anyhow::anyhow!("discover: seed=\"{}\" needs `[evolve].palace_path`", dcfg.seed)
+            anyhow::anyhow!(
+                "discover: seed=\"{}\" needs `[evolve].palace_path`",
+                dcfg.seed
+            )
         })?;
         Some(FilePalace::load(&path, &SystemClock))
     } else {
@@ -247,9 +253,7 @@ fn passage_from_node(node: &Node, origin: &str) -> (Passage, String) {
 fn dedup_passages(mut passages: Vec<(Passage, String)>) -> Vec<Passage> {
     // Stable order before dedup: by source then by text, so the survivor is
     // deterministic regardless of seed iteration order.
-    passages.sort_by(|(a, _), (b, _)| {
-        a.source.cmp(&b.source).then_with(|| a.text.cmp(&b.text))
-    });
+    passages.sort_by(|(a, _), (b, _)| a.source.cmp(&b.source).then_with(|| a.text.cmp(&b.text)));
 
     const HAMMING_DUP_THRESHOLD: u32 = 3; // ≤3 bits differ ⇒ near-identical
 
@@ -302,8 +306,11 @@ fn cluster_round_robin(passages: Vec<Passage>) -> Vec<Passage> {
     let mut groups: Vec<Vec<Passage>> = seed_names
         .iter()
         .map(|name| {
-            let mut g: Vec<Passage> =
-                passages.iter().filter(|p| &p.seed == name).cloned().collect();
+            let mut g: Vec<Passage> = passages
+                .iter()
+                .filter(|p| &p.seed == name)
+                .cloned()
+                .collect();
             g = rank_by_score(g);
             g
         })

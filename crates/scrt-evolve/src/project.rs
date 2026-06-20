@@ -77,10 +77,7 @@ pub fn resolve(project_dir: impl AsRef<Path>) -> anyhow::Result<ProjectLayout> {
 /// corpus/palace onto an optional base config (so `[generate]`/`[train]` from a
 /// base `evolve.toml` are preserved). The work-dir defaults to
 /// `<project>/.scrt-evolve` unless the base config sets one.
-pub fn config_for_project(
-    layout: &ProjectLayout,
-    base: Option<EvolveConfig>,
-) -> EvolveConfig {
+pub fn config_for_project(layout: &ProjectLayout, base: Option<EvolveConfig>) -> EvolveConfig {
     let mut cfg = base.unwrap_or_default();
     let seed_from_palace = layout.palace.is_some();
 

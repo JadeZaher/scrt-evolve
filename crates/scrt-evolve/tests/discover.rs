@@ -7,7 +7,10 @@ use scrt_evolve::EvolveConfig;
 /// near-duplicate line so dedup has something to collapse.
 fn fixture_corpus(suffix: &str) -> std::path::PathBuf {
     let mut dir = std::env::temp_dir();
-    dir.push(format!("scrt-evolve-corpus-{}-{suffix}", std::process::id()));
+    dir.push(format!(
+        "scrt-evolve-corpus-{}-{suffix}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -29,7 +32,12 @@ fn fixture_corpus(suffix: &str) -> std::path::PathBuf {
 }
 
 fn config_for(corpus: &std::path::Path, max_passages: usize, cluster: bool) -> EvolveConfig {
-    config_for_patterns(corpus, max_passages, cluster, &["mp-stash", "mp-compose", "mp-graph"])
+    config_for_patterns(
+        corpus,
+        max_passages,
+        cluster,
+        &["mp-stash", "mp-compose", "mp-graph"],
+    )
 }
 
 fn config_for_patterns(
@@ -85,8 +93,16 @@ fn near_duplicate_passages_collapse() {
     dir.push(format!("scrt-evolve-dedup-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("a.md"), "The mp-stash command stores a named stash.\n").unwrap();
-    std::fs::write(dir.join("b.md"), "The mp-stash command stores a named stash.\n").unwrap();
+    std::fs::write(
+        dir.join("a.md"),
+        "The mp-stash command stores a named stash.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("b.md"),
+        "The mp-stash command stores a named stash.\n",
+    )
+    .unwrap();
 
     let cfg = config_for_patterns(&dir, 100, false, &["mp-stash"]);
     let ctx = discover::run(&cfg).unwrap();
@@ -96,7 +112,10 @@ fn near_duplicate_passages_collapse() {
         .iter()
         .filter(|p| p.text.contains("mp-stash command stores a named stash"))
         .count();
-    assert_eq!(stash_passages, 1, "near-duplicate match lines must collapse");
+    assert_eq!(
+        stash_passages, 1,
+        "near-duplicate match lines must collapse"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -105,7 +124,10 @@ fn max_passages_is_honored() {
     let corpus = fixture_corpus("cap");
     let cfg = config_for(&corpus, 1, false);
     let ctx = discover::run(&cfg).unwrap();
-    assert!(ctx.passages.len() <= 1, "output must not exceed max_passages");
+    assert!(
+        ctx.passages.len() <= 1,
+        "output must not exceed max_passages"
+    );
     let _ = std::fs::remove_dir_all(&corpus);
 }
 

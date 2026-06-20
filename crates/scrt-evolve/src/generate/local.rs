@@ -73,7 +73,12 @@ impl LocalCandle {
         temperature: f32,
         seed: u64,
     ) -> Self {
-        Self { model, max_new_tokens, temperature, seed }
+        Self {
+            model,
+            max_new_tokens,
+            temperature,
+            seed,
+        }
     }
 
     /// Render the system+user prompt pair for `ctx` (identical to the API
@@ -151,21 +156,54 @@ fn restamp_local(rows: Vec<GenExample>) -> Vec<GenExample> {
         .map(|row| {
             let local = || Some("local".to_string());
             match row {
-                GenExample::Qa { prompt, completion, source, gen: _ } => GenExample::Qa {
+                GenExample::Qa {
+                    prompt,
+                    completion,
+                    source,
+                    gen: _,
+                } => GenExample::Qa {
                     prompt,
                     completion,
                     source,
                     gen: local(),
                 },
-                GenExample::Instruction { instruction, input, output, source, gen: _ } => {
-                    GenExample::Instruction { instruction, input, output, source, gen: local() }
-                }
-                GenExample::ToolCall { prompt, tool, arguments, source, gen: _ } => {
-                    GenExample::ToolCall { prompt, tool, arguments, source, gen: local() }
-                }
-                GenExample::Cli { prompt, command, source, gen: _ } => {
-                    GenExample::Cli { prompt, command, source, gen: local() }
-                }
+                GenExample::Instruction {
+                    instruction,
+                    input,
+                    output,
+                    source,
+                    gen: _,
+                } => GenExample::Instruction {
+                    instruction,
+                    input,
+                    output,
+                    source,
+                    gen: local(),
+                },
+                GenExample::ToolCall {
+                    prompt,
+                    tool,
+                    arguments,
+                    source,
+                    gen: _,
+                } => GenExample::ToolCall {
+                    prompt,
+                    tool,
+                    arguments,
+                    source,
+                    gen: local(),
+                },
+                GenExample::Cli {
+                    prompt,
+                    command,
+                    source,
+                    gen: _,
+                } => GenExample::Cli {
+                    prompt,
+                    command,
+                    source,
+                    gen: local(),
+                },
                 // Completion/Contrastive have no `gen` field — pass through.
                 other => other,
             }
@@ -199,9 +237,17 @@ pub fn filter_degenerate(rows: Vec<GenExample>) -> Vec<GenExample> {
 /// considered degenerate here.
 fn answer_and_prompt(row: &GenExample) -> Option<(&str, Option<&str>)> {
     match row {
-        GenExample::Qa { completion, prompt, .. } => Some((completion, Some(prompt))),
-        GenExample::Instruction { output, instruction, .. } => Some((output, Some(instruction))),
-        GenExample::Cli { command, prompt, .. } => Some((command, Some(prompt))),
+        GenExample::Qa {
+            completion, prompt, ..
+        } => Some((completion, Some(prompt))),
+        GenExample::Instruction {
+            output,
+            instruction,
+            ..
+        } => Some((output, Some(instruction))),
+        GenExample::Cli {
+            command, prompt, ..
+        } => Some((command, Some(prompt))),
         GenExample::Completion { text, .. } => Some((text, None)),
         // ToolCall's answer is structured args (validated by parse_examples);
         // Contrastive is not model prose. Neither is text-degenerate here.

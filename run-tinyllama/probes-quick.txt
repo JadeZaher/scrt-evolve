@@ -1,0 +1,4 @@
+What does the scrt --mp-stash command do?
+How do I save a search result as a named stash with scrt?
+What is the difference between --mp-compose and --mp-intersect in scrt?
+How do I set a time-to-live on a scrt stash?

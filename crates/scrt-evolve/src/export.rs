@@ -84,9 +84,9 @@ fn render_tool_call(
             }
             Ok(format!("```tool_code\n{tool}({})\n```", parts.join(", ")))
         }
-        ToolFormat::OpenAi => anyhow::bail!(
-            "export: tool_format=\"openai\" is not implemented yet (only \"gemma\")"
-        ),
+        ToolFormat::OpenAi => {
+            anyhow::bail!("export: tool_format=\"openai\" is not implemented yet (only \"gemma\")")
+        }
         ToolFormat::Anthropic => anyhow::bail!(
             "export: tool_format=\"anthropic\" is not implemented yet (only \"gemma\")"
         ),
@@ -98,10 +98,15 @@ fn render_tool_call(
 /// rendered in `fmt`; a render error (stubbed format) drops the row.
 fn row_to_pair(row: &GenExample, fmt: ToolFormat) -> Option<(String, String)> {
     match row {
-        GenExample::Qa { prompt, completion, .. } => {
-            Some((prompt.clone(), completion.clone()))
-        }
-        GenExample::Instruction { instruction, input, output, .. } => {
+        GenExample::Qa {
+            prompt, completion, ..
+        } => Some((prompt.clone(), completion.clone())),
+        GenExample::Instruction {
+            instruction,
+            input,
+            output,
+            ..
+        } => {
             let user = if input.trim().is_empty() {
                 instruction.clone()
             } else {
@@ -109,14 +114,17 @@ fn row_to_pair(row: &GenExample, fmt: ToolFormat) -> Option<(String, String)> {
             };
             Some((user, output.clone()))
         }
-        GenExample::ToolCall { prompt, tool, arguments, .. } => {
-            render_tool_call(tool, arguments, fmt)
-                .ok()
-                .map(|model_turn| (prompt.clone(), model_turn))
-        }
-        GenExample::Cli { prompt, command, .. } => {
-            Some((prompt.clone(), command.clone()))
-        }
+        GenExample::ToolCall {
+            prompt,
+            tool,
+            arguments,
+            ..
+        } => render_tool_call(tool, arguments, fmt)
+            .ok()
+            .map(|model_turn| (prompt.clone(), model_turn)),
+        GenExample::Cli {
+            prompt, command, ..
+        } => Some((prompt.clone(), command.clone())),
         // Raw completions train as-is; pretrain-style, not chat. Skip for the
         // instruction-tuning export.
         GenExample::Completion { .. } => None,
@@ -168,8 +176,14 @@ pub fn export_llamacpp(
         for (user, model) in &pairs {
             let rec = ChatRecord {
                 messages: vec![
-                    ChatTurn { role: "user", content: user.clone() },
-                    ChatTurn { role: "assistant", content: model.clone() },
+                    ChatTurn {
+                        role: "user",
+                        content: user.clone(),
+                    },
+                    ChatTurn {
+                        role: "assistant",
+                        content: model.clone(),
+                    },
                 ],
             };
             serde_json::to_writer(&mut f, &rec)?;

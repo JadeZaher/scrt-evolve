@@ -25,6 +25,7 @@ massively-parallel (MPP) execution** correct — not for taste alone.
 - **[MECH]** ML/Python stay behind features: a default `cargo build` + `cargo
   test` compiles with NO candle and NO Python. Feature-gated code (`train`,
   `pyo3`, `larql`) must not leak into the default build.
+- **[REVIEW]** Heavy-ML real-model path is Python (transformers), driven via subprocess over the dataset.jsonl contract (track 19). Candle code stays a fixture behind `--features train`. The default Rust build remains ML-free AND Python-free — the Python path is invoked as an external subprocess, never linked into the binary.
 - **[REVIEW]** Doc-comment every public item; module headers explain the *why*
   (match the existing `//!` headers).
 

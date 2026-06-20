@@ -153,13 +153,15 @@ fn empty_config_loads_with_defaults() {
 fn require_model_path_errors_when_absent() {
     let cfg = EvolveConfig::from_toml_str("[train]\npreset = \"lora\"").unwrap();
     let err = cfg.require_model_path("train").unwrap_err();
-    assert!(matches!(err, ConfigError::MissingModelPath { stage: "train" }));
+    assert!(matches!(
+        err,
+        ConfigError::MissingModelPath { stage: "train" }
+    ));
 }
 
 #[test]
 fn require_model_path_ok_when_present() {
-    let cfg =
-        EvolveConfig::from_toml_str("[evolve]\nmodel_path = \"/models/m\"").unwrap();
+    let cfg = EvolveConfig::from_toml_str("[evolve]\nmodel_path = \"/models/m\"").unwrap();
     assert_eq!(
         cfg.require_model_path("train").unwrap(),
         std::path::Path::new("/models/m")
@@ -188,26 +190,28 @@ fn inline_secret_with_spaces_is_rejected() {
   api_key_env = "my literal key value"
 "#;
     let err = EvolveConfig::from_toml_str(toml).unwrap_err();
-    assert!(matches!(err, ConfigError::InlineSecret { .. }), "got {err:?}");
+    assert!(
+        matches!(err, ConfigError::InlineSecret { .. }),
+        "got {err:?}"
+    );
 }
 
 #[test]
 fn inline_secret_long_token_is_rejected() {
     // 40+ char single token reads as a key, not an env var name.
     let long = "A".repeat(48);
-    let toml = format!(
-        "[generate]\n  [generate.api]\n  api_key_env = \"{long}\"\n"
-    );
+    let toml = format!("[generate]\n  [generate.api]\n  api_key_env = \"{long}\"\n");
     let err = EvolveConfig::from_toml_str(&toml).unwrap_err();
-    assert!(matches!(err, ConfigError::InlineSecret { .. }), "got {err:?}");
+    assert!(
+        matches!(err, ConfigError::InlineSecret { .. }),
+        "got {err:?}"
+    );
 }
 
 #[test]
 fn valid_env_var_name_is_accepted() {
     for name in ["SCRT_EVOLVE_API_KEY", "MY_KEY", "_X", "OPENAI_API_KEY"] {
-        let toml = format!(
-            "[generate]\n  [generate.api]\n  api_key_env = \"{name}\"\n"
-        );
+        let toml = format!("[generate]\n  [generate.api]\n  api_key_env = \"{name}\"\n");
         EvolveConfig::from_toml_str(&toml)
             .unwrap_or_else(|e| panic!("`{name}` should be a valid env var name, got {e:?}"));
     }

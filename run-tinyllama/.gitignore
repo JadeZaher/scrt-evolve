@@ -1,0 +1,4 @@
+# This is a scratch run dir for an end-to-end real-model test
+# (discover -> generate -> transformers LoRA). Keep the config, ignore artifacts.
+work/
+adapter/

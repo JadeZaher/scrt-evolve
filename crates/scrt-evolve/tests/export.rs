@@ -4,7 +4,10 @@ use scrt_evolve::dataset::{Dataset, GenExample};
 
 fn temp_dir(suffix: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("scrt-evolve-export-{}-{suffix}", std::process::id()));
+    p.push(format!(
+        "scrt-evolve-export-{}-{suffix}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&p);
     p
 }
@@ -79,7 +82,10 @@ fn tool_call_rows_render_in_gemma_tool_code_format() {
 
     let corpus = std::fs::read_to_string(&report.train_txt).unwrap();
     // Gemma native tool-call block with a Python-style call.
-    assert!(corpus.contains("```tool_code"), "expected tool_code block:\n{corpus}");
+    assert!(
+        corpus.contains("```tool_code"),
+        "expected tool_code block:\n{corpus}"
+    );
     assert!(corpus.contains("scrt_stash("));
     assert!(corpus.contains("name=\"auth\""));
     assert!(corpus.contains("note=\"Auth findings\""));

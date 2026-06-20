@@ -246,7 +246,11 @@ pub fn summary(signals: &Signals) -> String {
     if !signals.palace.tag_frequency.is_empty() {
         let mut tags: Vec<_> = signals.palace.tag_frequency.iter().collect();
         tags.sort_by(|a, b| b.1.cmp(a.1));
-        let top: Vec<String> = tags.iter().take(12).map(|(k, v)| format!("{k}({v})")).collect();
+        let top: Vec<String> = tags
+            .iter()
+            .take(12)
+            .map(|(k, v)| format!("{k}({v})"))
+            .collect();
         s.push_str(&format!("top tags: {}\n", top.join(", ")));
     }
     for st in signals.palace.stashes.iter().take(15) {
@@ -265,23 +269,42 @@ pub fn summary(signals: &Signals) -> String {
     tools.sort_by(|a, b| b.1.cmp(a.1));
     s.push_str(&format!(
         "tools: {}\n",
-        tools.iter().map(|(k, v)| format!("{k}({v})")).collect::<Vec<_>>().join(", ")
+        tools
+            .iter()
+            .map(|(k, v)| format!("{k}({v})"))
+            .collect::<Vec<_>>()
+            .join(", ")
     ));
     let mut flags: Vec<_> = signals.cooccurrence.flag_frequency.iter().collect();
     flags.sort_by(|a, b| b.1.cmp(a.1));
-    let topflags: Vec<String> = flags.iter().take(20).map(|(k, v)| format!("{k}({v})")).collect();
+    let topflags: Vec<String> = flags
+        .iter()
+        .take(20)
+        .map(|(k, v)| format!("{k}({v})"))
+        .collect();
     s.push_str(&format!("top flags: {}\n", topflags.join(", ")));
     let mut pairs: Vec<_> = signals.cooccurrence.pairs.iter().collect();
     pairs.sort_by(|a, b| b.1.cmp(a.1));
-    let toppairs: Vec<String> = pairs.iter().take(15).map(|(k, v)| format!("{k}({v})")).collect();
-    s.push_str(&format!("top co-occurring workflows: {}\n", toppairs.join(", ")));
+    let toppairs: Vec<String> = pairs
+        .iter()
+        .take(15)
+        .map(|(k, v)| format!("{k}({v})"))
+        .collect();
+    s.push_str(&format!(
+        "top co-occurring workflows: {}\n",
+        toppairs.join(", ")
+    ));
 
     s.push_str("\n## Corpus shape\n");
     let mut shapes: Vec<_> = signals.corpus_shape.shape_counts.iter().collect();
     shapes.sort_by(|a, b| b.1.cmp(a.1));
     s.push_str(&format!(
         "passage shapes: {}\n",
-        shapes.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(", ")
+        shapes
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     ));
 
     s

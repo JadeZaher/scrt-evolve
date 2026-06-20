@@ -7,7 +7,7 @@ use scrt_evolve::dataset::{Dataset, GenExample};
 use scrt_evolve::discover::{DiscoveredContext, Passage};
 use scrt_evolve::generate::api::{ApiEndpoint, ChatMessage, ChatTransport};
 use scrt_evolve::generate::run_plan_with_backend;
-use scrt_evolve::plan::critic::{measure, critique_with_transport};
+use scrt_evolve::plan::critic::{critique_with_transport, measure};
 use scrt_evolve::plan::planner::{parse_plan, plan_with_transport};
 use scrt_evolve::plan::signals;
 use scrt_evolve::plan::{GenPlan, GenSpec};
@@ -80,7 +80,14 @@ fn signals_extract_tool_and_shape() {
     let sig = signals::extract(&cfg, &ctx);
 
     // Tool frequency picks up scrt_stash from the first passage.
-    assert!(sig.cooccurrence.tool_frequency.get("scrt_stash").copied().unwrap_or(0) >= 1);
+    assert!(
+        sig.cooccurrence
+            .tool_frequency
+            .get("scrt_stash")
+            .copied()
+            .unwrap_or(0)
+            >= 1
+    );
     // Flag frequency picks up --mp-stash.
     assert!(sig.cooccurrence.flag_frequency.contains_key("--mp-stash"));
     // Two passages classified into shapes.
@@ -117,7 +124,10 @@ fn planner_parses_self_written_plan() {
     assert_eq!(plan.specs.len(), 2);
     assert_eq!(plan.specs[0].modality, "tool_call");
     assert_eq!(plan.specs[0].count, 20);
-    assert_eq!(plan.specs[0].target_tools, vec!["scrt_stash", "scrt_get_stash"]);
+    assert_eq!(
+        plan.specs[0].target_tools,
+        vec!["scrt_stash", "scrt_get_stash"]
+    );
     assert_eq!(plan.strategy, "weight tool_call toward stash workflows");
 }
 
@@ -165,7 +175,12 @@ fn plan_driven_generation_uses_spec_prompt_and_routes_modality() {
 #[test]
 fn coverage_measure_counts_modalities_and_tools() {
     let ds = Dataset::new(vec![
-        GenExample::Qa { prompt: "q".into(), completion: "a".into(), source: None, gen: None },
+        GenExample::Qa {
+            prompt: "q".into(),
+            completion: "a".into(),
+            source: None,
+            gen: None,
+        },
         GenExample::ToolCall {
             prompt: "p".into(),
             tool: "scrt_stash".into(),
@@ -202,7 +217,10 @@ fn gap_critic_plans_followup_then_empty_when_balanced() {
     let none_resp = r#"{"strategy":"balanced","specs":[]}"#;
     let t2 = MockTransport::new(vec![none_resp]);
     let done = critique_with_transport(&t2, &sig, &cov, &tools, 2).unwrap();
-    assert!(done.specs.is_empty(), "balanced coverage yields no follow-up specs");
+    assert!(
+        done.specs.is_empty(),
+        "balanced coverage yields no follow-up specs"
+    );
 }
 
 #[test]
@@ -225,10 +243,16 @@ fn directive_assembles_from_answers_and_renders() {
     let qs = core_questions();
     let find = |id: &str| qs.iter().find(|q| q.id == id).unwrap().clone();
     let answers: Vec<(Question, String)> = vec![
-        (find("goal"), "tool-calling fluency for memory traversal".into()),
+        (
+            find("goal"),
+            "tool-calling fluency for memory traversal".into(),
+        ),
         (find("priorities"), "tool_call, cli".into()),
         (find("must_cover"), "scrt_stash, scrt_get_stash".into()),
-        (find("exclusions"), "destructive commands, prose trivia".into()),
+        (
+            find("exclusions"),
+            "destructive commands, prose trivia".into(),
+        ),
         (find("max_rows"), "40".into()),
     ];
     let d = assemble_directive(&answers);

@@ -40,8 +40,7 @@ impl ChatTransport for MockTransport {
 fn fixture_ctx() -> DiscoveredContext {
     DiscoveredContext {
         passages: vec![Passage {
-            text: "scrt --mp-stash NAME stores the current search as a named stash."
-                .to_string(),
+            text: "scrt --mp-stash NAME stores the current search as a named stash.".to_string(),
             source: "README.md".to_string(),
             score: 10.0,
             seed: "corpus:stash".to_string(),
@@ -65,7 +64,12 @@ fn mocked_backend_produces_qa_and_instruction_rows() {
     assert_eq!(dataset.len(), 2);
     // Provenance is injected by the parser from the passage.
     match &dataset.rows[0] {
-        GenExample::Qa { prompt, source, gen, .. } => {
+        GenExample::Qa {
+            prompt,
+            source,
+            gen,
+            ..
+        } => {
             assert!(prompt.contains("stash"));
             assert_eq!(source.as_deref(), Some("README.md"));
             assert_eq!(gen.as_deref(), Some("api"));
@@ -83,7 +87,8 @@ fn mocked_backend_produces_qa_and_instruction_rows() {
 
 #[test]
 fn parser_tolerates_markdown_fenced_array() {
-    let response = "Here you go:\n```json\n[{\"kind\":\"qa\",\"prompt\":\"q\",\"completion\":\"a\"}]\n```";
+    let response =
+        "Here you go:\n```json\n[{\"kind\":\"qa\",\"prompt\":\"q\",\"completion\":\"a\"}]\n```";
     let backend = ApiEndpoint::with_transport(MockTransport::new(vec![response]), 1);
     let dataset = run_with_backend(&backend, &fixture_ctx(), &["qa".into()], 1).unwrap();
     assert_eq!(dataset.len(), 1);
@@ -132,7 +137,10 @@ fn dataset_round_trips_through_jsonl() {
             source: None,
             gen: None,
         },
-        GenExample::Completion { text: "raw".into(), source: None },
+        GenExample::Completion {
+            text: "raw".into(),
+            source: None,
+        },
         GenExample::Contrastive {
             query: "auth".into(),
             positive: "login.rs".into(),
@@ -164,7 +172,10 @@ fn missing_api_key_env_is_a_clear_error() {
     };
     let result = ApiEndpoint::from_config(&gcfg);
     let msg = result.err().expect("missing key must error").to_string();
-    assert!(msg.contains(var), "error should name the missing var: {msg}");
+    assert!(
+        msg.contains(var),
+        "error should name the missing var: {msg}"
+    );
 }
 
 #[test]
@@ -182,7 +193,13 @@ fn tool_call_rows_validate_against_real_schemas() {
 
     assert_eq!(dataset.len(), 1, "only the schema-valid tool call survives");
     match &dataset.rows[0] {
-        GenExample::ToolCall { tool, arguments, source, gen, .. } => {
+        GenExample::ToolCall {
+            tool,
+            arguments,
+            source,
+            gen,
+            ..
+        } => {
             assert_eq!(tool, "scrt_stash");
             assert_eq!(arguments["name"], "auth");
             assert_eq!(source.as_deref(), Some("README.md"));

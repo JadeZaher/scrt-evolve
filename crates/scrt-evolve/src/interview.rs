@@ -191,9 +191,7 @@ pub fn build(cfg: &EvolveConfig, ctx: &DiscoveredContext) -> Vec<Question> {
 /// Assemble a [`TrainingDirective`](crate::directive::TrainingDirective) from
 /// (question, answer) pairs. Answers for list fields are split on commas;
 /// `max_rows` parses as a number; unknown/`notes` answers accumulate into notes.
-pub fn assemble_directive(
-    answers: &[(Question, String)],
-) -> crate::directive::TrainingDirective {
+pub fn assemble_directive(answers: &[(Question, String)]) -> crate::directive::TrainingDirective {
     use crate::directive::TrainingDirective;
     let mut d = TrainingDirective::default();
     let mut notes = Vec::new();

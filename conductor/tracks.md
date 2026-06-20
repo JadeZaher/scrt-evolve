@@ -99,6 +99,7 @@ self-evolve lane (10–15: transformers/peft/trl drive the heavy ML workflows).
 | **02** | [generate-api-backend](tracks/02-generate-api-backend/) | 3 | `GenBackend` trait, `ApiEndpoint` impl, prompt templates, `Dataset` JSONL writer/reader, **dataset→Python export over the PyO3 bridge**. End-to-end discover→dataset, no local model. | 01 |
 | **03** | [generate-local-candle](tracks/03-generate-local-candle/) | 4 | `LocalCandle` GenBackend (candle inference) behind the same trait + `train` feature. | 02 |
 | **04** | [train-lora](tracks/04-train-lora/) | 5 | `TrainingPreset` trait, model loader (`model.rs` per-arch seam, ONE arch first), LoRA injection + training loop → `adapter.safetensors`. **PyO3 training-step seam** so `peft`/`trl` can drive it. | 02 (data), 03 (model loader shared) |
+| **19** | [python-train-infer](tracks/19-python-train-infer/) | — (core validation) | Standalone Python `scrt_evolve_train` (transformers LoRA) + `scrt_evolve_infer` (base+adapter A/B), driven from the Rust CLI via subprocess. The **PRIMARY real-model training/inference path** (candle = fixture). dataset.jsonl is the contract. | 02 (dataset), 03/04 (candle fixture it validates) |
 | **05** | [train-contrastive](tracks/05-train-contrastive/) | 6 | Port the in-tree InfoNCE embedding-adapter seam → `contrastive` preset (consumes palace structure directly). | 04 (trait), 01 (palace access) |
 | **06** | [train-full-pretrain](tracks/06-train-full-pretrain/) | 7 | `full` finetune + `pretrain` (continued causal-LM on raw corpus) presets. | 04 |
 | **07** | [train-shard](tracks/07-train-shard/) | 8 | Decentralized `shard` preset (coordinator + worker) reusing the **hivemind tensor wire format + coordinator/worker topology** via the PyO3 bridge. Small trusted cluster only. | 06, 04 |
@@ -133,7 +134,10 @@ self-evolve lane (10–15: transformers/peft/trl drive the heavy ML workflows).
 - After **08**: builds against published scrt-core; first tagged release.
 
 ## Honest risks carried across tracks (DESIGN.md §Honest risks)
-- candle's finetuning ecosystem is thin — per-arch model loaders are hand-built; start with ONE arch (track 04), expand as backlog.
+
+**NOTE (Amendment 2026-06-20):** The candle `train`/`local` backends (tracks 03/04) are confirmed **fixture/mechanical paths only** and cannot load real pretrained models (RoPE/GQA/BF16). The real-model training/inference path is **Python/transformers** (track 19), driven via subprocess over the dataset.jsonl contract — primary, fully validated, and consistent with the lane directive. See DESIGN.md §Amendment 2026-06-20 and track 19 spec for details.
+
+- candle's finetuning ecosystem is thin — per-arch model loaders are hand-built; start with ONE arch (track 04), expand as backlog. **Candle paths are fixture-only; real-model training via track 19 (Python backend).**
 - Local-gen quality can collapse (echo chamber) — ship API-first (02 before 03), treat local-gen as lower-trust.
 - Shard training is genuinely hard — v1 bar is a small trusted cluster, deliberately last (07).
 - The quality premise is unproven — the gated LongMemEval-style measurement is out of scope for these build tracks.

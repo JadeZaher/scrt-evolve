@@ -3,7 +3,8 @@
 //! Subcommands: `init | discover | generate | export | train | run`. Each
 //! reads/writes the work-dir artifacts so stages are independently runnable:
 //! `discover` → `discovered.json`, `generate` → `dataset.jsonl`, `export` →
-//! llama.cpp fine-tune files. `train` (candle-native) is still a track-04 seam.
+//! llama.cpp fine-tune files, `train` → `adapter.safetensors` (candle, behind
+//! the `train` feature).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -88,7 +89,14 @@ enum Command {
         #[arg(long)]
         model: Option<PathBuf>,
     },
-    /// Train a model from a dataset → adapter / weights (candle, track 04).
+    /// Train a model from a dataset → adapter.
+    ///
+    /// `--backend candle` (default) uses the in-tree candle preset — a
+    /// fixture/mechanical path (tiny hand-built arch; overfit-a-tiny-batch).
+    /// `--backend transformers` shells out to the standalone Python trainer
+    /// (`python/scrt_evolve_train`) which loads a REAL HuggingFace causal-LM
+    /// (RoPE/GQA/BF16) via `transformers` and LoRA-trains it — the real-model
+    /// path. The dataset.jsonl is the shared contract between both.
     Train {
         #[arg(long, default_value = "evolve.toml")]
         config: PathBuf,
@@ -96,6 +104,22 @@ enum Command {
         data: Option<PathBuf>,
         #[arg(long)]
         preset: Option<String>,
+        /// `candle` (fixture) | `transformers` (real model via Python).
+        #[arg(long, default_value = "candle")]
+        backend: String,
+        /// Python interpreter for `--backend transformers` (must have torch +
+        /// transformers + safetensors). Defaults to `python`.
+        #[arg(long)]
+        python: Option<String>,
+        /// Override the adapter output dir (default: work_dir/adapter).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// `transformers` backend: number of training steps.
+        #[arg(long, default_value_t = 40)]
+        steps: usize,
+        /// `transformers` backend: max sequence length.
+        #[arg(long, default_value_t = 256)]
+        max_seq_len: usize,
     },
     /// Run discover → generate (→ export) in one shot.
     Run {
@@ -104,6 +128,39 @@ enum Command {
         /// Also export to llama.cpp fine-tune format after generating.
         #[arg(long)]
         export: bool,
+    },
+    /// Run inference with an optional LoRA adapter; compare base vs adapter (--ab).
+    ///
+    /// Shells out to `python -m scrt_evolve_infer`. Reads the base model path
+    /// from [evolve].model_path in the config. When --adapter is omitted, defaults
+    /// to work_dir/adapter (the standard output location of `train --backend
+    /// transformers`). Use --ab to see base and adapter outputs side-by-side.
+    Infer {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// Directory containing adapter.safetensors + adapter_config.json.
+        /// Default: work_dir/adapter.
+        #[arg(long)]
+        adapter: Option<PathBuf>,
+        /// The prompt to generate from. Required.
+        #[arg(long)]
+        prompt: String,
+        /// Show base model and adapter outputs side-by-side.
+        #[arg(long)]
+        ab: bool,
+        /// Maximum number of new tokens to generate. Default: 128.
+        #[arg(long, default_value_t = 128)]
+        max_new_tokens: usize,
+        /// Sampling temperature. 0 = greedy (default). >0 = sampling.
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f32,
+        /// Wrap the prompt in the tokenizer's chat template before generating.
+        #[arg(long)]
+        chat: bool,
+        /// Python interpreter (must have torch + transformers + safetensors).
+        /// Default: python.
+        #[arg(long)]
+        python: Option<String>,
     },
     /// Point at a PROJECT directory: auto-detect its mpg palace + corpus and run
     /// the whole self-routing pipeline (discover → plan → generate → export).
@@ -141,7 +198,12 @@ fn run() -> Result<()> {
             let cfg = EvolveConfig::load(&config)?;
             cmd_discover(&cfg)
         }
-        Command::Interview { config, input, answers, core_only } => {
+        Command::Interview {
+            config,
+            input,
+            answers,
+            core_only,
+        } => {
             let cfg = EvolveConfig::load(&config)?;
             cmd_interview(&cfg, input, answers, core_only)
         }
@@ -149,7 +211,13 @@ fn run() -> Result<()> {
             let cfg = EvolveConfig::load(&config)?;
             cmd_plan(&cfg, input)
         }
-        Command::Generate { config, input, backend, self_route, gap_rounds } => {
+        Command::Generate {
+            config,
+            input,
+            backend,
+            self_route,
+            gap_rounds,
+        } => {
             let mut cfg = EvolveConfig::load(&config)?;
             if let Some(b) = backend {
                 cfg.generate.get_or_insert_with(Default::default).backend = b;
@@ -160,16 +228,59 @@ fn run() -> Result<()> {
                 cmd_generate(&cfg, input)
             }
         }
-        Command::Export { config, data, model } => {
+        Command::Export {
+            config,
+            data,
+            model,
+        } => {
             let cfg = EvolveConfig::load(&config)?;
             cmd_export(&cfg, data, model)
         }
-        Command::Train { config, data, preset } => {
+        Command::Train {
+            config,
+            data,
+            preset,
+            backend,
+            python,
+            out,
+            steps,
+            max_seq_len,
+        } => {
             let mut cfg = EvolveConfig::load(&config)?;
             if let Some(p) = preset {
                 cfg.train.get_or_insert_with(Default::default).preset = p;
             }
-            cmd_train(&cfg, data)
+            match backend.as_str() {
+                "candle" => cmd_train(&cfg, data),
+                "transformers" => {
+                    cmd_train_transformers(&cfg, data, python, out, steps, max_seq_len)
+                }
+                other => anyhow::bail!(
+                    "train: unknown backend \"{other}\" (expected candle | transformers)"
+                ),
+            }
+        }
+        Command::Infer {
+            config,
+            adapter,
+            prompt,
+            ab,
+            max_new_tokens,
+            temperature,
+            chat,
+            python,
+        } => {
+            let cfg = EvolveConfig::load(&config)?;
+            cmd_infer(
+                &cfg,
+                adapter,
+                &prompt,
+                ab,
+                max_new_tokens,
+                temperature,
+                chat,
+                python,
+            )
         }
         Command::Run { config, export } => {
             let cfg = EvolveConfig::load(&config)?;
@@ -180,9 +291,12 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
-        Command::Evolve { project, config, gap_rounds, export } => {
-            cmd_evolve(&project, config, gap_rounds, export)
-        }
+        Command::Evolve {
+            project,
+            config,
+            gap_rounds,
+            export,
+        } => cmd_evolve(&project, config, gap_rounds, export),
     }
 }
 
@@ -216,10 +330,7 @@ fn cmd_discover(cfg: &EvolveConfig) -> Result<()> {
     Ok(())
 }
 
-fn load_discovered(
-    wd: &WorkDir,
-    input: Option<PathBuf>,
-) -> Result<scrt_evolve::DiscoveredContext> {
+fn load_discovered(wd: &WorkDir, input: Option<PathBuf>) -> Result<scrt_evolve::DiscoveredContext> {
     let in_path = input.unwrap_or_else(|| wd.discovered_json());
     let text = std::fs::read_to_string(&in_path)
         .with_context(|| format!("reading discovered context {}", in_path.display()))?;
@@ -275,7 +386,8 @@ fn cmd_interview(
     };
 
     // Parse --answer id=value pairs.
-    let mut answer_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut answer_map: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for a in &answers {
         if let Some((id, val)) = a.split_once('=') {
             answer_map.insert(id.trim().to_string(), val.trim().to_string());
@@ -290,7 +402,15 @@ fn cmd_interview(
             let opts = if q.options.is_empty() {
                 String::new()
             } else {
-                format!("  options: [{}]{}", q.options.join(", "), if q.multi { " (multi, comma-separated)" } else { "" })
+                format!(
+                    "  options: [{}]{}",
+                    q.options.join(", "),
+                    if q.multi {
+                        " (multi, comma-separated)"
+                    } else {
+                        ""
+                    }
+                )
             };
             println!("[{}] {}\n{}\n", q.id, q.text, opts);
         }
@@ -456,6 +576,169 @@ fn cmd_train(cfg: &EvolveConfig, data: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Real-model training path: shell out to the standalone Python trainer
+/// (`python/scrt_evolve_train`). Loads a real HuggingFace causal-LM via
+/// `transformers` and LoRA-trains it on the dataset.jsonl. The candle path
+/// (`cmd_train`) is the fixture; this is the one that handles RoPE/GQA models.
+fn cmd_train_transformers(
+    cfg: &EvolveConfig,
+    data: Option<PathBuf>,
+    python: Option<String>,
+    out: Option<PathBuf>,
+    steps: usize,
+    max_seq_len: usize,
+) -> Result<()> {
+    let wd = WorkDir::from_config(cfg);
+    let data_path = data.unwrap_or_else(|| wd.dataset_jsonl());
+    if !data_path.exists() {
+        anyhow::bail!(
+            "train(transformers): dataset not found at {} — run `generate` first",
+            data_path.display()
+        );
+    }
+    let model_path = cfg
+        .evolve
+        .model_path
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("train(transformers): set [evolve].model_path"))?;
+    let out_dir = out.unwrap_or_else(|| wd.root().join("adapter"));
+
+    // LoRA hyperparameters from [train.lora] (or defaults).
+    let lora = cfg
+        .train
+        .as_ref()
+        .and_then(|t| t.lora.clone())
+        .unwrap_or_default();
+    let targets = lora.target_modules.join(",");
+
+    // Locate the python/ package dir: it ships next to the repo root. Search
+    // upward from the current dir for a `python/scrt_evolve_train` so the CLI
+    // works from a checkout regardless of cwd.
+    let pkg_parent = find_python_pkg_dir()
+        .ok_or_else(|| anyhow::anyhow!("train(transformers): could not locate python/ dir"))?;
+
+    let py = python.unwrap_or_else(|| "python".to_string());
+    let mut cmd = std::process::Command::new(&py);
+    cmd.arg("-m")
+        .arg("scrt_evolve_train")
+        .arg("--dataset")
+        .arg(&data_path)
+        .arg("--model")
+        .arg(&model_path)
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--steps")
+        .arg(steps.to_string())
+        .arg("--max-seq-len")
+        .arg(max_seq_len.to_string())
+        .arg("--lr")
+        .arg(lora.lr.to_string())
+        .arg("--rank")
+        .arg(lora.rank.to_string())
+        .arg("--alpha")
+        .arg(lora.alpha.to_string())
+        .arg("--target-modules")
+        .arg(&targets)
+        .env("PYTHONPATH", &pkg_parent);
+
+    println!(
+        "train(transformers): {} -m scrt_evolve_train  (model={}, {} steps)",
+        py,
+        model_path.display(),
+        steps
+    );
+    let status = cmd
+        .status()
+        .with_context(|| format!("launching `{py} -m scrt_evolve_train`"))?;
+    if !status.success() {
+        anyhow::bail!("train(transformers): trainer exited with {status}");
+    }
+    println!("train(transformers): adapter → {}", out_dir.display());
+    Ok(())
+}
+
+/// Inference shim: shell out to `python -m scrt_evolve_infer`.
+///
+/// Reads base model path from cfg.evolve.model_path; adapter dir defaults to
+/// work_dir/adapter. All generation flags are passed through transparently.
+/// Mirrors the structure of cmd_train_transformers exactly.
+fn cmd_infer(
+    cfg: &EvolveConfig,
+    adapter: Option<PathBuf>,
+    prompt: &str,
+    ab: bool,
+    max_new_tokens: usize,
+    temperature: f32,
+    chat: bool,
+    python: Option<String>,
+) -> Result<()> {
+    let model_path = cfg
+        .evolve
+        .model_path
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("infer: set [evolve].model_path in evolve.toml"))?;
+
+    let wd = WorkDir::from_config(cfg);
+    let adapter_dir = adapter.unwrap_or_else(|| wd.root().join("adapter"));
+
+    let pkg_parent = find_python_pkg_dir()
+        .ok_or_else(|| anyhow::anyhow!("infer: could not locate python/ dir"))?;
+
+    let py = python.unwrap_or_else(|| "python".to_string());
+    let mut cmd = std::process::Command::new(&py);
+    cmd.arg("-m")
+        .arg("scrt_evolve_infer")
+        .arg("--model")
+        .arg(&model_path)
+        .arg("--adapter")
+        .arg(&adapter_dir)
+        .arg("--prompt")
+        .arg(prompt)
+        .arg("--max-new-tokens")
+        .arg(max_new_tokens.to_string())
+        .arg("--temperature")
+        .arg(temperature.to_string())
+        .env("PYTHONPATH", &pkg_parent);
+
+    if ab {
+        cmd.arg("--ab");
+    }
+    if chat {
+        cmd.arg("--chat");
+    }
+
+    println!(
+        "infer: {} -m scrt_evolve_infer  (model={}, adapter={}{})",
+        py,
+        model_path.display(),
+        adapter_dir.display(),
+        if ab { ", --ab" } else { "" },
+    );
+
+    let status = cmd
+        .status()
+        .with_context(|| format!("launching `{py} -m scrt_evolve_infer`"))?;
+    if !status.success() {
+        anyhow::bail!("infer: python process exited with {status}");
+    }
+    Ok(())
+}
+
+/// Find the directory that should be on `PYTHONPATH` so `scrt_evolve_train`
+/// imports: the `python/` dir holding the package. Walks up from cwd.
+fn find_python_pkg_dir() -> Option<PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        let candidate = dir.join("python");
+        if candidate.join("scrt_evolve_train").is_dir() {
+            return Some(candidate);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
 fn cmd_export(cfg: &EvolveConfig, data: Option<PathBuf>, model: Option<PathBuf>) -> Result<()> {
     let wd = WorkDir::from_config(cfg);
     let data_path = data.unwrap_or_else(|| wd.dataset_jsonl());
@@ -466,7 +749,10 @@ fn cmd_export(cfg: &EvolveConfig, data: Option<PathBuf>, model: Option<PathBuf>)
         .ok_or_else(|| anyhow::anyhow!("export: pass --model or set [evolve].model_path"))?;
 
     let tool_format = scrt_evolve::ToolFormat::parse(
-        &cfg.generate.as_ref().map(|g| g.tool_format.clone()).unwrap_or_else(|| "gemma".into()),
+        &cfg.generate
+            .as_ref()
+            .map(|g| g.tool_format.clone())
+            .unwrap_or_else(|| "gemma".into()),
     );
     let report = scrt_evolve::export_llamacpp(&dataset, wd.root(), &model_gguf, tool_format)?;
     println!(
@@ -475,6 +761,9 @@ fn cmd_export(cfg: &EvolveConfig, data: Option<PathBuf>, model: Option<PathBuf>)
         report.train_txt.display(),
         report.chat_jsonl.display()
     );
-    println!("\nllama.cpp fine-tune command:\n{}", report.suggested_command);
+    println!(
+        "\nllama.cpp fine-tune command:\n{}",
+        report.suggested_command
+    );
     Ok(())
 }

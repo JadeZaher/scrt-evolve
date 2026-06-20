@@ -96,9 +96,7 @@ pub fn run(cfg: &EvolveConfig, ctx: &DiscoveredContext) -> anyhow::Result<Datase
             }
             #[cfg(not(feature = "train"))]
             {
-                anyhow::bail!(
-                    "generate: backend=\"local\" requires the `train` feature (track 03)"
-                )
+                anyhow::bail!("generate: backend=\"local\" requires the `train` feature (track 03)")
             }
         }
         other => anyhow::bail!("generate: unknown backend \"{other}\" (expected api | local)"),
@@ -192,7 +190,10 @@ pub fn run_plan_with_backend<B: GenBackend>(
             // Respect the spec's passage_shape filter when set.
             if !spec.passage_shape.is_empty()
                 && spec.passage_shape != "any"
-                && shape_of_passage.get(i).map(|s| s != &spec.passage_shape).unwrap_or(false)
+                && shape_of_passage
+                    .get(i)
+                    .map(|s| s != &spec.passage_shape)
+                    .unwrap_or(false)
             {
                 continue;
             }

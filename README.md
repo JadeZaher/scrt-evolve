@@ -80,17 +80,26 @@ data, or raw completions — via a **pluggable backend**:
 Both emit the same JSONL, so the dataset is backend-agnostic. → `dataset.jsonl`
 
 ### 3. Train — `scrt-evolve train`
-Finetunes via a **preset**, each with its own config:
+Finetunes a model into a reusable **adapter artifact**. Two backends:
 
-| Preset | What it does |
-| :--- | :--- |
-| **lora** | PEFT LoRA adapters (the practical default) |
-| **full** | update all weights |
-| **pretrain** | continued causal-LM pretraining on the raw corpus (domain adaptation) |
-| **contrastive** | InfoNCE embedding adapter from palace structure — improves *scrt's own retrieval* |
-| **shard** | decentralized training across a small trusted cluster |
+- **`--backend transformers`** (the real-model path): shells out to the
+  standalone Python trainer (`python/scrt_evolve_train`), which loads a real
+  HuggingFace causal-LM (RoPE / GQA / BF16) via `transformers` and trains LoRA
+  on it. This is the practical path for actual pretrained models. Needs a
+  Python env with `torch` + `transformers` + `safetensors` (no `peft`); it is
+  invoked as an external subprocess over the `dataset.jsonl` contract, so the
+  Rust build itself stays ML-free.
+- **`--backend candle`** (the in-tree fixture): a small hand-built arch for
+  mechanical validation (overfit-a-tiny-batch). It does **not** load real
+  pretrained checkpoints — see *Honest caveats*. Candle presets (`lora`,
+  `full`, `pretrain`, `contrastive`, `shard`) are the Rust-native north star,
+  deferred until candle's training ecosystem matures.
 
-→ `adapter.safetensors` (or full weights)
+→ `adapter.safetensors` + `adapter_config.json`
+
+### Run the artifact — `scrt-evolve infer`
+Load the base model with the trained adapter and generate — `--ab` runs base
+vs base+adapter side by side so you can see what the tuning changed.
 
 ## Usage
 
@@ -105,7 +114,11 @@ scrt-evolve train    --config evolve.toml      # -> adapter / weights
 
 # override the configured backend / preset inline
 scrt-evolve generate --backend api
-scrt-evolve train    --preset lora --data dataset.jsonl
+scrt-evolve train    --backend transformers --python /path/to/venv/python  # real model
+scrt-evolve train    --backend candle --preset lora                        # fixture
+
+# run the resulting adapter, base vs tuned side by side
+scrt-evolve infer --prompt "What does scrt --mp-stash do?" --ab
 ```
 
 Everything the CLI does is also a library call — scrt-evolve is an SDK
@@ -149,11 +162,14 @@ preset = "lora"
 
 ## Honest caveats
 
-- **candle's finetuning ecosystem is thin.** No turnkey PEFT/trl
-  equivalent — LoRA injection, the training loop, and per-architecture
-  model loaders are largely hand-built. v1 starts with one well-supported
-  architecture and grows coverage; "load any safetensors and finetune" is
-  the goal, not a day-one guarantee.
+- **candle's finetuning ecosystem is thin — so real training runs through
+  Python.** candle has no turnkey PEFT/transformers equivalent, and the in-tree
+  candle model is a *fixture* that can't load real RoPE/GQA/BF16 checkpoints.
+  The validated real-model path is therefore `--backend transformers` (HF
+  `transformers` + a hand-rolled LoRA), driven from the Rust CLI as a
+  subprocess. Reimplementing PyTorch's training stack in candle is explicitly
+  out of scope for now; "100% Rust-native training" remains the north star, not
+  a day-one guarantee. (See the dated amendment in [DESIGN.md](./DESIGN.md).)
 - **Self-generated data can echo-chamber.** A small local model generating
   its own training data risks amplifying its own errors. The API backend
   sidesteps this with a stronger teacher; local-gen output is treated as
@@ -165,4 +181,4 @@ preset = "lora"
 
 ## License
 
-MIT.
+MIT — see [LICENSE](./LICENSE).

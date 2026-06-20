@@ -22,13 +22,22 @@ fn detects_mpg_palace_in_project() {
 
     let layout = resolve(&proj).unwrap();
     assert!(layout.palace.is_some());
-    assert!(layout.palace.as_ref().unwrap().ends_with("mind-palace.json"));
+    assert!(layout
+        .palace
+        .as_ref()
+        .unwrap()
+        .ends_with("mind-palace.json"));
 
     let cfg = config_for_project(&layout, None);
     assert_eq!(cfg.evolve.corpus_dir.as_deref(), Some(proj.as_path()));
     assert!(cfg.evolve.palace_path.is_some());
     // work_dir defaults under the project.
-    assert!(cfg.evolve.work_dir.as_ref().unwrap().ends_with(".scrt-evolve"));
+    assert!(cfg
+        .evolve
+        .work_dir
+        .as_ref()
+        .unwrap()
+        .ends_with(".scrt-evolve"));
 
     let _ = std::fs::remove_dir_all(&proj);
 }
@@ -54,10 +63,9 @@ fn base_config_generate_settings_are_preserved() {
     let proj = temp_project("withbase");
     std::fs::write(proj.join("README.md"), "docs").unwrap();
 
-    let base = scrt_evolve::EvolveConfig::from_toml_str(
-        "[generate]\nbackend = \"api\"\nper_passage = 7",
-    )
-    .unwrap();
+    let base =
+        scrt_evolve::EvolveConfig::from_toml_str("[generate]\nbackend = \"api\"\nper_passage = 7")
+            .unwrap();
     let layout = resolve(&proj).unwrap();
     let cfg = config_for_project(&layout, Some(base));
 

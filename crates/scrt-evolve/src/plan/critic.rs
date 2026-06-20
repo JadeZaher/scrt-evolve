@@ -50,13 +50,25 @@ pub fn measure(dataset: &Dataset) -> Coverage {
 
 /// Render coverage as a compact summary for the critic prompt.
 fn coverage_summary(cov: &Coverage) -> String {
-    let modal: Vec<String> = cov.by_modality.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    let tools: Vec<String> = cov.by_tool.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let modal: Vec<String> = cov
+        .by_modality
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    let tools: Vec<String> = cov
+        .by_tool
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
     format!(
         "total examples: {}\nby modality: {}\ntool_call coverage by tool: {}",
         cov.total,
         modal.join(", "),
-        if tools.is_empty() { "(none)".into() } else { tools.join(", ") }
+        if tools.is_empty() {
+            "(none)".into()
+        } else {
+            tools.join(", ")
+        }
     )
 }
 

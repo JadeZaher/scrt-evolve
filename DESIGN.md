@@ -48,6 +48,43 @@ scrt does the retrieval; scrt-evolve does the generation + training.
   §Training presets) is a real preset but the v1 bar is "works across a
   small, trusted set of nodes," not Byzantine fault tolerance.
 
+---
+
+## Amendment 2026-06-20 — Python-first training (validated)
+
+**Status:** End-to-end validation complete. The direction-of-record reflects this amendment.
+
+### Candle paths are fixture-only
+
+The candle `train`/`local` backends in the Rust crate are **mechanical/fixture paths** that cannot load real pretrained models in production. Empirically validated:
+- Real models (TinyLlama-1.1B, Llama) use **RoPE** positional embeddings (no `embed_positions` tensor); our candle `model.rs` requires `embed_positions` and cannot load them.
+- Real models use **GQA** (grouped-query attention) with separate KV head counts; our candle model hardcodes [2048, 2048] dense projection shapes and cannot handle [256, 2048] GQA reductions.
+- Real model weights are **BF16**; our candle code assumes F32.
+
+These paths are suitable for **overfit-tiny-batch validation** (tracks 03/04) and serve the "works as a sandbox" goal, but are **not a real-model training path**. The north-star "Rust-native training" goal is unchanged and deferred; reimplementing PyTorch's ecosystem in candle is explicitly out of scope for now.
+
+### The real-model path: Python backend (primary)
+
+scrt-evolve's **PRIMARY real-model training and inference path** is Python, driven from the Rust CLI via subprocess over the `dataset.jsonl` contract:
+
+- **`python/scrt_evolve_train/`** — standalone transformers-based LoRA trainer. Loads real HuggingFace causal-LM checkpoints (handles RoPE/GQA/BF16), attaches LoRA adapters to q_proj/v_proj, trains on the dataset.jsonl schema with prompt masking, saves `adapter.safetensors` (correct GQA output shapes). Ported from lexame hivemind-models with no `peft` dependency (hand-rolled `LoRALinear`).
+- **`python/scrt_evolve_infer/`** — standalone inference module. Loads base + optional adapter, runs A/B comparison (base vs base+adapter), supports sampling/temperature.
+- **CLI surface:** `scrt-evolve train --backend transformers` shells out to `python -m scrt_evolve_train`; `scrt-evolve infer` drives inference.
+
+**Consistency with DESIGN.md directives:** This confirms the existing lane directive (DESIGN.md lines 55–60, "Heavy ML via PyO3→transformers (lane directive)... candle is an optional later path"). The directive was authored to defer candle ecosystem maturity and endorse Python-first heavy ML. This amendment extends the directive from the self-evolve lane (10–15) to the **core training path** (tracks 02–04).
+
+**Dependency reality:** The Python path introduces an explicit external dependency: a managed Python environment with `torch`, `transformers`, `safetensors`. No `peft` required (avoided by design — hand-rolled LoRALinear is simpler and attribute-portable). This is a deliberate, documented trade-off: heavy ML stays independent and runnable as a subprocess; the default Rust build remains ML-free (no candle, no Python linked).
+
+### New components and track
+
+- **Track 19 (python-train-infer):** Standalone Python trainer/inference, driven from Rust CLI via subprocess, dataset.jsonl contract, PRIMARY real-model path (candle = fixture).
+- **Track 03/04 amendments:** Candle `train`/`local` are fixture/mechanical; their sign-offs stand at that bar.
+
+### Affected text (annotations, not retractions)
+
+- **DESIGN.md line ~282 (preset table, "lora ... primary path"):** Annotated as "primary among CANDLE presets; the real-model primary path is `--backend transformers`, see Amendment 2026-06-20."
+- **All locked text and original sign-offs remain unchanged.** This amendment clarifies scope and validates the lane directive; it does not retract prior work.
+
 > **Scope note (self-evolve lane, tracks 10–15).** The original v1 scope above
 > is "one corpus, one pass." The self-evolve lane deliberately extends it toward
 > the product goal — **locally tune ONE model that evolves with a user's goals
@@ -279,7 +316,7 @@ Five presets, each with its own config block (see §Config):
 
 | Preset | What it does | Artifact | v1 bar |
 | :--- | :--- | :--- | :--- |
-| **`lora`** | PEFT LoRA adapters on attn/MLP projections | `adapter.safetensors` | **primary path** |
+| **`lora`** | PEFT LoRA adapters on attn/MLP projections | `adapter.safetensors` | **primary path among candle presets*** |
 | **`full`** | update all weights | full weights | works, memory-heavy |
 | **`pretrain`** | continued causal-LM pretraining on the **raw** corpus (not QA pairs) — domain adaptation | weights/adapter | works |
 | **`contrastive`** | InfoNCE embedding adapter from palace structure (stash note=query, nodes=positives) — improves **scrt's own retrieval** | embed adapter | the existing seam |
@@ -289,6 +326,8 @@ The `pretrain` and `contrastive` presets consume different inputs than the
 instruction presets (`pretrain` = raw corpus passages; `contrastive` =
 palace structure, not generated QA) — the `train()` driver routes the right
 dataset shape to each.
+
+\* **Note (Amendment 2026-06-20):** The candle `lora` preset is primary among the **candle-based** presets; the real-model training path that works with production checkpoints (RoPE/GQA/BF16) is Python/transformers, driven via `scrt-evolve train --backend transformers` (track 19). See §Amendment 2026-06-20 for details.
 
 ## Dataset format (the generate↔train boundary)
 

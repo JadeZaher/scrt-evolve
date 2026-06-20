@@ -14,8 +14,7 @@ use scrt_evolve::model::{LoadedModel, ModelConfig};
 fn fixture_ctx() -> DiscoveredContext {
     DiscoveredContext {
         passages: vec![Passage {
-            text: "scrt --mp-stash NAME stores the current search as a named stash."
-                .to_string(),
+            text: "scrt --mp-stash NAME stores the current search as a named stash.".to_string(),
             source: "README.md".to_string(),
             score: 10.0,
             seed: "corpus:stash".to_string(),
@@ -42,7 +41,11 @@ fn local_backend_produces_valid_rows_on_fixture() {
             | GenExample::Instruction { gen, .. }
             | GenExample::ToolCall { gen, .. }
             | GenExample::Cli { gen, .. } => {
-                assert_eq!(gen.as_deref(), Some("local"), "rows must be stamped gen=local");
+                assert_eq!(
+                    gen.as_deref(),
+                    Some("local"),
+                    "rows must be stamped gen=local"
+                );
             }
             other => panic!("unexpected variant from prose generation: {other:?}"),
         }

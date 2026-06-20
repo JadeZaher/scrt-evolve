@@ -52,8 +52,9 @@ pub fn run(cfg: &EvolveConfig, data: &Dataset) -> anyhow::Result<TrainReport> {
     match preset {
         "lora" => {
             let model_path = cfg.require_model_path("train")?;
-            let model = LoadedModel::load(model_path)
-                .map_err(|e| anyhow::anyhow!("train: loading model from {}: {e}", model_path.display()))?;
+            let model = LoadedModel::load(model_path).map_err(|e| {
+                anyhow::anyhow!("train: loading model from {}: {e}", model_path.display())
+            })?;
 
             let lora_cfg = train_cfg.lora.clone().unwrap_or_default();
             // Deterministic seed for adapter init + batch order (styleguide §2.2).
@@ -79,9 +80,7 @@ pub fn run(cfg: &EvolveConfig, data: &Dataset) -> anyhow::Result<TrainReport> {
 /// so a default build still compiles the CLI's `train::run` call.
 #[cfg(not(feature = "train"))]
 pub fn run(_cfg: &EvolveConfig, _data: &Dataset) -> anyhow::Result<TrainReport> {
-    anyhow::bail!(
-        "train: requires the `train` feature (candle) — build with --features train"
-    )
+    anyhow::bail!("train: requires the `train` feature (candle) — build with --features train")
 }
 
 /// Derive a stable seed from the LoRA config so runs are reproducible and a

@@ -478,7 +478,9 @@ fn looks_like_inline_secret(value: &str) -> bool {
     }
     // Env var names are valid identifiers: [A-Za-z_][A-Za-z0-9_]*.
     let is_identifier = !v.is_empty()
-        && v.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && v.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
     if !is_identifier {
         // Contains spaces, dashes, slashes, etc. — not an env var name.

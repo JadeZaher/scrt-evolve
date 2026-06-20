@@ -19,6 +19,11 @@
 //! the Python-driven loop consume the same rows (spec §Constraints).
 
 #![cfg(feature = "pyo3")]
+// The `#[pyfunction]` macro expands a `.into()` on the returned `PyResult`
+// whose source and target types coincide for our return types; clippy flags
+// that macro-generated conversion. It is not in our hand-written code, so the
+// lint is suppressed at the module level.
+#![allow(clippy::useless_conversion)]
 
 use std::collections::HashMap;
 
@@ -32,8 +37,15 @@ use crate::dataset::{Dataset, GenExample};
 /// Rust and Python loops see identical text. Non-trainable kinds yield `None`.
 fn training_pair(row: &GenExample) -> Option<(String, String)> {
     match row {
-        GenExample::Qa { prompt, completion, .. } => Some((prompt.clone(), completion.clone())),
-        GenExample::Instruction { instruction, input, output, .. } => {
+        GenExample::Qa {
+            prompt, completion, ..
+        } => Some((prompt.clone(), completion.clone())),
+        GenExample::Instruction {
+            instruction,
+            input,
+            output,
+            ..
+        } => {
             let prompt = if input.is_empty() {
                 format!("{instruction}\n")
             } else {
@@ -49,14 +61,25 @@ fn training_pair(row: &GenExample) -> Option<(String, String)> {
 fn row_to_dict<'py>(py: Python<'py>, row: &GenExample) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new_bound(py);
     match row {
-        GenExample::Qa { prompt, completion, source, gen } => {
+        GenExample::Qa {
+            prompt,
+            completion,
+            source,
+            gen,
+        } => {
             d.set_item("kind", "qa")?;
             d.set_item("prompt", prompt)?;
             d.set_item("completion", completion)?;
             d.set_item("source", source.clone())?;
             d.set_item("gen", gen.clone())?;
         }
-        GenExample::Instruction { instruction, input, output, source, gen } => {
+        GenExample::Instruction {
+            instruction,
+            input,
+            output,
+            source,
+            gen,
+        } => {
             d.set_item("kind", "instruction")?;
             d.set_item("instruction", instruction)?;
             d.set_item("input", input)?;
@@ -69,14 +92,25 @@ fn row_to_dict<'py>(py: Python<'py>, row: &GenExample) -> PyResult<Bound<'py, Py
             d.set_item("text", text)?;
             d.set_item("source", source.clone())?;
         }
-        GenExample::Contrastive { query, positive, negatives, stash } => {
+        GenExample::Contrastive {
+            query,
+            positive,
+            negatives,
+            stash,
+        } => {
             d.set_item("kind", "contrastive")?;
             d.set_item("query", query)?;
             d.set_item("positive", positive)?;
             d.set_item("negatives", negatives.clone())?;
             d.set_item("stash", stash.clone())?;
         }
-        GenExample::ToolCall { prompt, tool, arguments, source, gen } => {
+        GenExample::ToolCall {
+            prompt,
+            tool,
+            arguments,
+            source,
+            gen,
+        } => {
             d.set_item("kind", "tool_call")?;
             d.set_item("prompt", prompt)?;
             d.set_item("tool", tool)?;
@@ -84,7 +118,12 @@ fn row_to_dict<'py>(py: Python<'py>, row: &GenExample) -> PyResult<Bound<'py, Py
             d.set_item("source", source.clone())?;
             d.set_item("gen", gen.clone())?;
         }
-        GenExample::Cli { prompt, command, source, gen } => {
+        GenExample::Cli {
+            prompt,
+            command,
+            source,
+            gen,
+        } => {
             d.set_item("kind", "cli")?;
             d.set_item("prompt", prompt)?;
             d.set_item("command", command)?;
@@ -157,8 +196,9 @@ fn dataset_prompt_completion_pairs(path: String) -> PyResult<Vec<(String, String
 /// Count rows by `kind` — a cheap parity probe for Python-side tests.
 #[pyfunction]
 fn dataset_kind_counts(path: String) -> PyResult<HashMap<String, usize>> {
-    let ds = Dataset::read_jsonl(&path)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("dataset_kind_counts: {e}")))?;
+    let ds = Dataset::read_jsonl(&path).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!("dataset_kind_counts: {e}"))
+    })?;
     let mut counts: HashMap<String, usize> = HashMap::new();
     for row in &ds.rows {
         let kind = match row {

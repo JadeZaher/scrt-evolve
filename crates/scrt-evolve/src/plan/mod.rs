@@ -66,7 +66,11 @@ pub struct GenPlan {
 
 impl GenPlan {
     pub fn new(specs: Vec<GenSpec>) -> Self {
-        Self { round: 0, specs, strategy: String::new() }
+        Self {
+            round: 0,
+            specs,
+            strategy: String::new(),
+        }
     }
 
     /// Total planned example budget across all specs.
@@ -148,9 +152,8 @@ pub fn generate_self_routed(
     let backend = ApiEndpoint::from_config(&gcfg)?;
 
     // Phase 3: generate the initial plan.
-    let mut dataset = crate::generate::run_plan_with_backend(
-        &backend, ctx, &plan, per_passage, &shapes,
-    )?;
+    let mut dataset =
+        crate::generate::run_plan_with_backend(&backend, ctx, &plan, per_passage, &shapes)?;
     enforce_directive(&mut dataset, directive);
 
     // Phase 4: gap-critic rounds.
@@ -163,9 +166,8 @@ pub fn generate_self_routed(
         if follow.specs.is_empty() {
             break; // critic found no meaningful gap
         }
-        let more = crate::generate::run_plan_with_backend(
-            &backend, ctx, &follow, per_passage, &shapes,
-        )?;
+        let more =
+            crate::generate::run_plan_with_backend(&backend, ctx, &follow, per_passage, &shapes)?;
         dataset.rows.extend(more.rows);
         enforce_directive(&mut dataset, directive);
         plan.merge(follow);
@@ -179,7 +181,9 @@ pub fn generate_self_routed(
 /// human's hard constraints — enforced regardless of what the planner chose.
 fn enforce_directive(dataset: &mut Dataset, directive: &TrainingDirective) {
     if !directive.exclusions.is_empty() {
-        dataset.rows.retain(|row| !directive.excluded(&row_text(row)));
+        dataset
+            .rows
+            .retain(|row| !directive.excluded(&row_text(row)));
     }
     if directive.max_rows > 0 && dataset.rows.len() > directive.max_rows {
         dataset.rows.truncate(directive.max_rows);
@@ -189,15 +193,31 @@ fn enforce_directive(dataset: &mut Dataset, directive: &TrainingDirective) {
 /// Flatten a row's human-facing text for exclusion matching.
 fn row_text(row: &GenExample) -> String {
     match row {
-        GenExample::Qa { prompt, completion, .. } => format!("{prompt} {completion}"),
-        GenExample::Instruction { instruction, input, output, .. } => {
+        GenExample::Qa {
+            prompt, completion, ..
+        } => format!("{prompt} {completion}"),
+        GenExample::Instruction {
+            instruction,
+            input,
+            output,
+            ..
+        } => {
             format!("{instruction} {input} {output}")
         }
         GenExample::Completion { text, .. } => text.clone(),
-        GenExample::Contrastive { query, positive, .. } => format!("{query} {positive}"),
-        GenExample::ToolCall { prompt, tool, arguments, .. } => {
+        GenExample::Contrastive {
+            query, positive, ..
+        } => format!("{query} {positive}"),
+        GenExample::ToolCall {
+            prompt,
+            tool,
+            arguments,
+            ..
+        } => {
             format!("{prompt} {tool} {arguments}")
         }
-        GenExample::Cli { prompt, command, .. } => format!("{prompt} {command}"),
+        GenExample::Cli {
+            prompt, command, ..
+        } => format!("{prompt} {command}"),
     }
 }

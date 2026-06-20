@@ -75,7 +75,10 @@ impl TrainingDirective {
             s.push_str(&format!("GOAL: {}\n", self.goal));
         }
         if !self.priorities.is_empty() {
-            s.push_str(&format!("MODALITY PRIORITY (high→low): {}\n", self.priorities.join(" > ")));
+            s.push_str(&format!(
+                "MODALITY PRIORITY (high→low): {}\n",
+                self.priorities.join(" > ")
+            ));
         }
         if !self.must_cover.is_empty() {
             s.push_str(&format!(
@@ -93,7 +96,10 @@ impl TrainingDirective {
             s.push_str(&format!("TONE/STYLE: {}\n", self.tone));
         }
         if !self.exclusions.is_empty() {
-            s.push_str(&format!("HARD EXCLUSIONS (never produce): {}\n", self.exclusions.join(", ")));
+            s.push_str(&format!(
+                "HARD EXCLUSIONS (never produce): {}\n",
+                self.exclusions.join(", ")
+            ));
         }
         if self.max_rows > 0 {
             s.push_str(&format!("MAX TOTAL ROWS: {}\n", self.max_rows));

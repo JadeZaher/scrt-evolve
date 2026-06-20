@@ -153,9 +153,11 @@ pub fn inject_adapters(
     let var_map = VarMap::new();
     let mut adapters = Vec::with_capacity(names.len());
 
-    let base = model.var_map.data().lock().map_err(|e| {
-        LoraError::Model(format!("base var_map lock poisoned: {e}"))
-    })?;
+    let base = model
+        .var_map
+        .data()
+        .lock()
+        .map_err(|e| LoraError::Model(format!("base var_map lock poisoned: {e}")))?;
 
     for (ord, name) in names.iter().enumerate() {
         let dims = base
@@ -244,18 +246,19 @@ pub struct BatchIter {
 
 impl BatchIter {
     /// Build the example list from a dataset, tokenizing through `model`.
-    pub fn new(
-        model: &LoadedModel,
-        data: &Dataset,
-        batch_size: usize,
-    ) -> Result<Self, LoraError> {
+    pub fn new(model: &LoadedModel, data: &Dataset, batch_size: usize) -> Result<Self, LoraError> {
         let mut examples = Vec::new();
         for row in &data.rows {
             let (prompt, completion) = match row {
-                GenExample::Qa { prompt, completion, .. } => {
-                    (prompt.clone(), completion.clone())
-                }
-                GenExample::Instruction { instruction, input, output, .. } => {
+                GenExample::Qa {
+                    prompt, completion, ..
+                } => (prompt.clone(), completion.clone()),
+                GenExample::Instruction {
+                    instruction,
+                    input,
+                    output,
+                    ..
+                } => {
                     let prompt = if input.is_empty() {
                         format!("{instruction}\n")
                     } else {
@@ -339,8 +342,7 @@ fn example_loss(
     let device = &model.device;
     let seq = ex.tokens.len();
     // Inputs predict the next token: input = tokens[..seq-1], label = tokens[1..].
-    let input_ids =
-        Tensor::from_vec(ex.tokens[..seq - 1].to_vec(), (1, seq - 1), device)?;
+    let input_ids = Tensor::from_vec(ex.tokens[..seq - 1].to_vec(), (1, seq - 1), device)?;
     let labels: Vec<u32> = ex.tokens[1..].to_vec();
 
     // Frozen base logits [1, seq-1, vocab] — detached so the base never trains.
@@ -416,7 +418,11 @@ fn example_loss(
     // Mask: keep only completion positions. The label at position p predicts
     // tokens[p+1]; a position is a completion target when p+1 >= prompt_len.
     let keep: Vec<usize> = (0..n).filter(|&p| p + 1 >= ex.prompt_len).collect();
-    let keep = if keep.is_empty() { (0..n).collect() } else { keep };
+    let keep = if keep.is_empty() {
+        (0..n).collect()
+    } else {
+        keep
+    };
     let keep_idx = Tensor::from_vec(
         keep.iter().map(|&p| p as u32).collect::<Vec<_>>(),
         keep.len(),
@@ -464,9 +470,7 @@ fn train_loop(
             }
             let Some(sum) = batch_loss else { continue };
             let loss = (sum / batch.len() as f64)?;
-            let loss_val = loss
-                .to_scalar::<f32>()
-                .map_err(LoraError::from)?;
+            let loss_val = loss.to_scalar::<f32>().map_err(LoraError::from)?;
             if first_loss.is_none() {
                 first_loss = Some(loss_val);
             }
@@ -509,7 +513,10 @@ pub fn save_adapter(vars: &VarMap, path: &Path) -> Result<(), LoraError> {
 ///
 /// Thin wrapper over `candle_core::safetensors::load` so callers/tests verify
 /// the saved adapter round-trips by name + shape.
-pub fn load_adapter(path: &Path, device: &Device) -> Result<std::collections::HashMap<String, Tensor>, LoraError> {
+pub fn load_adapter(
+    path: &Path,
+    device: &Device,
+) -> Result<std::collections::HashMap<String, Tensor>, LoraError> {
     candle_core::safetensors::load(path, device)
         .map_err(|e| LoraError::Io(format!("{}: {e}", path.display())))
 }
@@ -540,7 +547,10 @@ struct SplitMix64 {
 
 impl SplitMix64 {
     fn new(seed: u64) -> Self {
-        Self { state: seed, spare: None }
+        Self {
+            state: seed,
+            spare: None,
+        }
     }
     fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -623,8 +633,7 @@ impl LoraPreset {
     ) -> anyhow::Result<(TrainReport, LoraAdapters, Option<f32>)> {
         let adapters = inject_adapters(model, cfg, self.seed)?;
         let mut batches = BatchIter::new(model, data, 2)?;
-        let (steps, first_loss, final_loss) =
-            train_loop(model, &adapters, &mut batches, cfg)?;
+        let (steps, first_loss, final_loss) = train_loop(model, &adapters, &mut batches, cfg)?;
 
         let artifact: Option<PathBuf> = match artifact_path {
             Some(p) => {

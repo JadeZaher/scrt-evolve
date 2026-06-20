@@ -40,13 +40,23 @@ pub fn scrt_tools() -> anyhow::Result<Vec<ToolSchema>> {
         let parameters = f["parameters"].clone();
         let required = parameters["required"]
             .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let properties = parameters["properties"]
             .as_object()
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default();
-        out.push(ToolSchema { name, description, parameters, required, properties });
+        out.push(ToolSchema {
+            name,
+            description,
+            parameters,
+            required,
+            properties,
+        });
     }
     Ok(out)
 }
