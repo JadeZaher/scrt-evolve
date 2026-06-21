@@ -93,9 +93,38 @@ def build_parser() -> argparse.ArgumentParser:
         default="q_proj,v_proj",
         metavar="LIST",
         help=(
-            "Comma-separated list of nn.Linear leaf names to wrap with LoRA. "
-            "Default: 'q_proj,v_proj' (Llama/TinyLlama). "
-            "Example for GPT-2: 'c_attn,c_proj'."
+            "Comma-separated nn.Linear leaf names to wrap with LoRA, or 'auto' to "
+            "auto-detect generically (recommended for hybrid/MoE arches like "
+            "granitemoehybrid where q_proj/v_proj don't cover the compute path). "
+            "Default: 'q_proj,v_proj' (Llama/TinyLlama)."
+        ),
+    )
+    # --- QAT (track 23): quantization-aware training ---
+    p.add_argument(
+        "--qat",
+        default=None,
+        metavar="QUANT",
+        help=(
+            "Enable quantization-aware training simulating this GGUF quant during "
+            "the LoRA forward (e.g. 'Q4_K_M'), so the adapter compensates for the "
+            "deployment quantization. Absent ⇒ plain LoRA."
+        ),
+    )
+    p.add_argument(
+        "--qat-group-size",
+        type=int,
+        default=32,
+        metavar="N",
+        help="QAT per-group affine group size. Default: 32 (Q4_K-faithful).",
+    )
+    p.add_argument(
+        "--qat-calibrate",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "QAT calibration: observe per-group scales over the first N batches, "
+            "then freeze them. 0 ⇒ dynamic per-step absmax (no calibration pass)."
         ),
     )
     p.add_argument(
@@ -113,6 +142,79 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print loss to stderr every N steps. Default: 5.",
     )
 
+    # --- Hardware (config-driven GPU usage) ---
+    p.add_argument(
+        "--device",
+        default="auto",
+        metavar="DEV",
+        help="Accelerator: 'auto' (cuda if available, else cpu), 'cuda', or 'cpu'. Default: auto.",
+    )
+    p.add_argument(
+        "--dtype",
+        default="auto",
+        metavar="DT",
+        help=(
+            "Compute dtype: 'auto' (bf16 on cuda, fp32 on cpu), 'float32', "
+            "'bfloat16', or 'float16'. Default: auto."
+        ),
+    )
+
+    # --- Sharded / fractional training (decentralized; bounds VRAM to 1 block) ---
+    p.add_argument(
+        "--shard-mode",
+        action="store_true",
+        help=(
+            "Train by contiguous layer-block shards via block-local distillation, "
+            "keeping only ONE block resident on the accelerator at a time. Lets a "
+            "large model be LoRA-trained on a small GPU (and shards run in parallel "
+            "across machines). Absent => dense training (default)."
+        ),
+    )
+    p.add_argument(
+        "--shards",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Number of contiguous layer-block shards to split the model into. "
+        "Mutually exclusive with --block-size (block-size wins if both set).",
+    )
+    p.add_argument(
+        "--block-size",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Layers per shard block. Overrides --shards. The hard VRAM knob: "
+        "smaller => less peak VRAM, more streaming.",
+    )
+    p.add_argument(
+        "--shard-index",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Train ONLY this shard index (0-based) and exit. For decentralized "
+        "runs: one process/machine per shard. Absent => all shards in sequence.",
+    )
+    p.add_argument(
+        "--calib-batches",
+        type=int,
+        default=8,
+        metavar="N",
+        help="Number of token batches to distill each shard over (boundary "
+        "activations captured from these). Default: 8.",
+    )
+    p.add_argument(
+        "--granularity",
+        default="block",
+        choices=["block", "module"],
+        help=(
+            "Sharded-mode training granularity. 'block' (default): train all of a "
+            "layer-block's LoRA together. 'module': PER-MODULE sub-layer floor — "
+            "train one submodule group (attention / MoE / MLP) at a time within "
+            "each layer, against the layer's frozen-output teacher. Lowest VRAM, "
+            "most passes (trade time for memory). Pair with --block-size 1."
+        ),
+    )
+
     return p
 
 
@@ -122,7 +224,12 @@ def main() -> None:
         parser.print_help()
         sys.exit(0)
     args = parser.parse_args()
-    train(args)
+    if getattr(args, "shard_mode", False):
+        from .shard import train_sharded
+
+        train_sharded(args)
+    else:
+        train(args)
 
 
 if __name__ == "__main__":

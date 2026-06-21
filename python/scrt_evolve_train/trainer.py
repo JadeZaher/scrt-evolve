@@ -36,15 +36,51 @@ class LoRALinear(nn.Module):
         self.alpha = alpha
         self.scaling = alpha / rank
         in_f, out_f = original.in_features, original.out_features
-        self.lora_A = nn.Parameter(torch.empty(rank, in_f))
-        self.lora_B = nn.Parameter(torch.zeros(out_f, rank))
+        # Match the wrapped layer's dtype/device so the LoRA matmul never hits a
+        # dtype mismatch (e.g. a bf16 block) and the params land on the right
+        # device. Falls back to default (fp32/cpu) for layers without a weight.
+        ref = getattr(original, "weight", None)
+        ref_dtype = ref.dtype if ref is not None else torch.float32
+        ref_device = ref.device if ref is not None else None
+        self.lora_A = nn.Parameter(torch.empty(rank, in_f, dtype=ref_dtype, device=ref_device))
+        self.lora_B = nn.Parameter(torch.zeros(out_f, rank, dtype=ref_dtype, device=ref_device))
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         for p in self.original.parameters():
             p.requires_grad = False
+        # QAT (track 23): when set, the effective weight (base + LoRA delta) is
+        # passed through a fake-quant of `qat_quant` before the matmul, so the
+        # adapter learns to compensate for deployment quantization. None ⇒ plain
+        # LoRA (today's behavior). `qat_name` keys calibrated scales.
+        self.qat_quant: str | None = None
+        self.qat_group_size: int = 32
+        self.qat_name: str = ""
+        self.qat_calibrator = None  # set to a qat.Calibrator when calibrating
+        # When True, behave as the frozen base layer (no LoRA delta, no QAT).
+        # Used by the sharded distillation trainer to get the teacher output
+        # from the same module. Default False ⇒ standard LoRA behavior.
+        self.lora_disabled: bool = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.original(x) + (self.dropout(x) @ self.lora_A.T @ self.lora_B.T) * self.scaling
+        if self.lora_disabled:
+            return self.original(x)
+        if self.qat_quant is None:
+            base = self.original(x)
+            # Dtype-safe LoRA delta: some modules (e.g. MoE routers) run in fp32
+            # while the rest of the block is bf16/fp16. Match the base output's
+            # dtype so the delta add never raises a dtype mismatch.
+            delta = (self.dropout(x) @ self.lora_A.T @ self.lora_B.T) * self.scaling
+            return base + delta.to(base.dtype)
+        # QAT path: build the effective weight, fake-quantize it (STE), and apply.
+        from scrt_evolve_train import qat as _qat
+
+        eff_w = self.original.weight + (self.lora_B @ self.lora_A) * self.scaling
+        if self.qat_calibrator is not None:
+            self.qat_calibrator.observe(self.qat_name, eff_w)
+        scale = self.qat_calibrator.scale_for(self.qat_name) if self.qat_calibrator else None
+        q_w = _qat.fake_quantize(eff_w, self.qat_quant, self.qat_group_size, scale)
+        out = torch.nn.functional.linear(self.dropout(x), q_w, self.original.bias)
+        return out
 
     def merge_and_unload(self) -> nn.Linear:
         with torch.no_grad():
@@ -74,6 +110,10 @@ def attach_lora(
         leaf = full_name.split(".")[-1]
         if leaf not in target_modules:
             continue
+        # Never wrap a MoE router/gate, even if its leaf name matches a target
+        # (routers are routing classifiers, not content projections).
+        if _is_router_path(full_name):
+            continue
         # Walk to parent
         parts = full_name.split(".")
         parent = model
@@ -82,6 +122,85 @@ def attach_lora(
         setattr(parent, parts[-1], LoRALinear(module, rank=rank, alpha=alpha, dropout=dropout))
         count += 1
     return count
+
+
+# Path substrings that mark a module as a state-space / convolution (Mamba/SSM)
+# block. Generic (not model-specific): any arch whose modules live under these
+# names is treated as SSM. The naive CPU SSM backward segfaults in current
+# torch/transformers, so we EXCLUDE these from LoRA by default and leave them
+# frozen (LoRA freezes the base, so no grad flows through them).
+SSM_PATH_MARKERS = ("mamba", "ssm", "conv1d", "conv_1d", ".conv")
+
+# Path substrings that mark a Linear as a MoE ROUTER / GATE (a tiny routing
+# classifier, not a content projection). Generic: adapting the router is both
+# unhelpful and often dtype-fragile (routers frequently run in fp32 while the
+# block is bf16). Excluded from LoRA auto-detection.
+ROUTER_PATH_MARKERS = ("router", "gate", "gating")
+
+
+def _is_ssm_path(full_name: str) -> bool:
+    low = full_name.lower()
+    return any(m in low for m in SSM_PATH_MARKERS)
+
+
+def _is_router_path(full_name: str) -> bool:
+    low = full_name.lower()
+    return any(m in low for m in ROUTER_PATH_MARKERS)
+
+
+def auto_detect_targets(
+    model: nn.Module, top_k: int = 6, exclude_ssm: bool = True
+) -> list[str]:
+    """Generic, architecture-agnostic LoRA target selection.
+
+    Enumerate the model's nn.Linear leaves and pick the most common leaf names
+    (a projection repeated across N layers is the signal), ranked by frequency.
+    Model-agnostic: any arch's real linear projections are discovered, not
+    hardcoded.
+
+    `exclude_ssm` (default True): a leaf name is dropped if it ONLY ever appears
+    inside a state-space/convolution (Mamba) block. This is correct hygiene — you
+    don't want LoRA on layers that won't train well — but NOTE it does NOT by
+    itself make a hybrid Mamba model trainable on CPU: autograd still traverses
+    the naive Mamba forward op during `loss.backward()`, which segfaults on CPU
+    without the `causal_conv1d`/`mamba-ssm` CUDA kernels (verified on
+    granitemoehybrid). Hybrid-SSM TRAINING needs CUDA regardless; forward-only
+    eval/inference works on CPU. A leaf appearing in BOTH ssm and non-ssm
+    contexts is kept (it's a general projection).
+    """
+    from collections import Counter
+
+    counts: Counter[str] = Counter()
+    ssm_ctx: Counter[str] = Counter()
+    nonssm_ctx: Counter[str] = Counter()
+    for full_name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        leaf = full_name.split(".")[-1]
+        if leaf in ("lm_head", "embed_tokens"):
+            continue
+        # Skip MoE routers/gates — tiny routing classifiers, not content
+        # projections, and frequently fp32 (dtype-fragile under LoRA).
+        if _is_router_path(full_name):
+            continue
+        counts[leaf] += 1
+        if _is_ssm_path(full_name):
+            ssm_ctx[leaf] += 1
+        else:
+            nonssm_ctx[leaf] += 1
+
+    if not counts:
+        return []
+
+    candidates = []
+    for leaf, n in counts.items():
+        # Drop leaves that live ONLY in SSM blocks.
+        if exclude_ssm and ssm_ctx.get(leaf, 0) > 0 and nonssm_ctx.get(leaf, 0) == 0:
+            continue
+        candidates.append((leaf, n))
+
+    ranked = sorted(candidates, key=lambda kv: (-kv[1], kv[0]))
+    return [name for name, _ in ranked[:top_k]]
 
 
 # ---------------------------------------------------------------------------
@@ -294,16 +413,62 @@ def train(args: Any) -> None:
     model.config.use_cache = False
     model.train()
 
-    # Attach LoRA
-    target_modules = [m.strip() for m in args.target_modules.split(",") if m.strip()]
+    # Resolve LoRA targets. `--target-modules auto` (or an empty value) triggers
+    # generic, architecture-agnostic auto-detection so hybrid/MoE arches work
+    # without hardcoded names.
+    raw_targets = (args.target_modules or "").strip()
+    if raw_targets in ("", "auto"):
+        target_modules = auto_detect_targets(model)
+        print(f"INFO: auto-detected LoRA targets: {target_modules}", file=sys.stderr)
+    else:
+        target_modules = [m.strip() for m in raw_targets.split(",") if m.strip()]
+
     n_adapters = attach_lora(model, target_modules, rank=args.rank, alpha=args.alpha, dropout=args.dropout)
     if n_adapters == 0:
+        # Auto-detect fallback: if explicit targets matched nothing, try auto.
+        auto = auto_detect_targets(model)
+        if auto and auto != target_modules:
+            print(
+                f"WARN: explicit targets {target_modules} matched nothing; "
+                f"falling back to auto-detected {auto}",
+                file=sys.stderr,
+            )
+            target_modules = auto
+            n_adapters = attach_lora(model, target_modules, rank=args.rank, alpha=args.alpha, dropout=args.dropout)
+    if n_adapters == 0:
         sys.exit(
-            f"ERROR: zero LoRA adapters attached. target_modules={target_modules} did not match "
-            f"any nn.Linear leaf names in the model. For Llama-family models, "
-            f"'q_proj,v_proj' should match — check the model architecture."
+            f"ERROR: zero LoRA adapters attached. No nn.Linear leaves matched "
+            f"{target_modules}. Use `--target-modules auto` to auto-detect, or "
+            "inspect the model's module names."
         )
     print(f"INFO: attached {n_adapters} LoRA adapters", file=sys.stderr)
+
+    # QAT setup (track 23): if --qat <quant> is set, configure every LoRALinear to
+    # fake-quantize its effective weight during the forward pass. Optional
+    # calibration picks per-group scales over the first N batches.
+    qat_quant = getattr(args, "qat", None)
+    calibrator = None
+    if qat_quant:
+        from scrt_evolve_train import qat as _qat
+
+        calib_cfg = _qat.CalibConfig(
+            enabled=True,
+            quant=qat_quant,
+            group_size=getattr(args, "qat_group_size", 32),
+            calibrate_batches=getattr(args, "qat_calibrate", 0),
+        )
+        calibrator = _qat.Calibrator(cfg=calib_cfg)
+        for name, m in model.named_modules():
+            if isinstance(m, LoRALinear):
+                m.qat_quant = qat_quant
+                m.qat_group_size = calib_cfg.group_size
+                m.qat_name = name
+                m.qat_calibrator = calibrator
+        print(
+            f"INFO: QAT enabled - quant={qat_quant} group_size={calib_cfg.group_size} "
+            f"calibrate_batches={calib_cfg.calibrate_batches}",
+            file=sys.stderr,
+        )
 
     # Optimizer — only lora params
     lora_params = [
@@ -334,6 +499,10 @@ def train(args: Any) -> None:
         loss: torch.Tensor = outputs.loss
         loss.backward()
         optimizer.step()
+
+        # Advance QAT calibration window (bounded by calibrate_batches).
+        if calibrator is not None:
+            calibrator.tick()
 
         loss_val = loss.item()
         if first_loss is None:

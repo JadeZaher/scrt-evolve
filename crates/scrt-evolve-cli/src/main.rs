@@ -196,13 +196,81 @@ enum Command {
         #[arg(long)]
         python: Option<String>,
     },
+    /// Score the current model against a held-out probe set (track 10 eval
+    /// harness). Prints a `ScoreReport` and writes it to `work_dir/score.json`.
+    ///
+    /// Backend from `[evolve.eval].scorer_backend`: `api` (no ML — generate
+    /// completions via `[generate.api]`, judge with the executable gate) or
+    /// `transformers` (real forward pass via `python -m scrt_evolve_score`).
+    Eval {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// Override the probe path (default: `[evolve.eval].probe_path` or
+        /// `work_dir/probe.jsonl`).
+        #[arg(long)]
+        probe: Option<PathBuf>,
+        /// Python interpreter for the `transformers` backend.
+        #[arg(long)]
+        python: Option<String>,
+    },
+    /// Convert a GGUF model to an HF safetensors dir (track 23) so it can be
+    /// LoRA-trained. Generic + architecture-registry-driven (no model-specific
+    /// logic): shells out to `python -m scrt_evolve_dequant`. Streaming
+    /// (bounded memory). Lossy for quantized sources (recovers the quantized
+    /// weights upcast). Use `--tokenizer` to copy in a fallback HF tokenizer.
+    Dequant {
+        /// Source `.gguf` path.
+        #[arg(long)]
+        gguf: PathBuf,
+        /// Output HF model dir.
+        #[arg(long)]
+        out: PathBuf,
+        /// Storage dtype: `f16` | `f32`. Default f16.
+        #[arg(long, default_value = "f16")]
+        dtype: String,
+        /// HF tokenizer dir to copy in as the fallback (GGUF tokenizer
+        /// extraction is a documented seam).
+        #[arg(long)]
+        tokenizer: Option<PathBuf>,
+        /// Python interpreter (needs `gguf` + `safetensors` + `numpy`).
+        #[arg(long)]
+        python: Option<String>,
+    },
+    /// Probe-set management (track 10).
+    Probe {
+        #[command(subcommand)]
+        command: ProbeCommand,
+    },
+    /// Checkpoint store inspection (track 15 — the transactional homeostasis
+    /// layer). Checkpoints are produced by eval-gated steps.
+    Checkpoints {
+        #[command(subcommand)]
+        command: CheckpointCommand,
+    },
+    /// Quarantine management (track 15): the provenance stamps the loop skips
+    /// after a catastrophe.
+    Quarantine {
+        #[command(subcommand)]
+        command: QuarantineCommand,
+    },
     /// Point at a PROJECT directory: auto-detect its mpg palace + corpus and run
     /// the whole self-routing pipeline (discover → plan → generate → export).
+    ///
+    /// With `--goals`, run the **learning-by-doing multi-goal** pipeline instead
+    /// (track 20): for each `[[goals]]` in the config, discover the goal's
+    /// tagged stashes → generate a per-goal dataset under
+    /// `work_dir/goals/<name>/`. In `--goals` mode the `project` positional is
+    /// optional (goals carry their own `project` scoping). For the EVAL-GATED
+    /// schedule (train → eval → keep|rollback across goals, halt on catastrophe),
+    /// use `--schedule`. The regen flywheel (track 11) remains optional/un-wired.
     Evolve {
-        /// The project directory to evolve a model against.
-        project: PathBuf,
+        /// The project directory to evolve a model against. Optional in
+        /// `--goals` mode.
+        project: Option<PathBuf>,
         /// Optional base evolve.toml supplying [generate]/[train] settings
         /// (corpus_dir/palace_path are auto-detected and override the base).
+        /// In `--goals` mode this is the config the `[[goals]]` are read from
+        /// (default: `evolve.toml`).
         #[arg(long)]
         config: Option<PathBuf>,
         /// Gap-critic follow-up rounds.
@@ -211,6 +279,85 @@ enum Command {
         /// Also export to llama.cpp format after generating.
         #[arg(long)]
         export: bool,
+        /// Run the multi-goal learning-by-doing pipeline over the config's
+        /// `[[goals]]` (discover → generate per goal). No eval-gating yet.
+        #[arg(long)]
+        goals: bool,
+        /// Run the EVAL-GATED multi-goal SCHEDULE (track 20 slices 6–9): bounded
+        /// rounds across goals, each `discover → generate → train → eval →
+        /// keep|rollback` through the track-15 transaction; halts on catastrophe.
+        /// Implies `--goals`. Weight + round count control the budget.
+        #[arg(long)]
+        schedule: bool,
+        /// Max rounds for `--schedule` (the hard budget; no unbounded loop).
+        #[arg(long, default_value_t = 4)]
+        max_rounds: usize,
+        /// Schedule policy for `--schedule`: `round-robin` | `weighted`.
+        #[arg(long, default_value = "weighted")]
+        policy: String,
+        /// Python interpreter for the schedule's train + score subprocesses.
+        #[arg(long)]
+        python: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CheckpointCommand {
+    /// List all checkpoints (id, status, kind, metrics) + the `last_good` pointer.
+    List {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+    },
+    /// Show one checkpoint's manifest.
+    Show {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        id: String,
+    },
+    /// Restore the adapter from a checkpoint into `work_dir/adapter` (manual
+    /// rollback). Transactional steps do this automatically on regress.
+    Restore {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum QuarantineCommand {
+    /// List the quarantined `gen` provenance stamps.
+    List {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+    },
+    /// Clear the quarantine (re-arm: the loop will no longer skip those causes).
+    Clear {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProbeCommand {
+    /// Carve a held-out probe set out of a dataset (asserted zero-overlap with
+    /// the training remainder). Writes `probe.jsonl` + the training remainder.
+    Build {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// Dataset to carve from (default: `work_dir/dataset.jsonl`).
+        #[arg(long = "from")]
+        from: Option<PathBuf>,
+        /// Fraction held out into the probe (default: `[evolve.eval]` value or 0.1).
+        #[arg(long)]
+        holdout: Option<f32>,
+        /// Probe output path (default: `[evolve.eval].probe_path` or
+        /// `work_dir/probe.jsonl`).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Where to write the training remainder (default:
+        /// `work_dir/dataset.train.jsonl`).
+        #[arg(long)]
+        remainder: Option<PathBuf>,
     },
 }
 
@@ -336,6 +483,57 @@ fn run() -> Result<()> {
                 python,
             )
         }
+        Command::Eval {
+            config,
+            probe,
+            python,
+        } => {
+            let cfg = EvolveConfig::load(&config)?;
+            cmd_eval(&cfg, probe, python)
+        }
+        Command::Dequant {
+            gguf,
+            out,
+            dtype,
+            tokenizer,
+            python,
+        } => cmd_dequant(&gguf, &out, &dtype, tokenizer, python),
+        Command::Probe { command } => match command {
+            ProbeCommand::Build {
+                config,
+                from,
+                holdout,
+                out,
+                remainder,
+            } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_probe_build(&cfg, from, holdout, out, remainder)
+            }
+        },
+        Command::Checkpoints { command } => match command {
+            CheckpointCommand::List { config } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_checkpoints_list(&cfg)
+            }
+            CheckpointCommand::Show { config, id } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_checkpoints_show(&cfg, &id)
+            }
+            CheckpointCommand::Restore { config, id } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_checkpoints_restore(&cfg, &id)
+            }
+        },
+        Command::Quarantine { command } => match command {
+            QuarantineCommand::List { config } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_quarantine_list(&cfg)
+            }
+            QuarantineCommand::Clear { config } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_quarantine_clear(&cfg)
+            }
+        },
         Command::Run { config, export } => {
             let cfg = EvolveConfig::load(&config)?;
             cmd_discover(&cfg)?;
@@ -350,7 +548,30 @@ fn run() -> Result<()> {
             config,
             gap_rounds,
             export,
-        } => cmd_evolve(&project, config, gap_rounds, export),
+            goals,
+            schedule,
+            max_rounds,
+            policy,
+            python,
+        } => {
+            if schedule {
+                let config = config.unwrap_or_else(|| PathBuf::from("evolve.toml"));
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_evolve_schedule(&cfg, &policy, max_rounds, python)
+            } else if goals {
+                let config = config.unwrap_or_else(|| PathBuf::from("evolve.toml"));
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_evolve_goals(&cfg)
+            } else {
+                let project = project.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "evolve: pass a PROJECT directory, or use --goals / --schedule \
+                         to run the multi-goal pipeline over the config's [[goals]]"
+                    )
+                })?;
+                cmd_evolve(&project, config, gap_rounds, export)
+            }
+        }
     }
 }
 
@@ -606,6 +827,365 @@ fn cmd_evolve(
     Ok(())
 }
 
+/// Learning-by-doing multi-goal pipeline (track 20 slice 5). Thin shim — the
+/// orchestration lives in `scrt_evolve::goals::run_buildable` (styleguide §1).
+/// Runs discover → generate per goal; NO eval-gating / keep|rollback yet (those
+/// are lane-gated on tracks 10/15 — carry-forward).
+fn cmd_evolve_goals(cfg: &EvolveConfig) -> Result<()> {
+    let wd = WorkDir::from_config(cfg);
+    wd.ensure()?;
+
+    println!(
+        "evolve --goals: {} goal(s) — discover → generate per goal (no eval gate yet)",
+        cfg.goals.len()
+    );
+
+    let report = scrt_evolve::goals::run_buildable(cfg, scrt_evolve::generate::run)?;
+
+    for run in &report.runs {
+        println!(
+            "  - {:24} {:>4} passages, {:>4} rows  [{}]",
+            run.goal, run.passages, run.rows, run.note
+        );
+        if let Some(p) = &run.dataset_path {
+            println!("      dataset → {}", p.display());
+        }
+    }
+    println!(
+        "evolve --goals: {} total rows across {} goal(s)",
+        report.total_rows(),
+        report.runs.len()
+    );
+    Ok(())
+}
+
+/// The EVAL-GATED multi-goal SCHEDULE (track 20 slices 6–9). Wires production
+/// hooks (discover/generate from the SDK; train/score as Python subprocesses)
+/// into `scrt_evolve::rounds::run_schedule`. Every weight change goes through the
+/// track-15 transaction; the schedule halts on catastrophe.
+fn cmd_evolve_schedule(
+    cfg: &EvolveConfig,
+    policy: &str,
+    max_rounds: usize,
+    python: Option<String>,
+) -> Result<()> {
+    use scrt_evolve::rounds::{run_schedule, RoundHooks, SchedulePolicy};
+
+    let wd = WorkDir::from_config(cfg);
+    wd.ensure()?;
+    if cfg.goals.is_empty() {
+        anyhow::bail!("evolve --schedule: no [[goals]] in the config");
+    }
+
+    let policy = match policy {
+        "round-robin" | "roundrobin" | "rr" => SchedulePolicy::RoundRobin,
+        "weighted" | "w" => SchedulePolicy::Weighted,
+        other => {
+            anyhow::bail!("evolve --schedule: unknown policy \"{other}\" (round-robin|weighted)")
+        }
+    };
+    let py = python.clone();
+
+    // Hardware pre-flight: if [hardware] is declared, surface whether this box
+    // can train a state-space (Mamba) model — a heads-up before a long run that
+    // would otherwise segfault on the first backward. Generic (kernel-keyed), not
+    // model-specific; advisory only (the operator chooses the student model).
+    if let Some(hw) = &cfg.hardware {
+        match hw.can_train_state_space() {
+            Ok(()) => println!(
+                "hardware: device={} vram={}GB, mamba kernels present — state-space \
+                 training enabled",
+                hw.device, hw.vram_gb
+            ),
+            Err(reason) => eprintln!(
+                "hardware WARNING: {reason}.\n  → A HYBRID-SSM student (e.g. Granite) \
+                 will SEGFAULT on the training backward here. Use a CUDA torch + \
+                 mamba kernels, or set model_path to a non-Mamba model. (Eval + \
+                 teacher are forward-only and run fine.)"
+            ),
+        }
+    }
+
+    println!(
+        "evolve --schedule: {} goal(s), max_rounds={max_rounds}, policy={policy:?} \
+         (each round: discover → generate → train → eval → keep|rollback)",
+        cfg.goals.len()
+    );
+
+    // Regulator (checkpoint store / quarantine) + resume ordinal — computed up
+    // front so the per-round log index and baseline can use them.
+    let reg = scrt_evolve::Regulator::new(cfg)?;
+    let start_ordinal = reg
+        .store()
+        .list()?
+        .iter()
+        .map(|m| m.ordinal)
+        .max()
+        .map(|o| o + 1)
+        .unwrap_or(1);
+
+    // --- Production hooks ---
+    let discover = |c: &EvolveConfig| scrt_evolve::discover::run(c);
+    let generate =
+        |c: &EvolveConfig, ctx: &scrt_evolve::DiscoveredContext| scrt_evolve::generate::run(c, ctx);
+    // Per-round log index (each train/score call writes to work_dir/logs/).
+    let log_seq = std::cell::Cell::new(start_ordinal);
+    // The weight-mutating step: write the round's train set, shell out to the
+    // transformers trainer, and return the rows' `gen` provenance (quarantine key).
+    let py_train = py.clone();
+    let train = |c: &EvolveConfig, train_set: &scrt_evolve::Dataset| -> Result<Vec<String>> {
+        let wd = WorkDir::from_config(c);
+        let data_path = wd.root().join("dataset.round-train.jsonl");
+        train_set.write_jsonl(&data_path)?;
+        // Per-round durable log: work_dir/logs/round-<n>.log (train + score tee here).
+        let n = log_seq.get();
+        let log_path = wd.root().join("logs").join(format!("round-{n}.log"));
+        std::env::set_var("SCRT_EVOLVE_LOG_FILE", &log_path);
+        println!("  round log → {}", log_path.display());
+        // Reuse the existing transformers trainer shim (defaults for steps/seq).
+        cmd_train_transformers(c, Some(data_path), py_train.clone(), None, 40, 256)?;
+        // Provenance = the distinct `gen` stamps in this round's training rows.
+        Ok(provenance_of(train_set))
+    };
+    let py_score = py.clone();
+    let score = |c: &EvolveConfig| -> Result<scrt_evolve::ScoreReport> {
+        let r = scrt_evolve::eval::run_eval(c, py_score.as_deref());
+        // Advance the per-round log index AFTER score, so train+score of one
+        // round share round-<n>.log, then the next round increments.
+        log_seq.set(log_seq.get() + 1);
+        std::env::remove_var("SCRT_EVOLVE_LOG_FILE");
+        r
+    };
+
+    let hooks = RoundHooks {
+        discover: &discover,
+        generate: &generate,
+        train: &train,
+        score: &score,
+    };
+
+    // Baseline: the last good score if present (read from the last_good
+    // checkpoint's metrics), else a conservative zero baseline so the first
+    // round can only improve.
+    let last_good_score = reg
+        .store()
+        .last_good()
+        .and_then(|id| reg.store().load_manifest(&id).ok())
+        .and_then(|m| m.metrics);
+    let baseline = move |_g: &scrt_evolve::GoalConfig| -> scrt_evolve::ScoreReport {
+        last_good_score
+            .clone()
+            .unwrap_or_else(|| scrt_evolve::ScoreReport::uncovered("probe-none", "baseline"))
+    };
+
+    // start_ordinal (resume point) was computed up front.
+    let report = run_schedule(cfg, policy, max_rounds, start_ordinal, &hooks, &baseline)?;
+
+    println!(
+        "\nevolve --schedule: {} round(s), {} committed{}",
+        report.rounds.len(),
+        report.committed(),
+        if report.halted {
+            " — HALTED on catastrophe"
+        } else {
+            ""
+        }
+    );
+    for r in &report.rounds {
+        let corr = r
+            .metrics
+            .as_ref()
+            .map(|m| format!("{:.3}", m.correctness))
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "  #{:<3} {:20} rows={:<4} correctness={:<6} [{}]",
+            r.ordinal, r.goal, r.rows, corr, r.note
+        );
+    }
+    if report.halted {
+        eprintln!(
+            "\nschedule halted. Inspect: `scrt-evolve quarantine list`, \
+             `scrt-evolve checkpoints list`. Re-arm with `scrt-evolve quarantine clear`."
+        );
+    }
+    Ok(())
+}
+
+/// The distinct `gen` provenance stamps present in a dataset (the quarantine key
+/// for a round's training rows).
+fn provenance_of(ds: &scrt_evolve::Dataset) -> Vec<String> {
+    use scrt_evolve::GenExample::*;
+    let mut set = std::collections::BTreeSet::new();
+    for row in &ds.rows {
+        let g = match row {
+            Qa { gen, .. } | Instruction { gen, .. } | ToolCall { gen, .. } | Cli { gen, .. } => {
+                gen.clone()
+            }
+            _ => None,
+        };
+        if let Some(g) = g {
+            set.insert(g);
+        }
+    }
+    set.into_iter().collect()
+}
+
+/// Score the current model against the probe set (track 10). Thin shim — the
+/// scoring + backend dispatch live in `scrt_evolve::eval::run_eval`.
+fn cmd_eval(cfg: &EvolveConfig, probe: Option<PathBuf>, python: Option<String>) -> Result<()> {
+    let wd = WorkDir::from_config(cfg);
+    wd.ensure()?;
+
+    // Apply a --probe override by patching the config's eval block.
+    let mut cfg = cfg.clone();
+    if let Some(p) = probe {
+        cfg.eval.get_or_insert_with(Default::default).probe_path = Some(p);
+    }
+    if cfg.eval.is_none() {
+        eprintln!(
+            "eval: no [evolve.eval] block — scoring with defaults (api backend). \
+             Add [evolve.eval] to configure the probe/backend."
+        );
+    }
+
+    let report = scrt_evolve::eval::run_eval(&cfg, python.as_deref())?;
+    let out = wd.root().join("score.json");
+    report.write(&out)?;
+
+    println!(
+        "eval: correctness={:.3} n={} backend={} probe={}",
+        report.correctness, report.n, report.backend, report.probe_version
+    );
+    if let Some(c) = report.constitution_adherence {
+        println!("  constitution_adherence={c:.3}");
+    }
+    if let Some(d) = report.mean_exit_depth {
+        println!("  mean_exit_depth={d:.3}");
+    }
+    if let Some(p) = report.perplexity {
+        println!("  perplexity={p:.3}");
+    }
+    println!("  report → {}", out.display());
+    Ok(())
+}
+
+/// Carve a held-out probe set from a dataset (track 10). Thin shim over
+/// `ProbeSet::carve`, which guarantees + re-asserts zero training overlap.
+fn cmd_probe_build(
+    cfg: &EvolveConfig,
+    from: Option<PathBuf>,
+    holdout: Option<f32>,
+    out: Option<PathBuf>,
+    remainder: Option<PathBuf>,
+) -> Result<()> {
+    let wd = WorkDir::from_config(cfg);
+    wd.ensure()?;
+
+    let from_path = from.unwrap_or_else(|| wd.dataset_jsonl());
+    let dataset = scrt_evolve::Dataset::read_jsonl(&from_path)
+        .with_context(|| format!("reading dataset {}", from_path.display()))?;
+
+    let frac = holdout
+        .or_else(|| cfg.eval.as_ref().map(|e| e.probe_holdout_frac))
+        .unwrap_or(0.1);
+
+    let (probe, train) = scrt_evolve::ProbeSet::carve(&dataset, frac)?;
+
+    let probe_out = out.unwrap_or_else(|| scrt_evolve::eval::probe_path(cfg));
+    let train_out = remainder.unwrap_or_else(|| wd.root().join("dataset.train.jsonl"));
+
+    probe.write(&probe_out)?;
+    train.write_jsonl(&train_out)?;
+
+    println!(
+        "probe build: {} probe items (holdout={:.0}%), {} train rows  [{}]",
+        probe.len(),
+        frac * 100.0,
+        train.len(),
+        probe.version,
+    );
+    println!("  probe → {}", probe_out.display());
+    println!("  train → {}", train_out.display());
+    Ok(())
+}
+
+/// List checkpoints + the `last_good` pointer (track 15).
+fn cmd_checkpoints_list(cfg: &EvolveConfig) -> Result<()> {
+    let reg = scrt_evolve::Regulator::new(cfg)?;
+    let store = reg.store();
+    let last_good = store.last_good();
+    let all = store.list()?;
+    if all.is_empty() {
+        println!("checkpoints: none yet (run an eval-gated step to produce one)");
+        return Ok(());
+    }
+    println!(
+        "checkpoints (last_good = {}):",
+        last_good.as_deref().unwrap_or("none")
+    );
+    for m in &all {
+        let corr = m
+            .metrics
+            .as_ref()
+            .map(|s| format!("{:.3}", s.correctness))
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "  {:20} {:11} {:12} correctness={}",
+            m.id,
+            format!("{:?}", m.status),
+            m.step_kind,
+            corr
+        );
+    }
+    Ok(())
+}
+
+/// Show one checkpoint manifest (track 15).
+fn cmd_checkpoints_show(cfg: &EvolveConfig, id: &str) -> Result<()> {
+    let reg = scrt_evolve::Regulator::new(cfg)?;
+    let m = reg.store().load_manifest(id)?;
+    println!("{}", serde_json::to_string_pretty(&m)?);
+    Ok(())
+}
+
+/// Restore the adapter from a checkpoint (manual rollback, track 15).
+fn cmd_checkpoints_restore(cfg: &EvolveConfig, id: &str) -> Result<()> {
+    let reg = scrt_evolve::Regulator::new(cfg)?;
+    let wd = WorkDir::from_config(cfg);
+    let adapter = wd.root().join("adapter");
+    reg.store().restore_adapter(id, &adapter)?;
+    println!(
+        "restored adapter from checkpoint {id} → {}",
+        adapter.display()
+    );
+    Ok(())
+}
+
+/// List quarantined provenance stamps (track 15).
+fn cmd_quarantine_list(cfg: &EvolveConfig) -> Result<()> {
+    let reg = scrt_evolve::Regulator::new(cfg)?;
+    let q = reg.quarantine()?;
+    if q.is_empty() {
+        println!("quarantine: empty");
+    } else {
+        println!("quarantine ({} stamp(s)):", q.gen_stamps.len());
+        for s in &q.gen_stamps {
+            println!("  {s}");
+        }
+    }
+    Ok(())
+}
+
+/// Clear the quarantine = re-arm (track 15).
+fn cmd_quarantine_clear(cfg: &EvolveConfig) -> Result<()> {
+    let wd = WorkDir::from_config(cfg);
+    let path = wd.root().join("quarantine.json");
+    let empty = scrt_evolve::Quarantine::default();
+    empty.write(&path)?;
+    println!("quarantine cleared (re-armed) → {}", path.display());
+    Ok(())
+}
+
 /// Load the dataset and run training, printing the report. Thin shim — all
 /// orchestration lives in `scrt_evolve::train::run` (styleguide §1).
 fn cmd_train(cfg: &EvolveConfig, data: Option<PathBuf>) -> Result<()> {
@@ -697,20 +1277,102 @@ fn cmd_train_transformers(
         .arg(&targets)
         .env("PYTHONPATH", &pkg_parent);
 
+    // Hardware pass-through: forward [hardware].device so GPU usage is fully
+    // config-driven (default "auto" lets the Python side pick cuda-if-available).
+    if let Some(hw) = cfg.hardware.as_ref() {
+        cmd.arg("--device").arg(&hw.device);
+    }
+
+    // QAT pass-through (track 23): if [train.qat] is set + enabled, forward the
+    // fake-quant flags to the Python trainer.
+    if let Some(qat) = cfg.train.as_ref().and_then(|t| t.qat.clone()) {
+        if qat.enabled {
+            cmd.arg("--qat")
+                .arg(&qat.quant)
+                .arg("--qat-group-size")
+                .arg(qat.group_size.to_string())
+                .arg("--qat-calibrate")
+                .arg(qat.calibrate_batches.to_string());
+        }
+    }
+
+    // Fractional / sharded layer-block training pass-through: if
+    // [train.fractional] is set + enabled, switch the trainer to block-local
+    // distillation (bounds peak VRAM to one block). Config-driven so the same
+    // pipeline runs on a small GPU without code changes.
+    if let Some(frac) = cfg.train.as_ref().and_then(|t| t.fractional.clone()) {
+        if frac.enabled {
+            cmd.arg("--shard-mode");
+            if let Some(bs) = frac.block_size {
+                cmd.arg("--block-size").arg(bs.to_string());
+            } else if let Some(n) = frac.shards {
+                cmd.arg("--shards").arg(n.to_string());
+            }
+            cmd.arg("--calib-batches")
+                .arg(frac.calib_batches.to_string());
+            cmd.arg("--granularity").arg(&frac.granularity);
+        }
+    }
+
     println!(
         "train(transformers): {} -m scrt_evolve_train  (model={}, {} steps)",
         py,
         model_path.display(),
         steps
     );
-    let status = cmd
-        .status()
-        .with_context(|| format!("launching `{py} -m scrt_evolve_train`"))?;
+
+    // Log capture: when SCRT_EVOLVE_LOG_FILE is set (the schedule sets it per
+    // round), tee the trainer's stdout+stderr to that file so a multi-day run
+    // has a durable, inspectable trail — and a crash (e.g. a CPU SSM segfault)
+    // is captured automatically instead of vanishing with the console.
+    let status = run_subprocess_logged(&mut cmd, &py, "scrt_evolve_train")?;
     if !status.success() {
         anyhow::bail!("train(transformers): trainer exited with {status}");
     }
     println!("train(transformers): adapter → {}", out_dir.display());
     Ok(())
+}
+
+/// Run a subprocess, optionally teeing its combined output to the file named by
+/// `SCRT_EVOLVE_LOG_FILE`. Without that env var, output inherits the console
+/// (today's behavior). The captured file is appended to (one round may run
+/// train then score into the same file).
+fn run_subprocess_logged(
+    cmd: &mut std::process::Command,
+    py: &str,
+    module: &str,
+) -> Result<std::process::ExitStatus> {
+    let log_file = std::env::var("SCRT_EVOLVE_LOG_FILE").ok();
+    match log_file {
+        None => cmd
+            .status()
+            .with_context(|| format!("launching `{py} -m {module}`")),
+        Some(path) => {
+            use std::io::Write;
+            let out = cmd
+                .stderr(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .output()
+                .with_context(|| format!("launching `{py} -m {module}`"))?;
+            if let Some(parent) = std::path::Path::new(&path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = writeln!(f, "===== {module} =====");
+                let _ = f.write_all(&out.stdout);
+                let _ = f.write_all(&out.stderr);
+            }
+            // Mirror stdout to the console too (so the JSON summary line the
+            // caller may parse, and progress, are still visible live-ish).
+            std::io::stdout().write_all(&out.stdout).ok();
+            std::io::stderr().write_all(&out.stderr).ok();
+            Ok(out.status)
+        }
+    }
 }
 
 /// Inference shim: shell out to `python -m scrt_evolve_infer`.
@@ -782,6 +1444,90 @@ fn cmd_infer(
     Ok(())
 }
 
+/// Convert a GGUF to an HF safetensors dir (track 23) by shelling out to
+/// `python -m scrt_evolve_dequant`. Generic + registry-driven; the Rust side is
+/// a thin shim (gguf-py on PYTHONPATH, like export-gguf).
+fn cmd_dequant(
+    gguf: &PathBuf,
+    out: &PathBuf,
+    dtype: &str,
+    tokenizer: Option<PathBuf>,
+    python: Option<String>,
+) -> Result<()> {
+    if !gguf.exists() {
+        anyhow::bail!("dequant: GGUF not found: {}", gguf.display());
+    }
+    let pkg_parent = find_python_pkg_dir()
+        .ok_or_else(|| anyhow::anyhow!("dequant: could not locate python/ dir"))?;
+
+    // Put the vendored gguf-py on PYTHONPATH (alongside the package parent), the
+    // same way export-gguf relies on it.
+    let gguf_py = find_llama_gguf_py();
+    let pythonpath = match &gguf_py {
+        Some(p) => format!("{};{}", pkg_parent.display(), p.display()),
+        None => pkg_parent.display().to_string(),
+    };
+
+    let py = python.unwrap_or_else(|| "python".to_string());
+    let mut cmd = std::process::Command::new(&py);
+    cmd.arg("-m")
+        .arg("scrt_evolve_dequant")
+        .arg("--gguf")
+        .arg(gguf)
+        .arg("--out")
+        .arg(out)
+        .arg("--dtype")
+        .arg(dtype)
+        .env("PYTHONPATH", &pythonpath);
+    if let Some(tok) = &tokenizer {
+        cmd.arg("--tokenizer").arg(tok);
+    }
+
+    println!(
+        "dequant: {} -m scrt_evolve_dequant  (gguf={}, out={}, dtype={})",
+        py,
+        gguf.display(),
+        out.display(),
+        dtype
+    );
+    let status = cmd
+        .status()
+        .with_context(|| format!("launching `{py} -m scrt_evolve_dequant`"))?;
+    if !status.success() {
+        anyhow::bail!("dequant: python process exited with {status}");
+    }
+    println!("dequant: HF model dir → {}", out.display());
+    Ok(())
+}
+
+/// Best-effort locate a vendored `gguf-py` dir in a llama.cpp checkout, mirroring
+/// the auto-detect in the export path so `dequant` can read GGUFs without the
+/// `gguf` pip package installed.
+fn find_llama_gguf_py() -> Option<PathBuf> {
+    let home = dirs_home()?;
+    for base in [
+        home.join(".unsloth").join("llama.cpp"),
+        home.join("llama.cpp"),
+        home.join("Documents").join("llama.cpp"),
+    ] {
+        let candidate = base.join("gguf-py");
+        if candidate.join("gguf").is_dir() {
+            return Some(candidate);
+        }
+    }
+    std::env::var("LLAMA_CPP")
+        .ok()
+        .map(|p| PathBuf::from(p).join("gguf-py"))
+        .filter(|p| p.join("gguf").is_dir())
+}
+
+/// Home dir without pulling in the `dirs` crate (HOME / USERPROFILE).
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+}
+
 /// Merge a LoRA adapter into the base model and export a quantized GGUF by
 /// shelling out to `python -m scrt_evolve_gguf` (merge → convert → quantize).
 #[allow(clippy::too_many_arguments)]
@@ -844,19 +1590,10 @@ fn cmd_export_gguf(
     Ok(())
 }
 
-/// Find the directory that should be on `PYTHONPATH` so `scrt_evolve_train`
-/// imports: the `python/` dir holding the package. Walks up from cwd.
+/// Find the `python/` dir for `PYTHONPATH`. Thin re-export of the shared SDK
+/// helper so the CLI and the eval subprocess scorer agree on resolution.
 fn find_python_pkg_dir() -> Option<PathBuf> {
-    let mut dir = std::env::current_dir().ok()?;
-    loop {
-        let candidate = dir.join("python");
-        if candidate.join("scrt_evolve_train").is_dir() {
-            return Some(candidate);
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
+    scrt_evolve::python_pkg_dir()
 }
 
 fn cmd_export(cfg: &EvolveConfig, data: Option<PathBuf>, model: Option<PathBuf>) -> Result<()> {

@@ -157,9 +157,23 @@ content, NOT format — the JSON-array schema above is mandatory):\n{guidance}"
 /// them. Tolerates a markdown code-fence wrapper around the array.
 pub fn parse_examples(raw: &str, ctx: &GenContext) -> anyhow::Result<Vec<GenExample>> {
     let json = extract_json_array(raw);
-    let values: Vec<serde_json::Value> = serde_json::from_str(json).map_err(|e| {
-        anyhow::anyhow!("generate.api: response was not a JSON array of examples: {e}\nraw: {raw}")
-    })?;
+    // Primary path: a clean JSON array. Fallback: smaller models often emit a
+    // truncated array (missing a closing bracket — a context-length artifact) or
+    // bare/loosely-delimited objects. Rather than discard the whole response,
+    // salvage every well-formed `{...}` object from the raw text.
+    let values: Vec<serde_json::Value> = match serde_json::from_str(json) {
+        Ok(vs) => vs,
+        Err(_) => {
+            let salvaged = salvage_objects(raw);
+            if salvaged.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "generate.api: response was not a JSON array and no objects \
+                     could be salvaged\nraw: {raw}"
+                ));
+            }
+            salvaged
+        }
+    };
 
     let source = ctx.passage.source.clone();
     let provenance = "api".to_string();
@@ -261,6 +275,67 @@ fn valid_tool_call(
         }
     }
     true
+}
+
+/// Salvage individual JSON objects from a malformed/truncated response. Scans
+/// for balanced `{...}` spans (respecting strings + escapes) and parses each
+/// independently, so a response with a missing array bracket or a trailing
+/// truncated object still yields the rows that ARE complete. Smaller teacher
+/// models frequently produce these; this keeps a round from emitting zero rows.
+fn salvage_objects(raw: &str) -> Vec<serde_json::Value> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            // Find the matching close brace, tracking string state.
+            let mut depth = 0usize;
+            let mut in_str = false;
+            let mut esc = false;
+            let mut j = i;
+            let mut end = None;
+            while j < bytes.len() {
+                let c = bytes[j];
+                if in_str {
+                    if esc {
+                        esc = false;
+                    } else if c == b'\\' {
+                        esc = true;
+                    } else if c == b'"' {
+                        in_str = false;
+                    }
+                } else {
+                    match c {
+                        b'"' => in_str = true,
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = Some(j);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                j += 1;
+            }
+            match end {
+                Some(e) => {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw[i..=e]) {
+                        if v.is_object() {
+                            out.push(v);
+                        }
+                    }
+                    i = e + 1;
+                }
+                None => break, // unbalanced tail — stop
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Pull the JSON array out of a model response that may be wrapped in a

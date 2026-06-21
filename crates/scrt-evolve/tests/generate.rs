@@ -95,6 +95,21 @@ fn parser_tolerates_markdown_fenced_array() {
 }
 
 #[test]
+fn parser_salvages_truncated_array() {
+    // A small teacher emitted a valid-prefix array that got truncated (missing
+    // the closing `]`) plus a trailing incomplete object — the real shape seen
+    // during track-24 bring-up. The two complete objects must be salvaged.
+    let response = concat!(
+        "[{\"kind\":\"qa\",\"prompt\":\"q1\",\"completion\":\"a1\"}, ",
+        "{\"kind\":\"qa\",\"prompt\":\"q2\",\"completion\":\"a2\"}, ",
+        "{\"kind\":\"qa\",\"prompt\":\"q3 truncated"
+    );
+    let backend = ApiEndpoint::with_transport(MockTransport::new(vec![response]), 1);
+    let dataset = run_with_backend(&backend, &fixture_ctx(), &["qa".into()], 1).unwrap();
+    assert_eq!(dataset.len(), 2, "the two complete objects are salvaged");
+}
+
+#[test]
 fn malformed_rows_are_skipped_not_fatal() {
     // One good row, one missing required field — the good one survives.
     let response = r#"[

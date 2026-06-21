@@ -30,3 +30,11 @@ __pycache__/
 # belt-and-suspenders for any model weights / datasets that land at the root.
 *.safetensors
 *.gguf
+
+# Bench: keep the scaffold (evolve.toml, RUNBOOK.md, harvest script) but NEVER
+# commit the adapted corpus (personal Claude Code transcripts — privacy, spec
+# §Constraints "no transcript leaves the machine") or the work/ artifacts.
+bench/corpus/
+bench/work/
+bench/.mpg/
+bench/traces/

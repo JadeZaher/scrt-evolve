@@ -48,6 +48,18 @@ impl WorkDir {
         self.root.join("adapter.safetensors")
     }
 
+    /// The traces root: harvested frontier transcripts live under
+    /// `work_dir/traces/` (track 20 slice 4), one subdir per goal.
+    pub fn traces_dir(&self) -> PathBuf {
+        self.root.join("traces")
+    }
+
+    /// The per-goal traces subdir: `work_dir/traces/<goal>/`. The harvester
+    /// captures raw transcripts here (`<slug>-<date>.jsonl`) before filtering.
+    pub fn goal_traces_dir(&self, goal: &str) -> PathBuf {
+        self.traces_dir().join(goal)
+    }
+
     /// The checkpoints directory for longer training runs.
     pub fn checkpoints_dir(&self) -> PathBuf {
         self.root.join("checkpoints")

@@ -1,0 +1,153 @@
+# scrt-evolve BENCHMARK config (track 24).
+#
+# Trains IBM Granite-4.0-h-tiny toward goals distilled from the user's own
+# Claude Code work (transcripts under ~/.claude/projects), via the eval-gated
+# multi-goal SCHEDULE (tracks 10 + 15 + 20), with quantization-aware training
+# (track 23) so the exported Q4_K_M GGUF degrades less.
+#
+# model_path = the CACHED full-precision HF Granite (granitemoehybrid), NOT the
+# GGUF (the GGUF can't be LoRA-trained; the f16 HF weights are already cached).
+#
+# ===================== GRANITE TRAINING: GPU PATH (VERIFIED) ==================
+# Granite-4.0-h-tiny is a HYBRID MAMBA-2 (SSM) model. On a CPU-only torch its
+# loss.backward() SEGFAULTS in the naive Mamba kernel. On a CUDA torch WITH the
+# mamba-ssm/causal-conv1d kernels, training WORKS — verified on this box's
+# RTX 4060 (8GB) under WSL2 (see [hardware].machine): forward + backward run, no
+# segfault. The verified env (Ubuntu 24.04 / Python 3.12 venv):
+#     torch 2.5.1+cu121, causal-conv1d 1.6.2, mamba-ssm 2.3.2, bitsandbytes,
+#     transformers 5.12, peft 0.19.  (See bench/RUNBOOK.md "GPU setup (WSL2)".)
+#
+# Granite is 6.9B; a DENSE bf16 fine-tune needs ~22GB and OOMs on 8GB. The bench
+# therefore uses FRACTIONAL (sharded) training — see [train.fractional] — which
+# trains one contiguous LAYER BLOCK at a time via block-local distillation,
+# bounding peak VRAM to a single block (~3.1–3.4 GB measured on the RTX 4060 for
+# block_size=8, FLAT across all 5 shards). This is what lets a large model train
+# on a small GPU, and what makes the pipeline portable to "everyone's" hardware.
+#
+# EVAL + TEACHER are forward-only and run on CPU too. To run on a non-Mamba
+# student (e.g. TinyLlama) on plain CPU, just switch model_path; fractional mode
+# still applies and bounds VRAM/RAM the same way.
+# ==============================================================================
+
+[evolve]
+# Cached full-precision HF Granite snapshot (granitemoehybrid: Mamba-2 + 64-expert MoE).
+model_path  = "C:/Users/atooz/.cache/huggingface/hub/models--ibm-granite--granite-4.0-h-tiny/snapshots/791e0d3d28c86e106c9b6e0b4cecdee0375b6124"
+# Corpus = the adapted Claude Code transcripts (produced by harvest_claude_projects.py).
+# The transcript harvester (track 20 slice 4) distills these into trace:<goal> rows.
+corpus_dir  = "C:/Users/atooz/Programming/ai-utils-memory/scrt-evolve/bench/corpus"
+# A mind-palace for goal-tagged stashes (curated, high-signal). Optional —
+# transcripts are the firehose; stashes are the curated curriculum.
+palace_path = "C:/Users/atooz/Programming/ai-utils-memory/scrt-evolve/bench/.mpg/mind-palace.json"
+work_dir    = "C:/Users/atooz/Programming/ai-utils-memory/scrt-evolve/bench/work"
+
+[discover]
+# Bench uses the transcript corpus as the signal (the palace starts empty;
+# populate it with goal-tagged stashes via the scrt-evolve skill to add curated
+# signal, then switch to "both"). For a per-goal schedule, `for_goal()` overrides
+# palace_search/tags; corpus_patterns target the goal topics in the transcripts.
+seed = "corpus"
+max_passages = 120
+dedup = "simhash"
+cluster = true
+corpus_patterns = [
+  "mp-stash", "mp-compose", "mp-graph", "mp-intersect", "mp-link", "mp-similar",
+  "mind.?palace", "stash", "scrt ",
+  "conductor", "track", "spec", "plan", "sign-?off",
+  "tool", "Read", "Edit", "Bash", "Grep", "function", "arguments",
+]
+
+[generate]
+backend = "api"
+# Teacher = the Granite GGUF served by LM Studio (forward-only generation works
+# fine; load it with context length >= 8192). Set `model` to the exact id LM
+# Studio reports for the loaded Granite GGUF.
+kinds = ["qa", "instruction", "cli", "tool_call"]
+per_passage = 3
+tool_format = "gemma"
+  [generate.api]
+  base_url = "http://localhost:1234/v1"
+  model = "granite-4.0-h-tiny"   # the Granite GGUF id in LM Studio (forward-only teacher)
+  # No api_key_env: local endpoint ignores auth.
+  turns = 1
+
+[train]
+preset = "lora"
+  [train.lora]
+  rank = 16
+  alpha = 32
+  # AUTO target detection (granitemoehybrid has no plain q_proj/v_proj coverage).
+  # The trainer's --target-modules auto enumerates real nn.Linear leaves; the
+  # CLI passes lora.target_modules through, so set it to the sentinel "auto".
+  target_modules = ["auto"]
+  lr = 2e-4
+  epochs = 1
+  # Quantization-aware training toward the deployment quant (Q4_K_M GGUF).
+  [train.qat]
+  enabled = true
+  quant = "Q4_K_M"
+  group_size = 32
+  calibrate_batches = 8
+  # FRACTIONAL / sharded layer-block training (the VRAM-bounding mode that lets
+  # a 6.9B hybrid model train on an 8GB GPU). Trains one contiguous block at a
+  # time via block-local distillation; peak VRAM ≈ one block (measured ~3.1–3.4
+  # GB for block_size=8 on the RTX 4060). Set enabled=false for dense training.
+  [train.fractional]
+  enabled = true
+  block_size = 8        # 40 Granite layers → 5 shards; the hard VRAM knob
+  calib_batches = 8     # token batches each block is distilled over
+  # granularity: "block" (default) trains a block's LoRA together (~3.3GB VRAM
+  # at block_size=8). "module" is the SUB-LAYER floor — trains one submodule
+  # group (attention/MoE/MLP) at a time within each layer; measured ~0.9GB VRAM
+  # at block_size=1 on the RTX 4060 (trades time for memory; lets the model
+  # train on <1GB). Use block_size=1 with granularity="module" for the floor.
+  granularity = "block"
+
+# --- Hardware: the machine + verified GPU env this bench trains on (track 24). ---
+# device = "cuda" runs training on the RTX 4060 (WSL2). With the mamba kernels
+# present (listed below), can_train_state_space() passes its pre-flight.
+# NOTE: run training from the WSL2 venv (see RUNBOOK "GPU setup (WSL2)"); the
+# native Windows venv torch is CPU-only and will segfault on Mamba backward.
+[hardware]
+device = "cuda"
+vram_gb = 8.0          # NVIDIA RTX 4060 (8188 MiB), compute capability 8.9
+ram_gb = 26.0          # WSL2 cap (set in %USERPROFILE%\.wslconfig; host has 32GB)
+kernels = ["mamba-ssm", "causal-conv1d"]   # built in the WSL2 venv (verified)
+machine = "WSL2 Ubuntu 24.04 on Win11 | i5-12400F (6c/12t) | 32GB host / 26GB WSL | RTX 4060 8GB (cc 8.9) | venv py3.12 torch 2.5.1+cu121 + mamba-ssm 2.3.2 + causal-conv1d 1.6.2 (Granite GPU backward VERIFIED)"
+
+[eval]
+# Held-out probe carved from each round's dataset; gates keep|rollback.
+# scorer_backend = transformers scores via [evolve].model_path (Granite)
+# FORWARD-ONLY (perplexity/exit-depth/correctness need no backward) — so eval
+# runs on CPU even though Granite TRAINING needs CUDA.
+probe_holdout_frac = 0.15
+scorer_backend = "transformers"
+metrics = ["correctness", "perplexity", "mean_exit_depth"]
+
+[regulate]
+enabled = true
+accept_tolerance = 0.02
+catastrophe_floor = 0.10
+keep_checkpoints = 8
+on_catastrophe = "rollback_quarantine_halt"
+
+# --- Goals: what to evolve Granite toward, distilled from the user's work. ---
+# Each goal's `tag` is what the scrt-evolve skill stamps on goal-relevant palace
+# stashes; `topic` feeds discover.palace_search + scopes the corpus sweep.
+
+[[goals]]
+name = "scrt-cli-fluency"
+topic = "scrt mind palace mp commands stash compose graph"
+tag = "scrt-cli"
+weight = 2.0
+
+[[goals]]
+name = "conductor-workflow"
+topic = "conductor track spec plan implement sign-off"
+tag = "conductor"
+weight = 1.0
+
+[[goals]]
+name = "tool-calling"
+topic = "tool call function arguments Read Edit Bash Grep"
+tag = "tools"
+weight = 1.5

@@ -242,3 +242,75 @@ palace_search = "auth"
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+// ---------------------------------------------------------------------------
+// Track 20 slice 3 — goal→discover wiring.
+//
+// `EvolveConfig::for_goal(goal)` sets discover.palace_search = goal.topic and
+// discover.palace_tags = [goal.tag] and forces seed = "palace". The contract
+// is one goal ⇄ one tag: only stashes carrying the goal's tag (AND matching its
+// topic) should seed. Reuses the `write_palace` fixture (tags: security/perf).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn goal_scoped_discover_seeds_only_goal_tagged_stashes() {
+    use scrt_evolve::GoalConfig;
+
+    let mut base = std::env::temp_dir();
+    base.push(format!("scrt-evolve-goal-discover-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let corpus = base.join("corpus");
+    let palace_dir = base.join("palace");
+    std::fs::create_dir_all(&corpus).unwrap();
+    std::fs::create_dir_all(&palace_dir).unwrap();
+    std::fs::write(
+        corpus.join("auth.md"),
+        "fn authenticate(user) checks the password.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        corpus.join("cache.md"),
+        "fn cacheget(key) reads from redis.\n",
+    )
+    .unwrap();
+    let palace = write_palace(&palace_dir);
+
+    // A base config with the corpus + palace, plus a seed-everything default
+    // discover block — for_goal must override it to the goal's tag/topic.
+    let toml = format!(
+        r#"
+[evolve]
+corpus_dir = {corpus:?}
+palace_path = {palace:?}
+
+[discover]
+seed = "both"
+cluster = false
+
+[[goals]]
+name = "security-mastery"
+topic = "authenticate"
+tag = "security"
+"#,
+    );
+    let cfg = scrt_evolve::EvolveConfig::from_toml_str(&toml).unwrap();
+    let goal: &GoalConfig = &cfg.goals[0];
+    let per_goal = cfg.for_goal(goal);
+
+    let ctx = discover::run(&per_goal).expect("goal-scoped discover runs");
+
+    // The "security"-tagged auth-flow stash seeds (its "authenticate" pattern);
+    // the "perf"-tagged cache-layer stash is filtered OUT by palace_tags.
+    assert!(
+        ctx.passages.iter().any(|p| p.source.contains("auth.md")),
+        "the security-tagged stash should surface the auth passage"
+    );
+    assert!(
+        !ctx.passages.iter().any(|p| p.source.contains("cache.md")),
+        "palace_tags=[\"security\"] must NOT seed the perf-tagged cache stash, \
+         got sources: {:?}",
+        ctx.passages.iter().map(|p| &p.source).collect::<Vec<_>>()
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
