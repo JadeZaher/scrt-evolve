@@ -44,7 +44,10 @@ pub mod workdir;
 pub mod bridge;
 
 pub use config::{ConfigError, EvalConfig, EvolveConfig, GoalConfig};
-pub use config::{FractionalConfig, HardwareConfig, RegulateConfig};
+pub use config::{
+    ExportConfig, FractionalConfig, HardwareConfig, MergeShardsConfig, RegulateConfig,
+    RuntimeConfig, SamplingConfig,
+};
 pub use dataset::{Dataset, GenExample};
 pub use directive::TrainingDirective;
 pub use discover::DiscoveredContext;

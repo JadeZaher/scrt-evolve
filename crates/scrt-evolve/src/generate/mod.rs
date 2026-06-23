@@ -82,20 +82,27 @@ pub fn plan_modes(kinds: &[String]) -> Vec<GenMode> {
 /// Run generation over a discovered context, producing a dataset.
 pub fn run(cfg: &EvolveConfig, ctx: &DiscoveredContext) -> anyhow::Result<Dataset> {
     let gcfg = cfg.generate.clone().unwrap_or_default();
+    // Compose the active constitution + taste into a steering prompt that is
+    // injected into every generated batch. None ⇒ today's built-in templates.
+    // This is what makes [evolve]/[[goals]] constitution+taste actually shape
+    // the dataset (and downstream training).
+    let steering = cfg.compose_steering();
+    let steer = steering.as_deref();
     match gcfg.backend.as_str() {
         "api" => {
             let backend = ApiEndpoint::from_config(&gcfg)?;
-            run_with_backend(&backend, ctx, &gcfg.kinds, gcfg.per_passage)
+            run_with_backend_steered(&backend, ctx, &gcfg.kinds, gcfg.per_passage, steer)
         }
         "local" => {
             #[cfg(feature = "train")]
             {
                 let model_path = cfg.require_model_path("generate")?;
                 let backend = local::LocalCandle::from_config(&gcfg, model_path)?;
-                run_with_backend(&backend, ctx, &gcfg.kinds, gcfg.per_passage)
+                run_with_backend_steered(&backend, ctx, &gcfg.kinds, gcfg.per_passage, steer)
             }
             #[cfg(not(feature = "train"))]
             {
+                let _ = steer;
                 anyhow::bail!("generate: backend=\"local\" requires the `train` feature (track 03)")
             }
         }
@@ -111,6 +118,21 @@ pub fn run_with_backend<B: GenBackend>(
     ctx: &DiscoveredContext,
     kinds: &[String],
     per_passage: usize,
+) -> anyhow::Result<Dataset> {
+    run_with_backend_steered(backend, ctx, kinds, per_passage, None)
+}
+
+/// Like [`run_with_backend`] but injects an optional `steering` system prompt
+/// (composed constitution + taste) into every batch via `custom_prompt`. The
+/// `steering` is layered as additional guidance on top of each mode's built-in
+/// template (see the backend's `custom_prompt` handling), so values + taste
+/// shape the generated rows without replacing the modality scaffolding.
+pub fn run_with_backend_steered<B: GenBackend>(
+    backend: &B,
+    ctx: &DiscoveredContext,
+    kinds: &[String],
+    per_passage: usize,
+    steering: Option<&str>,
 ) -> anyhow::Result<Dataset> {
     let modes = plan_modes(kinds);
     let prose_kinds: Vec<String> = kinds
@@ -135,7 +157,7 @@ pub fn run_with_backend<B: GenBackend>(
                 kinds: &prose_kinds,
                 per_passage,
                 tools: &tools,
-                custom_prompt: None,
+                custom_prompt: steering,
             };
             match backend.generate(&gctx) {
                 Ok(mut examples) => rows.append(&mut examples),

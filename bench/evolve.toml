@@ -114,6 +114,41 @@ ram_gb = 26.0          # WSL2 cap (set in %USERPROFILE%\.wslconfig; host has 32G
 kernels = ["mamba-ssm", "causal-conv1d"]   # built in the WSL2 venv (verified)
 machine = "WSL2 Ubuntu 24.04 on Win11 | i5-12400F (6c/12t) | 32GB host / 26GB WSL | RTX 4060 8GB (cc 8.9) | venv py3.12 torch 2.5.1+cu121 + mamba-ssm 2.3.2 + causal-conv1d 1.6.2 (Granite GPU backward VERIFIED)"
 
+# --- Export pipeline (config-driven: merge sharded adapter -> GGUF -> place) ---
+# `scrt-evolve export-gguf` runs the whole chain from this block. The fractional
+# trainer emits per-shard adapters; merge_shards unions them first. dtype=bfloat16
+# avoids the float32 OOM on the hybrid model; work_path MUST be a fast native fs
+# (a ~/… WSL path, NOT /mnt/c — big writes there OOM/IO-error). place_dir copies
+# the finished GGUF into LM Studio's models dir.
+[export]
+quant = "Q4_K_M"
+dtype = "bfloat16"
+llama_cpp_path = "~/llama.cpp"                 # fresh checkout w/ granitemoehybrid converter
+work_path = "~/scrt-export"                     # native WSL fs scratch (avoid 9p)
+out_path = "~/scrt-export/granite-scrt-Q4_K_M.gguf"
+place_dir = "/mnt/c/Users/atooz/.lmstudio/models/scrt-evolve/granite-4.0-h-tiny-scrt"
+max_shard_size = "3GB"
+  [export.merge_shards]
+  enabled = true
+  pattern = "adapter-shard-*.safetensors"
+
+# --- Inference runtime: load + run the evolved model for generation ---
+# `scrt-evolve run-model --prompt "..."` serves this. backend=llamacpp runs the
+# exported GGUF efficiently via llama.cpp's llama-completion (handles the hybrid
+# Mamba SSM state properly — the transformers forward OOMs on this 8GB box).
+# n_gpu_layers=99 offloads all that fit; set 0 for pure CPU.
+[runtime]
+backend = "llamacpp"
+model_path = "~/scrt-export/granite-scrt-Q4_K_M.gguf"
+llama_cpp_path = "~/llama.cpp"
+n_ctx = 8192
+n_gpu_layers = 99
+n_threads = 8
+  [runtime.sampling]
+  temperature = 0.0
+  top_p = 1.0
+  max_tokens = 256
+
 [eval]
 # Held-out probe carved from each round's dataset; gates keep|rollback.
 # scorer_backend = transformers scores via [evolve].model_path (Granite)

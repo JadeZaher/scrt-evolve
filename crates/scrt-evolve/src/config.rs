@@ -65,6 +65,16 @@ pub struct EvolveConfig {
     /// defaults. Additive + non-breaking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hardware: Option<HardwareConfig>,
+    /// `[export]` — the config-driven model-export pipeline (merge sharded
+    /// adapter → convert → quantize → place). Absent ⇒ `export-gguf` uses its
+    /// CLI-flag defaults. Additive + non-breaking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export: Option<ExportConfig>,
+    /// `[runtime]` — the inference runtime (load + run a model for generation,
+    /// backend-generic: GGUF via llama.cpp, or HF via transformers). Absent ⇒
+    /// `infer` uses the transformers fallback. Additive + non-breaking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeConfig>,
     /// Learning-by-doing **goals** (track 20). Each `[[goals]]` table declares
     /// something a local model should evolve toward and how its traces are
     /// captured (topic ⇄ palace search, tag ⇄ palace tag). Additive + non-
@@ -114,6 +124,15 @@ pub struct GoalConfig {
     /// on-demand. Lane-gated (the scheduler is slice 9).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cadence: Option<String>,
+    /// Per-goal constitution override/addition — values specific to this goal,
+    /// layered on top of the global `[evolve].constitution`. Composed into the
+    /// goal's generate system prompt (the steering seam).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constitution: Option<String>,
+    /// Per-goal taste override/addition — representational form specific to this
+    /// goal, layered on the global `[evolve].taste`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taste: Option<String>,
 }
 
 /// `[evolve]` — the top section. `model_path` is the one thing most stages
@@ -134,6 +153,17 @@ pub struct EvolveSection {
     /// `.scrt-evolve` (see [`EvolveSection::work_dir_or_default`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_dir: Option<PathBuf>,
+    /// GLOBAL constitution — values that drive HOW the model should process /
+    /// answer (applied to every goal's generation). Composed into the generate
+    /// system prompt (the `custom_prompt` steering seam). Minimal slice of the
+    /// taste/meta-object substrate (tracks 21/22); a plain string for now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constitution: Option<String>,
+    /// GLOBAL taste — the representational FORM ideas should take (style,
+    /// structure, conventions). Composed into the generate system prompt
+    /// alongside `constitution`. Minimal slice; a plain string for now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taste: Option<String>,
 }
 
 impl EvolveSection {
@@ -564,6 +594,14 @@ pub struct FractionalConfig {
     /// passes setting (trade time for memory); pair with `block_size = 1`.
     #[serde(default = "default_granularity")]
     pub granularity: String,
+    /// Learning objective: `distill` (default — block-local MSE vs the frozen
+    /// block's own output; a representation/regularization signal that does NOT
+    /// impart new knowledge) or `end_task` (the FINAL shard learns real
+    /// cross-entropy against the completion tokens via the LM head — the actual
+    /// KNOWLEDGE signal; use this to teach the model new content). Non-final
+    /// shards still distill under `end_task`.
+    #[serde(default = "default_objective")]
+    pub objective: String,
 }
 
 fn default_calib_batches() -> usize {
@@ -571,6 +609,9 @@ fn default_calib_batches() -> usize {
 }
 fn default_granularity() -> String {
     "block".to_string()
+}
+fn default_objective() -> String {
+    "distill".to_string()
 }
 
 impl Default for FractionalConfig {
@@ -581,6 +622,197 @@ impl Default for FractionalConfig {
             shards: None,
             calib_batches: default_calib_batches(),
             granularity: default_granularity(),
+            objective: default_objective(),
+        }
+    }
+}
+
+/// `[export]` — config-driven model-export pipeline: merge (sharded) adapter →
+/// convert to GGUF → quantize → place. Every knob the manual pipeline needed —
+/// sharding-merge rules, the merge-load dtype/device, the format conversion
+/// target, source (llama.cpp) + scratch + target weight paths — lives here so
+/// `scrt-evolve export-gguf` runs the whole chain from config. Absent ⇒ the CLI
+/// falls back to its flag defaults (non-breaking). Generic + architecture-level.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportConfig {
+    /// Target quantization / output format: `Q4_K_M` | `Q5_K_M` | `Q6_K` |
+    /// `Q8_0` | `f16` | `none` | … (any llama.cpp quant; `f16`/`none` skip the
+    /// quantize step). The "format conversion" target.
+    #[serde(default = "default_export_quant")]
+    pub quant: String,
+    /// dtype to load the base model in during the MERGE stage. `bfloat16`
+    /// (default) avoids the float32 OOM on large/hybrid models; `float32` for
+    /// max fidelity on small models.
+    #[serde(default = "default_export_dtype")]
+    pub dtype: String,
+    /// Path to a llama.cpp checkout providing `convert_hf_to_gguf.py` +
+    /// `llama-quantize` (the conversion SOURCE tooling). Auto-detected if unset
+    /// (`$LLAMA_CPP`, `~/llama.cpp`, `~/.unsloth/llama.cpp`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llama_cpp_path: Option<String>,
+    /// Scratch directory for intermediates (merged HF dir + f16 GGUF). Point
+    /// this at a FAST native filesystem — on WSL, a `~/…` path, NOT a `/mnt/c`
+    /// 9p mount (large writes there OOM / I/O-error). Default: alongside `out`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_path: Option<String>,
+    /// Final GGUF output path (the TARGET weight file). Default:
+    /// `work_dir/<model>-<quant>.gguf`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out_path: Option<String>,
+    /// Optional directory to PLACE (copy) the finished GGUF into — e.g. an LM
+    /// Studio models dir. Absent ⇒ leave it at `out_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub place_dir: Option<String>,
+    /// `save_pretrained` shard size for the merged HF dir (caps the per-file
+    /// write so a big model doesn't spike RAM). Default `3GB`.
+    #[serde(default = "default_max_shard_size")]
+    pub max_shard_size: String,
+    /// Keep the intermediate merged-HF dir + f16 GGUF (default false ⇒ cleaned).
+    #[serde(default)]
+    pub keep_intermediates: bool,
+    /// `[export.merge_shards]` — how to combine the per-shard adapter files that
+    /// fractional training emits into the single `adapter.safetensors` the merge
+    /// stage consumes. Absent ⇒ assume a single-file adapter already.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_shards: Option<MergeShardsConfig>,
+}
+
+/// `[export.merge_shards]` — sharding-merge rules.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeShardsConfig {
+    /// Master switch. `false` ⇒ skip the merge (adapter is already single-file).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Glob (relative to the adapter dir) matching the per-shard weight files.
+    /// Their keys are global-layer-indexed, so the union is order-independent.
+    #[serde(default = "default_shard_glob")]
+    pub pattern: String,
+}
+
+fn default_export_quant() -> String {
+    "Q4_K_M".to_string()
+}
+fn default_export_dtype() -> String {
+    "bfloat16".to_string()
+}
+fn default_max_shard_size() -> String {
+    "3GB".to_string()
+}
+fn default_shard_glob() -> String {
+    "adapter-shard-*.safetensors".to_string()
+}
+
+impl Default for ExportConfig {
+    fn default() -> Self {
+        Self {
+            quant: default_export_quant(),
+            dtype: default_export_dtype(),
+            llama_cpp_path: None,
+            work_path: None,
+            out_path: None,
+            place_dir: None,
+            max_shard_size: default_max_shard_size(),
+            keep_intermediates: false,
+            merge_shards: None,
+        }
+    }
+}
+
+impl Default for MergeShardsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            pattern: default_shard_glob(),
+        }
+    }
+}
+
+/// `[runtime]` — the inference runtime: how to LOAD + RUN a model efficiently for
+/// generation, config-driven and backend-generic. `scrt-evolve infer/run-model`
+/// use this to serve the evolved model (or any model). Absent ⇒ infer falls back
+/// to the transformers HF path against `[evolve].model_path`. Additive.
+///
+/// `backend` selects the engine by an internal registry (no brand logic):
+///   - `llamacpp`  → a GGUF served via the llama.cpp `llama-cli` runner
+///     (efficient quantized inference; the right path for hybrid-SSM models whose
+///     naive transformers forward OOMs — llama.cpp handles SSM state properly).
+///   - `transformers` → a HuggingFace model via the Python `scrt_evolve_infer`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeConfig {
+    /// Inference engine: `llamacpp` (GGUF) | `transformers` (HF dir).
+    #[serde(default = "default_runtime_backend")]
+    pub backend: String,
+    /// Weights to serve. For `llamacpp` a `.gguf` file; for `transformers` an HF
+    /// model dir. Absent ⇒ fall back to `[export].out_path` (llamacpp) or
+    /// `[evolve].model_path` (transformers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_path: Option<String>,
+    /// Path to the llama.cpp checkout/build providing the `llama-cli` runner
+    /// (llamacpp backend). Auto-detected if unset (shared with `[export]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llama_cpp_path: Option<String>,
+    /// Context window (tokens). Transcript-derived prompts are long — keep ≥ 8192.
+    #[serde(default = "default_n_ctx")]
+    pub n_ctx: usize,
+    /// Layers to offload to the GPU (llamacpp `-ngl`). 0 ⇒ pure CPU; a high
+    /// value (e.g. 99) ⇒ offload all that fit. Generic VRAM/speed knob.
+    #[serde(default)]
+    pub n_gpu_layers: usize,
+    /// CPU threads for generation. 0 ⇒ let the engine choose.
+    #[serde(default)]
+    pub n_threads: usize,
+    /// Sampling controls for generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<SamplingConfig>,
+}
+
+/// `[runtime.sampling]` — decoding controls.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SamplingConfig {
+    /// 0.0 ⇒ greedy (deterministic); >0 ⇒ sampled.
+    #[serde(default)]
+    pub temperature: f32,
+    /// Nucleus sampling cutoff (1.0 ⇒ off).
+    #[serde(default = "default_top_p")]
+    pub top_p: f32,
+    /// Max new tokens to generate per prompt.
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: usize,
+}
+
+fn default_runtime_backend() -> String {
+    "llamacpp".to_string()
+}
+fn default_n_ctx() -> usize {
+    8192
+}
+fn default_top_p() -> f32 {
+    1.0
+}
+fn default_max_tokens() -> usize {
+    256
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_runtime_backend(),
+            model_path: None,
+            llama_cpp_path: None,
+            n_ctx: default_n_ctx(),
+            n_gpu_layers: 0,
+            n_threads: 0,
+            sampling: None,
+        }
+    }
+}
+
+impl Default for SamplingConfig {
+    fn default() -> Self {
+        Self {
+            temperature: 0.0,
+            top_p: default_top_p(),
+            max_tokens: default_max_tokens(),
         }
     }
 }
@@ -884,7 +1116,48 @@ impl EvolveConfig {
         dcfg.palace_tags = vec![goal.tag.clone()];
         cfg.discover = Some(dcfg);
 
+        // Layer the goal's constitution/taste ON TOP of the global ones so the
+        // composed config carries the goal-specific steering (global base +
+        // goal addition). The composer (`compose_steering`) renders both.
+        if let Some(gc) = &goal.constitution {
+            cfg.evolve.constitution = Some(match &cfg.evolve.constitution {
+                Some(base) => format!("{base}\n{gc}"),
+                None => gc.clone(),
+            });
+        }
+        if let Some(gt) = &goal.taste {
+            cfg.evolve.taste = Some(match &cfg.evolve.taste {
+                Some(base) => format!("{base}\n{gt}"),
+                None => gt.clone(),
+            });
+        }
+
         cfg
+    }
+
+    /// Compose the active constitution + taste into a single steering block to be
+    /// injected as the generate `custom_prompt` (the seam that lets values +
+    /// representational form shape the dataset, and thus training). Returns
+    /// `None` when neither is set (preserves today's built-in-template behavior).
+    pub fn compose_steering(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(c) = self.evolve.constitution.as_ref().map(|s| s.trim()) {
+            if !c.is_empty() {
+                parts.push(format!(
+                    "## Constitution (values that drive how you answer)\n{c}"
+                ));
+            }
+        }
+        if let Some(t) = self.evolve.taste.as_ref().map(|s| s.trim()) {
+            if !t.is_empty() {
+                parts.push(format!("## Taste (the form ideas should take)\n{t}"));
+            }
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n\n"))
+        }
     }
 }
 

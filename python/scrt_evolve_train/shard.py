@@ -241,16 +241,27 @@ def train_sharded(args: Any) -> None:
     all_summaries: list[dict[str, Any]] = []
     total_adapters = 0
 
+    # Objective: `distill` (block-local MSE-vs-self — a representation/regularize
+    # signal) or `end_task` (the FINAL shard learns real cross-entropy against the
+    # completion tokens via the LM head — the actual KNOWLEDGE signal). Under
+    # end_task, non-final shards still distill; the final shard does CE.
+    objective = (getattr(args, "objective", "distill") or "distill").strip()
+    final_norm = _find_final_norm(model)
+    lm_head = model.get_output_embeddings()
+
     for shard_id, (a, b) in selected:
+        is_final = b >= n_layers
         # The activations we need: the input to layer `a` (boundary). Capture by
         # streaming the frozen prefix [0, a) — peak VRAM stays at one layer.
         per_batch_in: list[torch.Tensor] = []
+        per_batch_labels: list[torch.Tensor] = []
         for batch in batches:
             ids = batch["input_ids"].to(device)
             with torch.no_grad():
                 emb = embed(ids).to(dtype)
             caps = capture_boundaries(model, layers, [a], emb, device, layer_kwargs)
             per_batch_in.append(caps[a])
+            per_batch_labels.append(batch["labels"])
 
         # Build this shard's block, attach LoRA (params init on CPU), THEN move
         # the whole block — base + freshly created LoRA params — to the device
@@ -276,7 +287,19 @@ def train_sharded(args: Any) -> None:
         _maybe_enable_qat(args, block)
 
         granularity = getattr(args, "granularity", "block") or "block"
-        if granularity == "module":
+        if objective == "end_task" and is_final:
+            # The FINAL shard learns the real end-task signal: block → norm →
+            # head → CE on completions. Real knowledge gradient, bounded VRAM.
+            first_loss, last_loss = _train_final_shard_end_task(
+                block, final_norm, lm_head, per_batch_in, per_batch_labels,
+                device, dtype, layer_kwargs, args, shard_id,
+            )
+            print(
+                f"INFO[shard {shard_id}]: end-task CE on final block "
+                f"(layers {a}:{b}) — first={first_loss:.4f} last={last_loss:.4f}",
+                file=sys.stderr,
+            )
+        elif granularity == "module":
             # PER-MODULE SUB-LAYER microsharding: train ONE submodule group at a
             # time within each layer, against that LAYER's frozen-output teacher.
             # Only the active group's LoRA gets gradients; the rest of the layer
@@ -346,6 +369,7 @@ def train_sharded(args: Any) -> None:
     summary = {
         "mode": "sharded",
         "granularity": getattr(args, "granularity", "block") or "block",
+        "objective": objective,
         "shards": all_summaries,
         "n_shards_trained": len(all_summaries),
         "total_adapters": total_adapters,
@@ -369,6 +393,98 @@ def _run_block(block: nn.ModuleList, hidden: torch.Tensor, layer_kwargs: dict[st
     for layer in block:
         h = _layer_call(layer, h, **layer_kwargs)
     return h
+
+
+def _find_final_norm(model: nn.Module) -> nn.Module | None:
+    """Locate the model's final norm (applied after the last decoder layer,
+    before the LM head). Generic: the `.norm`/`.final_layernorm`/`.ln_f` child of
+    the decoder backbone (`model.model` on most HF causal-LMs)."""
+    backbone = getattr(model, "model", model)
+    for name in ("norm", "final_layernorm", "ln_f", "final_norm"):
+        m = getattr(backbone, name, None)
+        if isinstance(m, nn.Module):
+            return m
+    return None
+
+
+def _train_final_shard_end_task(
+    block: nn.ModuleList,
+    final_norm: nn.Module | None,
+    lm_head: nn.Module,
+    per_batch_in: list[torch.Tensor],
+    per_batch_labels: list[torch.Tensor],
+    device: torch.device,
+    dtype: torch.dtype,
+    layer_kwargs: dict[str, Any],
+    args: Any,
+    shard_id: int,
+) -> tuple[float, float]:
+    """END-TASK objective for the FINAL shard: run the block (LoRA on) → final
+    norm → LM head → cross-entropy against the completion labels. The boundary
+    input is the cached frozen-prefix activation, so gradient flows ONLY through
+    the final block's LoRA (the norm + head run frozen). This is the real
+    knowledge signal — unlike block-local distillation, the target is the DESIRED
+    tokens, not the block's own output. Footprint ≈ one block + head + logits.
+
+    Labels follow the dataset convention: -100 on prompt/pad, completion ids
+    elsewhere (loss only on completions). Shapes are [batch, seq].
+    """
+    # final norm + head resident, frozen (no grad on their params).
+    if final_norm is not None:
+        final_norm.to(device)
+        for p in final_norm.parameters():
+            p.requires_grad_(False)
+    lm_head.to(device)
+    for p in lm_head.parameters():
+        p.requires_grad_(False)
+
+    lora_params = [
+        p for m in block.modules() if isinstance(m, LoRALinear) for p in (m.lora_A, m.lora_B)
+    ]
+    optimizer = torch.optim.AdamW(lora_params, lr=args.lr)
+
+    first_loss: float | None = None
+    last_loss = 0.0
+    n = len(per_batch_in)
+    for step in range(args.steps):
+        in_k = per_batch_in[step % n].to(device).to(dtype)
+        labels = per_batch_labels[step % n].to(device)
+
+        # Final block with LoRA active → norm → head → logits.
+        for m in block.modules():
+            if isinstance(m, LoRALinear):
+                m.lora_disabled = False
+        h = in_k
+        for layer in block:
+            h = _layer_call(layer, h, **layer_kwargs)
+        if final_norm is not None:
+            h = final_norm(h)
+        logits = lm_head(h)
+
+        # Causal LM shift: predict token t+1 from position t; CE on completions.
+        shift_logits = logits[:, :-1, :].float()
+        shift_labels = labels[:, 1:]
+        loss = torch.nn.functional.cross_entropy(
+            shift_logits.reshape(-1, shift_logits.size(-1)),
+            shift_labels.reshape(-1),
+            ignore_index=-100,
+        )
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        lv = loss.item()
+        if first_loss is None:
+            first_loss = lv
+        last_loss = lv
+        if (step + 1) % args.log_every == 0 or step == 0:
+            print(
+                f"shard {shard_id} [end_task] step {step+1}/{args.steps} ce_loss={lv:.6f}",
+                file=sys.stderr,
+            )
+
+    return (first_loss or 0.0, last_loss)
 
 
 # ---------------------------------------------------------------------------

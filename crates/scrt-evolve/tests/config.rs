@@ -454,8 +454,16 @@ preset = "lora"
     assert_eq!(f.block_size, Some(8));
     assert_eq!(f.shards, None);
     assert_eq!(f.calib_batches, 8);
-    // granularity defaults to "block" when omitted (non-breaking).
+    // granularity + objective default when omitted (non-breaking).
     assert_eq!(f.granularity, "block");
+    assert_eq!(f.objective, "distill");
+
+    // explicit end_task objective round-trips.
+    let et = EvolveConfig::from_toml_str(
+        "[train]\npreset=\"lora\"\n  [train.fractional]\n  objective=\"end_task\"\n",
+    )
+    .unwrap();
+    assert_eq!(et.train.unwrap().fractional.unwrap().objective, "end_task");
 
     // Round-trips.
     let ser = toml::to_string(&cfg).unwrap();
@@ -475,6 +483,100 @@ preset = "lora"
     // Absent ⇒ None (dense training; non-breaking).
     let plain = EvolveConfig::from_toml_str("[train]\npreset = \"lora\"").unwrap();
     assert!(plain.train.unwrap().fractional.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// `[export]` config-driven export pipeline (additive).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn export_config_round_trips_with_merge_shards_and_defaults() {
+    let toml = r#"
+[export]
+quant = "Q5_K_M"
+dtype = "bfloat16"
+llama_cpp_path = "~/llama.cpp"
+work_path = "~/scrt-export"
+place_dir = "/models/lmstudio"
+max_shard_size = "3GB"
+  [export.merge_shards]
+  enabled = true
+  pattern = "adapter-shard-*.safetensors"
+"#;
+    let cfg = EvolveConfig::from_toml_str(toml).unwrap();
+    let e = cfg.export.as_ref().expect("[export]");
+    assert_eq!(e.quant, "Q5_K_M");
+    assert_eq!(e.dtype, "bfloat16");
+    assert_eq!(e.llama_cpp_path.as_deref(), Some("~/llama.cpp"));
+    assert_eq!(e.work_path.as_deref(), Some("~/scrt-export"));
+    assert_eq!(e.place_dir.as_deref(), Some("/models/lmstudio"));
+    let ms = e.merge_shards.as_ref().expect("[export.merge_shards]");
+    assert!(ms.enabled);
+    assert_eq!(ms.pattern, "adapter-shard-*.safetensors");
+
+    // Round-trips.
+    let ser = toml::to_string(&cfg).unwrap();
+    let back = EvolveConfig::from_toml_str(&ser).unwrap();
+    assert_eq!(back.export.unwrap().quant, "Q5_K_M");
+
+    // Defaults when fields omitted: quant Q4_K_M, dtype bfloat16, shard 3GB.
+    let minimal = EvolveConfig::from_toml_str("[export]\n").unwrap();
+    let e2 = minimal.export.unwrap();
+    assert_eq!(e2.quant, "Q4_K_M");
+    assert_eq!(e2.dtype, "bfloat16");
+    assert_eq!(e2.max_shard_size, "3GB");
+    assert!(e2.merge_shards.is_none());
+
+    // Absent ⇒ None (CLI flag defaults; non-breaking).
+    let none = EvolveConfig::from_toml_str("[evolve]\nmodel_path=\"/m\"").unwrap();
+    assert!(none.export.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// `[runtime]` inference runtime config (additive).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn runtime_config_round_trips_with_sampling_and_defaults() {
+    let toml = r#"
+[runtime]
+backend = "llamacpp"
+model_path = "/m/model-Q4_K_M.gguf"
+llama_cpp_path = "~/llama.cpp"
+n_ctx = 8192
+n_gpu_layers = 99
+n_threads = 8
+  [runtime.sampling]
+  temperature = 0.2
+  top_p = 0.95
+  max_tokens = 128
+"#;
+    let cfg = EvolveConfig::from_toml_str(toml).unwrap();
+    let r = cfg.runtime.as_ref().expect("[runtime]");
+    assert_eq!(r.backend, "llamacpp");
+    assert_eq!(r.model_path.as_deref(), Some("/m/model-Q4_K_M.gguf"));
+    assert_eq!(r.n_ctx, 8192);
+    assert_eq!(r.n_gpu_layers, 99);
+    let s = r.sampling.as_ref().expect("[runtime.sampling]");
+    assert_eq!(s.max_tokens, 128);
+    assert!((s.top_p - 0.95).abs() < 1e-6);
+
+    // Round-trips.
+    let ser = toml::to_string(&cfg).unwrap();
+    let back = EvolveConfig::from_toml_str(&ser).unwrap();
+    assert_eq!(back.runtime.unwrap().n_gpu_layers, 99);
+
+    // Defaults when omitted: backend llamacpp, n_ctx 8192, ngl 0.
+    let minimal = EvolveConfig::from_toml_str("[runtime]\n").unwrap();
+    let r2 = minimal.runtime.unwrap();
+    assert_eq!(r2.backend, "llamacpp");
+    assert_eq!(r2.n_ctx, 8192);
+    assert_eq!(r2.n_gpu_layers, 0);
+    assert!(r2.sampling.is_none());
+
+    // Absent ⇒ None (transformers fallback; non-breaking).
+    let none = EvolveConfig::from_toml_str("[evolve]\nmodel_path=\"/m\"").unwrap();
+    assert!(none.runtime.is_none());
 }
 
 #[test]

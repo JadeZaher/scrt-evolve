@@ -13,11 +13,22 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use scrt_evolve::{EvolveConfig, WorkDir};
 
+mod config_reference;
+use config_reference::{CONFIG_REFERENCE, CONFIG_TEMPLATE};
+
 #[derive(Parser)]
 #[command(
     name = "scrt-evolve",
     version,
-    about = "Make a model better at its own corpus — discover → generate → train."
+    about = "Make a model better at its own corpus — discover → generate → train → export → run.",
+    long_about = "scrt-evolve — opinionated local LLM training + model tooling.\n\n\
+        Everything is driven by an `evolve.toml` config. Run `scrt-evolve config-reference`\n\
+        for the FULL annotated schema of every config block (the recommended starting\n\
+        point for coding agents configuring this for a user), or `scrt-evolve init` to\n\
+        scaffold a commented evolve.toml.\n\n\
+        Pipeline: discover → generate → train (dense | fractional/sharded GPU) → export\n\
+        (merge → GGUF → quantize → place) → run-model (llama.cpp / transformers). The\n\
+        `evolve --schedule` umbrella runs the eval-gated multi-goal loop."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -161,6 +172,34 @@ enum Command {
         /// Default: python.
         #[arg(long)]
         python: Option<String>,
+    },
+    /// Run a model for generation through the config-driven inference RUNTIME.
+    ///
+    /// Driven by the `[runtime]` block in evolve.toml (backend / model_path /
+    /// n_ctx / n_gpu_layers / n_threads / [runtime.sampling]). `backend =
+    /// "llamacpp"` serves a GGUF efficiently via llama.cpp's `llama-completion`
+    /// (the right path for hybrid-SSM models whose naive transformers forward
+    /// OOMs); `backend = "transformers"` runs a HF dir via Python. This is the
+    /// serving lane; use `infer` for HF base-vs-adapter A/B comparison.
+    RunModel {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// The prompt to generate from. Required.
+        #[arg(long)]
+        prompt: String,
+        /// Python interpreter for the `transformers` backend. Default: python.
+        #[arg(long)]
+        python: Option<String>,
+    },
+    /// Print the full annotated `evolve.toml` config schema — every block, field,
+    /// default, and purpose. The recommended reference for coding agents
+    /// configuring scrt-evolve for a user. `--toml` prints a copy-pasteable
+    /// commented template; default prints the reference doc.
+    ConfigReference {
+        /// Print a copy-pasteable commented evolve.toml template instead of the
+        /// reference doc.
+        #[arg(long)]
+        toml: bool,
     },
     /// Merge a LoRA adapter into the base model and export a quantized GGUF
     /// (for LM Studio / llama.cpp).
@@ -462,6 +501,25 @@ fn run() -> Result<()> {
                 chat,
                 python,
             )
+        }
+        Command::RunModel {
+            config,
+            prompt,
+            python,
+        } => {
+            let cfg = EvolveConfig::load(&config)?;
+            cmd_run_model(&cfg, &prompt, python)
+        }
+        Command::ConfigReference { toml } => {
+            print!(
+                "{}",
+                if toml {
+                    CONFIG_TEMPLATE
+                } else {
+                    CONFIG_REFERENCE
+                }
+            );
+            Ok(())
         }
         Command::ExportGguf {
             config,
@@ -1311,6 +1369,7 @@ fn cmd_train_transformers(
             cmd.arg("--calib-batches")
                 .arg(frac.calib_batches.to_string());
             cmd.arg("--granularity").arg(&frac.granularity);
+            cmd.arg("--objective").arg(&frac.objective);
         }
     }
 
@@ -1444,6 +1503,123 @@ fn cmd_infer(
     Ok(())
 }
 
+/// Config-driven inference RUNTIME (`run-model`): load + run a model for
+/// generation per `[runtime]`. Backend-generic — `llamacpp` serves a GGUF via
+/// the llama.cpp `llama-cli` runner (efficient quantized inference; the right
+/// path for hybrid-SSM models whose naive transformers forward OOMs), and
+/// `transformers` falls through to the Python HF path. This is the dedicated
+/// serving lane (vs. `infer`, which is the HF base-vs-adapter A/B comparison).
+fn cmd_run_model(cfg: &EvolveConfig, prompt: &str, python: Option<String>) -> Result<()> {
+    let rt = cfg.runtime.clone().unwrap_or_default();
+    let sampling = rt.sampling.clone().unwrap_or_default();
+
+    match rt.backend.as_str() {
+        "llamacpp" => {
+            // Resolve the GGUF: [runtime].model_path > [export].out_path.
+            let gguf = rt
+                .model_path
+                .clone()
+                .or_else(|| cfg.export.as_ref().and_then(|e| e.out_path.clone()))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "run-model(llamacpp): set [runtime].model_path (a .gguf) \
+                         or [export].out_path"
+                    )
+                })?;
+            // Resolve the llama-cli runner from [runtime] or [export] llama.cpp path.
+            let llama_root = rt
+                .llama_cpp_path
+                .clone()
+                .or_else(|| cfg.export.as_ref().and_then(|e| e.llama_cpp_path.clone()))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "run-model(llamacpp): set [runtime].llama_cpp_path (or \
+                         [export].llama_cpp_path) to a llama.cpp build with llama-cli"
+                    )
+                })?;
+            // `llama-completion` is the non-interactive runner in current
+            // llama.cpp (the old `llama-cli` no longer supports `-no-cnv`).
+            let root = llama_root.trim_end_matches('/');
+            let cli = format!("{root}/build/bin/llama-completion");
+
+            let mut cmd = std::process::Command::new(&cli);
+            cmd.arg("-m")
+                .arg(&gguf)
+                .arg("-p")
+                .arg(prompt)
+                .arg("-n")
+                .arg(sampling.max_tokens.to_string())
+                .arg("--temp")
+                .arg(sampling.temperature.to_string())
+                .arg("--top-p")
+                .arg(sampling.top_p.to_string())
+                .arg("-c")
+                .arg(rt.n_ctx.to_string())
+                .arg("-ngl")
+                .arg(rt.n_gpu_layers.to_string());
+            if rt.n_threads > 0 {
+                cmd.arg("-t").arg(rt.n_threads.to_string());
+            }
+            println!(
+                "run-model(llamacpp): {cli}  (gguf={gguf}, ctx={}, ngl={}, temp={})",
+                rt.n_ctx, rt.n_gpu_layers, sampling.temperature
+            );
+            let status = cmd
+                .status()
+                .with_context(|| format!("launching llama-completion at {cli}"))?;
+            if !status.success() {
+                anyhow::bail!("run-model(llamacpp): llama-cli exited with {status}");
+            }
+            Ok(())
+        }
+        "transformers" => {
+            // Fall through to the Python HF inference path; model from
+            // [runtime].model_path or [evolve].model_path.
+            let model = rt
+                .model_path
+                .clone()
+                .map(PathBuf::from)
+                .or_else(|| cfg.evolve.model_path.clone())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "run-model(transformers): set [runtime].model_path or \
+                         [evolve].model_path"
+                    )
+                })?;
+            let pkg_parent = find_python_pkg_dir()
+                .ok_or_else(|| anyhow::anyhow!("run-model: could not locate python/ dir"))?;
+            let py = python.unwrap_or_else(|| "python".to_string());
+            let mut cmd = std::process::Command::new(&py);
+            cmd.arg("-m")
+                .arg("scrt_evolve_infer")
+                .arg("--model")
+                .arg(&model)
+                .arg("--prompt")
+                .arg(prompt)
+                .arg("--max-new-tokens")
+                .arg(sampling.max_tokens.to_string())
+                .arg("--temperature")
+                .arg(sampling.temperature.to_string())
+                .env("PYTHONPATH", &pkg_parent);
+            println!(
+                "run-model(transformers): {py} -m scrt_evolve_infer  (model={})",
+                model.display()
+            );
+            let status = cmd
+                .status()
+                .with_context(|| format!("launching `{py} -m scrt_evolve_infer`"))?;
+            if !status.success() {
+                anyhow::bail!("run-model(transformers): python exited with {status}");
+            }
+            Ok(())
+        }
+        other => anyhow::bail!(
+            "run-model: unknown [runtime].backend '{other}' \
+             (expected 'llamacpp' or 'transformers')"
+        ),
+    }
+}
+
 /// Convert a GGUF to an HF safetensors dir (track 23) by shelling out to
 /// `python -m scrt_evolve_dequant`. Generic + registry-driven; the Rust side is
 /// a thin shim (gguf-py on PYTHONPATH, like export-gguf).
@@ -1548,6 +1724,17 @@ fn cmd_export_gguf(
     let wd = WorkDir::from_config(cfg);
     let adapter_dir = adapter.unwrap_or_else(|| wd.root().join("adapter"));
 
+    // `[export]` config is the source of defaults; explicit CLI flags override.
+    let exp = cfg.export.clone().unwrap_or_default();
+
+    // quant: the CLI default ("Q4_K_M") is also the config default, so prefer
+    // the config value unless the user passed a non-default flag.
+    let quant_eff: String = if quant == "Q4_K_M" {
+        exp.quant.clone()
+    } else {
+        quant.to_string()
+    };
+
     let pkg_parent = find_python_pkg_dir()
         .ok_or_else(|| anyhow::anyhow!("export-gguf: could not locate python/ dir"))?;
 
@@ -1560,25 +1747,49 @@ fn cmd_export_gguf(
         .arg("--adapter")
         .arg(&adapter_dir)
         .arg("--quant")
-        .arg(quant)
+        .arg(&quant_eff)
+        .arg("--dtype")
+        .arg(&exp.dtype)
+        .arg("--max-shard-size")
+        .arg(&exp.max_shard_size)
         .env("PYTHONPATH", &pkg_parent);
 
+    // out: CLI flag > [export].out_path > python default.
     if let Some(o) = &out {
         cmd.arg("--out").arg(o);
+    } else if let Some(o) = &exp.out_path {
+        cmd.arg("--out").arg(o);
     }
+    // llama.cpp: CLI flag > [export].llama_cpp_path > python auto-detect.
     if let Some(lc) = &llama_cpp {
         cmd.arg("--llama-cpp").arg(lc);
+    } else if let Some(lc) = &exp.llama_cpp_path {
+        cmd.arg("--llama-cpp").arg(lc);
     }
-    if keep_intermediates {
+    // scratch + placement from config.
+    if let Some(w) = &exp.work_path {
+        cmd.arg("--work-dir").arg(w);
+    }
+    if let Some(p) = &exp.place_dir {
+        cmd.arg("--place-dir").arg(p);
+    }
+    // sharding-merge rule: union per-shard adapters first when enabled.
+    if let Some(ms) = &exp.merge_shards {
+        if ms.enabled {
+            cmd.arg("--merge-shards").arg(&ms.pattern);
+        }
+    }
+    if keep_intermediates || exp.keep_intermediates {
         cmd.arg("--keep-merged").arg("--keep-f16");
     }
 
     println!(
-        "export-gguf: {} -m scrt_evolve_gguf  (model={}, adapter={}, quant={})",
+        "export-gguf: {} -m scrt_evolve_gguf  (model={}, adapter={}, quant={}, dtype={})",
         py,
         model_path.display(),
         adapter_dir.display(),
-        quant,
+        quant_eff,
+        exp.dtype,
     );
 
     let status = cmd

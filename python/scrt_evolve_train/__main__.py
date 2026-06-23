@@ -214,6 +214,19 @@ def build_parser() -> argparse.ArgumentParser:
             "most passes (trade time for memory). Pair with --block-size 1."
         ),
     )
+    p.add_argument(
+        "--objective",
+        default="distill",
+        choices=["distill", "end_task"],
+        help=(
+            "Sharded learning objective. 'distill' (default): block-local MSE vs "
+            "the frozen block's own output — a representation/regularization signal "
+            "(does NOT impart new knowledge). 'end_task': the FINAL shard trains "
+            "real cross-entropy against the completion tokens via the LM head (the "
+            "actual knowledge signal — use this to teach the model new content). "
+            "Non-final shards still distill under end_task."
+        ),
+    )
 
     return p
 

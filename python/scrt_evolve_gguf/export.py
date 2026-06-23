@@ -245,11 +245,22 @@ def _apply_and_merge_adapter(model: nn.Module, adapter_dir: Path) -> None:
             f"ERROR: {len(unmatched)} adapter tensor(s) had no matching "
             "LoRALinear:\n" + "\n".join(f"  {k}" for k in sorted(unmatched))
         )
+    # Modules with no loaded weights are EXPECTED for a PARTIAL adapter — e.g. a
+    # single fractional shard only carries its own layers' tensors. Those
+    # modules keep their zero-init LoRA (delta == 0), so merging them is a no-op
+    # and leaves the base weights untouched. Warn (don't fail) so partial /
+    # single-shard adapters export cleanly. A FULLY-empty load is still an error.
     missing = set(lora_modules.keys()) - modules_loaded
-    if missing:
+    if not modules_loaded:
         sys.exit(
-            f"ERROR: {len(missing)} LoRALinear module(s) received no weights:\n"
-            + "\n".join(f"  {k}" for k in sorted(missing))
+            "ERROR: the adapter loaded ZERO LoRALinear weights — target_modules "
+            "likely don't match the base model. Check the adapter_config.json."
+        )
+    if missing:
+        print(
+            f"INFO: {len(missing)} LoRALinear module(s) outside this adapter's "
+            f"coverage kept as base (partial/single-shard adapter — expected).",
+            file=sys.stderr,
         )
 
     print(
@@ -376,6 +387,11 @@ def export_gguf(
     llama_cpp_dir: str,
     keep_merged: bool = False,
     keep_f16: bool = False,
+    dtype: str = "bfloat16",
+    max_shard_size: str = "3GB",
+    merge_shards_pattern: str | None = None,
+    work_dir: str | None = None,
+    place_dir: str | None = None,
 ) -> dict[str, Any]:
     """
     Run the full 3-stage merge → convert → quantize pipeline.
@@ -423,9 +439,25 @@ def export_gguf(
 
     stem = out_path_p.stem  # used for intermediate file names
 
-    # Intermediate paths inside out_dir
-    merged_hf_dir = out_dir / "_merged_hf"
-    f16_gguf_path = out_dir / f"{stem}-f16.gguf"
+    # Intermediate scratch: prefer an explicit work_dir (point at a FAST native
+    # fs — on WSL a ~/… path, NOT /mnt/c 9p, where big writes OOM/IO-error).
+    scratch = Path(work_dir).resolve() if work_dir else out_dir
+    scratch.mkdir(parents=True, exist_ok=True)
+    merged_hf_dir = scratch / "_merged_hf"
+    f16_gguf_path = scratch / f"{stem}-f16.gguf"
+
+    # Stage 0 — MERGE SHARDS (config-driven): if the adapter dir holds per-shard
+    # files, union them into the single adapter.safetensors the merge expects.
+    if adapter_dir is not None and merge_shards_pattern:
+        from .merge_shards import merge_shard_adapters
+
+        ms = merge_shard_adapters(adapter_dir, merge_shards_pattern)
+        print(f"INFO: [stage 0] merge-shards: {json.dumps(ms)}", file=sys.stderr)
+
+    # Resolve merge-load dtype (bfloat16 default avoids the float32 OOM on
+    # large/hybrid models; float32 for max fidelity on small ones).
+    _dtypes = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
+    load_dtype = _dtypes.get(dtype, torch.bfloat16)
 
     adapter_str = str(Path(adapter_dir).resolve()) if adapter_dir else "none"
 
@@ -439,7 +471,7 @@ def export_gguf(
 
     model = AutoModelForCausalLM.from_pretrained(
         str(model_path_p),
-        dtype=torch.float32,
+        dtype=load_dtype,
         low_cpu_mem_usage=True,
         local_files_only=True,
     )
@@ -456,7 +488,9 @@ def export_gguf(
 
     print(f"INFO: [stage 1] saving merged HF model to '{merged_hf_dir}'", file=sys.stderr)
     merged_hf_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(str(merged_hf_dir))
+    model.save_pretrained(
+        str(merged_hf_dir), safe_serialization=True, max_shard_size=max_shard_size
+    )
     tokenizer.save_pretrained(str(merged_hf_dir))
     print("INFO: [stage 1] merge complete", file=sys.stderr)
 
@@ -494,6 +528,27 @@ def export_gguf(
         print("INFO: removed intermediate f16 GGUF", file=sys.stderr)
 
     # -----------------------------------------------------------------------
+    # Stage 4 — PLACE (optional): copy the finished GGUF into a deploy dir
+    # (e.g. an LM Studio models dir). Config-driven via [export].place_dir.
+    # -----------------------------------------------------------------------
+    placed_path: str | None = None
+    if place_dir:
+        pd = Path(place_dir)
+        pd.mkdir(parents=True, exist_ok=True)
+        dest = pd / out_path_p.name
+        try:
+            shutil.copy2(str(out_path_p), str(dest))
+            placed_path = str(dest)
+            print(f"INFO: [stage 4] placed GGUF -> '{dest}'", file=sys.stderr)
+        except OSError as exc:
+            # Don't lose the export over a placement failure (e.g. full disk).
+            print(
+                f"WARN: [stage 4] could not place GGUF into '{pd}': {exc}. "
+                f"The GGUF is at '{out_path_p}'.",
+                file=sys.stderr,
+            )
+
+    # -----------------------------------------------------------------------
     # Summary
     # -----------------------------------------------------------------------
     size_bytes = out_path_p.stat().st_size if out_path_p.exists() else 0
@@ -503,6 +558,7 @@ def export_gguf(
         "size_bytes": size_bytes,
         "base_model": str(model_path_p.resolve()),
         "adapter": adapter_str,
+        "placed": placed_path,
     }
     # Final stdout line — parseable by Rust CLI
     print(json.dumps(summary))

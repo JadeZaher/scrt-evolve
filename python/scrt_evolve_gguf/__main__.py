@@ -98,6 +98,41 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Keep the intermediate f16 GGUF after quantization.",
     )
+    p.add_argument(
+        "--dtype",
+        metavar="DT",
+        default="bfloat16",
+        choices=["bfloat16", "float16", "float32"],
+        help="Merge-stage load dtype. bfloat16 (default) avoids the float32 OOM "
+        "on large/hybrid models. Choices: %(choices)s.",
+    )
+    p.add_argument(
+        "--max-shard-size",
+        metavar="SIZE",
+        default="3GB",
+        help="save_pretrained shard size for the merged HF dir (caps write RAM). "
+        "Default: %(default)s.",
+    )
+    p.add_argument(
+        "--merge-shards",
+        metavar="GLOB",
+        default=None,
+        help="If set, first union per-shard adapter files matching this glob "
+        "(e.g. 'adapter-shard-*.safetensors') into a single adapter.safetensors.",
+    )
+    p.add_argument(
+        "--work-dir",
+        metavar="DIR",
+        default=None,
+        help="Scratch dir for intermediates (merged HF + f16 GGUF). Point at a "
+        "FAST native fs (on WSL a ~/… path, not /mnt/c). Default: alongside --out.",
+    )
+    p.add_argument(
+        "--place-dir",
+        metavar="DIR",
+        default=None,
+        help="Copy the finished GGUF into this dir (e.g. an LM Studio models dir).",
+    )
     return p
 
 
@@ -159,6 +194,11 @@ def main(argv: list[str] | None = None) -> None:
         llama_cpp_dir=llama_cpp_dir,
         keep_merged=args.keep_merged,
         keep_f16=args.keep_f16,
+        dtype=args.dtype,
+        max_shard_size=args.max_shard_size,
+        merge_shards_pattern=args.merge_shards,
+        work_dir=args.work_dir,
+        place_dir=args.place_dir,
     )
 
 

@@ -254,3 +254,73 @@ fn no_api_key_env_means_unauthenticated_local_endpoint_ok() {
     };
     assert!(ApiEndpoint::from_config(&gcfg).is_ok());
 }
+
+// ---------------------------------------------------------------------------
+// Signal-chain integration: constitution + taste -> generate system prompt.
+// Proves the end-to-end seam — config values/taste actually reach generation
+// (and therefore shape the dataset and downstream training).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn constitution_and_taste_steer_the_generate_prompt() {
+    use scrt_evolve::config::{EvolveConfig, GoalConfig};
+
+    // A config with a GLOBAL constitution + taste, and a goal that ADDS its own.
+    let mut cfg = EvolveConfig::default();
+    cfg.evolve.constitution = Some("Always cite the exact scrt flag.".to_string());
+    cfg.evolve.taste = Some("Answer in one terse sentence.".to_string());
+    let goal = GoalConfig {
+        name: "scrt-cli".into(),
+        topic: "mp-stash".into(),
+        tag: "scrt-cli".into(),
+        project: None,
+        probe_set: None,
+        weight: None,
+        cadence: None,
+        constitution: Some("Prefer the canonical spelling --mp-stash.".into()),
+        taste: Some("No marketing language.".into()),
+    };
+
+    // for_goal must layer goal values on top of global; compose_steering renders.
+    let goal_cfg = cfg.for_goal(&goal);
+    let steering = goal_cfg.compose_steering().expect("steering present");
+    assert!(steering.contains("Always cite the exact scrt flag.")); // global constitution
+    assert!(steering.contains("Prefer the canonical spelling --mp-stash.")); // goal constitution
+    assert!(steering.contains("Answer in one terse sentence.")); // global taste
+    assert!(steering.contains("No marketing language.")); // goal taste
+
+    // And the steering actually reaches the backend's SYSTEM message.
+    let response = r#"[{"kind":"qa","prompt":"q","completion":"a"}]"#;
+    let backend = ApiEndpoint::with_transport(MockTransport::new(vec![response]), 1);
+    let _ = scrt_evolve::generate::run_with_backend_steered(
+        &backend,
+        &fixture_ctx(),
+        &["qa".to_string()],
+        1,
+        Some(steering.as_str()),
+    )
+    .unwrap();
+
+    let msgs = backend_last_system_message(&backend);
+    assert!(
+        msgs.contains("Prefer the canonical spelling --mp-stash.")
+            && msgs.contains("No marketing language."),
+        "constitution + taste must appear in the generate system prompt; got:\n{msgs}"
+    );
+
+    // No steering ⇒ None (preserves built-in-template behavior).
+    assert!(EvolveConfig::default().compose_steering().is_none());
+}
+
+/// Reach into the ApiEndpoint's mock transport for the last system message.
+fn backend_last_system_message(backend: &ApiEndpoint<MockTransport>) -> String {
+    backend
+        .transport()
+        .last_messages
+        .borrow()
+        .iter()
+        .filter(|m| m.role == "system")
+        .map(|m| m.content.clone())
+        .collect::<Vec<_>>()
+        .join("\n")
+}

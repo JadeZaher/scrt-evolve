@@ -111,6 +111,12 @@ impl<T: ChatTransport> ApiEndpoint<T> {
     pub fn into_transport(self) -> T {
         self.transport
     }
+
+    /// Borrow the transport (read-only) — for introspection (e.g. tests that
+    /// inspect the messages a mock transport last received).
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
 }
 
 impl<T: ChatTransport> GenBackend for ApiEndpoint<T> {
