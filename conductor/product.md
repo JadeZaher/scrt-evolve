@@ -26,6 +26,7 @@ rather than blind.
 ## Authoritative design
 [DESIGN.md](../DESIGN.md) is the locked architecture (crate shape, the three
 core traits, config schema, CLI/SDK surface, 9-phase build order, honest
-risks). [SPIKE-NOTES.md](../SPIKE-NOTES.md) is prior art (the InfoNCE seam and
-the SimHash similarity work that shipped in scrt-cli). Tracks here implement
-DESIGN.md; they do not re-decide it.
+risks). Prior art: the InfoNCE embedding-adapter spike (the in-tree
+`corpus.rs` export + candle `train.rs` loop, now folded into track 05) and
+the SimHash similarity work that shipped in scrt-cli (`--mp-similar`). Tracks
+here implement DESIGN.md; they do not re-decide it.

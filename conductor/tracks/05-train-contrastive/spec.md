@@ -14,13 +14,16 @@ than the generative model.
   adapter (`.safetensors`).
 - Input is the `contrastive`-kind dataset rows OR palace structure directly:
   port the in-tree `corpus.rs` export (`{query, positive, negatives[], stash}`)
-  + the candle InfoNCE `train.rs` loop from SPIKE-NOTES §1–3.
+  + the candle InfoNCE `train.rs` loop (the original embedding-adapter spike:
+  stash note = query, captured node = positive, up to N cross-stash nodes =
+  negatives, sampled deterministically).
 - The embedding backbone is a per-arch seam (the spike targeted nomic-embed-text
   BERT); reuse `model.rs`'s loader contract where it fits, or a parallel
   embedding loader.
 - `scrt-evolve train --preset contrastive` consumes palace structure directly
   (no generate stage needed), and the contrastive adapter feeds scrt's hybrid
-  retriever signal 3 (SPIKE-NOTES §A).
+  retriever as the semantic signal (the embedding-cosine layer that lights up
+  only once a trained adapter exists, alongside substring + MinHash-Jaccard).
 
 ## Constraints
 - Behind `--features train`.

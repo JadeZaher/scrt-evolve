@@ -18,46 +18,28 @@ labeling. Point it at a model, a directory of work, and a
 
 The corpus and palace **are** the training signal. scrt discovers the
 relevant context; scrt-evolve turns it into supervised data by generating
-its own QA / instruction pairs (via a local model *or* an API endpoint of
-your choice), and a training preset finetunes on it. The "labels" are
-model-generated from discovered context — self-supervised in the labeling
-sense, not hand-written.
+its own QA / instruction pairs (via a local model *or* an API endpoint), and
+a training preset finetunes on it. The "labels" are model-generated from
+discovered context — self-supervised, not hand-written. A stash's **note** is
+a natural-language query; its captured **nodes** are context the agent judged
+relevant — a self-directed, post-deployment shaping loop over one directory of
+work.
 
 > **Status: design draft.** The architecture is fixed in
-> [DESIGN.md](./DESIGN.md); no implementation yet. This README is the
-> intent; the design doc is the contract. Built in review-gated phases.
-
-## Why it exists
-
-An agent's accumulated work — a corpus plus the mind-palace it built while
-working — is a ready-made, unlabeled training signal. A stash's **note** is
-a natural-language query; its captured **nodes** are context the agent
-judged relevant. That structure is enough to:
-
-1. **discover** what's worth learning (retrieve + dedup + cluster context),
-2. **generate** supervised pairs about it (no human in the loop), and
-3. **train** a model or adapter to internalize it.
-
-It's a self-directed, post-deployment shaping loop, scoped to one
-directory of work, over unstructured data.
+> [DESIGN.md](./DESIGN.md). This README is the intent; the design doc is the
+> contract. Built in review-gated phases.
 
 ## How it relates to scrt
 
-scrt-evolve **consumes** [scrt](../scrt-cli) — the Rust retrieval engine —
-as a library (`scrt-core`), in-process. scrt does the retrieval (search,
-the mind palace, lexical similarity); scrt-evolve does the generation and
-training scrt deliberately leaves out.
+scrt-evolve **consumes** [scrt](../scrt-cli) — the Rust retrieval engine — as
+a library (`scrt-core`), in-process. scrt does the retrieval (search, mind
+palace, lexical similarity); scrt-evolve does the generation and training scrt
+leaves out. scrt's similarity is **cheap and lexical** — it matches surface
+form, not meaning ("dog Rex" and "my pet's name" never match). scrt-evolve is
+the **semantic** tier: a trained model is the only thing that crosses that gap.
 
-The two are complementary by design. scrt ships three **cheap, lexical**
-similarity signals (SimHash, chunked best-pair/Jaccard, random-projection
-cosine) that match *surface form, not meaning* — "dog Rex" and "my pet's
-name" never match. scrt-evolve is the **semantic** tier: a trained model is
-the only thing that crosses that gap. scrt finds and structures the
-context; scrt-evolve learns from it.
-
-> Interim dependency: until scrt is published to crates.io, `scrt-core` is
-> a pinned git dependency. (Swapping to the published crate is a one-line
-> change tracked for the first release.)
+> Until scrt is published to crates.io, `scrt-core` is a pinned git dependency
+> (swapping to the published crate is a one-line change tracked for release).
 
 ## What it does, in three stages
 
@@ -71,29 +53,23 @@ covers distinct topics instead of re-mining one. → `discovered.json`
 
 ### 2. Generate — `scrt-evolve generate`
 Turns discovered context into supervised examples — QA pairs, instruction
-data, or raw completions — via a **pluggable backend**:
-
-- **local model** — candle inference on your model, fully offline; or
-- **API endpoint** — turns against a configurable endpoint (OpenAI /
-  Anthropic / any OpenAI-compatible), for a stronger teacher.
-
-Both emit the same JSONL, so the dataset is backend-agnostic. → `dataset.jsonl`
+data, or raw completions — via a **pluggable backend**: a **local model**
+(candle inference, fully offline) or an **API endpoint** (OpenAI / Anthropic /
+any OpenAI-compatible, for a stronger teacher). Both emit the same JSONL, so
+the dataset is backend-agnostic. → `dataset.jsonl`
 
 ### 3. Train — `scrt-evolve train`
 Finetunes a model into a reusable **adapter artifact**. Two backends:
 
 - **`--backend transformers`** (the real-model path): shells out to the
-  standalone Python trainer (`python/scrt_evolve_train`), which loads a real
-  HuggingFace causal-LM (RoPE / GQA / BF16) via `transformers` and trains LoRA
-  on it. This is the practical path for actual pretrained models. Needs a
-  Python env with `torch` + `transformers` + `safetensors` (no `peft`); it is
-  invoked as an external subprocess over the `dataset.jsonl` contract, so the
-  Rust build itself stays ML-free.
+  Python trainer (`python/scrt_evolve_train`), which loads a real HuggingFace
+  causal-LM (RoPE / GQA / BF16) and trains LoRA on it. It runs as a subprocess
+  over the `dataset.jsonl` contract, so the Rust build itself stays ML-free.
 - **`--backend candle`** (the in-tree fixture): a small hand-built arch for
-  mechanical validation (overfit-a-tiny-batch). It does **not** load real
-  pretrained checkpoints — see *Honest caveats*. Candle presets (`lora`,
-  `full`, `pretrain`, `contrastive`, `shard`) are the Rust-native north star,
-  deferred until candle's training ecosystem matures.
+  mechanical validation; it does **not** load real checkpoints (see *Honest
+  caveats*). Candle presets (`lora`, `full`, `pretrain`, `contrastive`,
+  `shard`) are the Rust-native north star, deferred until candle's training
+  ecosystem matures.
 
 → `adapter.safetensors` + `adapter_config.json`
 
@@ -104,52 +80,40 @@ vs base+adapter side by side so you can see what the tuning changed.
 ## Constitution + taste: steering what gets learned
 
 Discovery decides *what context* to learn from; **constitution and taste decide
-what the model learns to do with it.** They are two plain-text config fields that
-compose into the generation system prompt — the `custom_prompt` steering seam —
-so they shape the *dataset* itself, and therefore the trained model:
+what the model learns to do with it.** Two plain-text config fields compose into
+the generation system prompt (the `custom_prompt` seam), so they shape the
+*dataset* — and therefore the trained model:
 
-- **`constitution`** — the **values** that drive *how* the model should
-  process and answer (e.g. "cite file:line for every claim", "prefer the
-  smallest correct change", "never invent an API that isn't in the context").
-- **`taste`** — the **representational form** ideas should take: style,
-  structure, conventions (e.g. "answer in imperative steps", "lead with the
-  one-line takeaway", "code blocks over prose").
+- **`constitution`** — the **values** driving *how* the model answers (e.g.
+  "cite file:line for every claim", "never invent an API not in the context").
+- **`taste`** — the **representational form** ideas take: style, structure,
+  conventions (e.g. "lead with the one-line takeaway, then imperative steps").
 
-Both are optional. With neither set, generation uses its built-in template; set
-either and it's injected as a labelled steering block before generation. Because
-the steering shapes the generated QA/instruction pairs, the model internalizes
-the constitution and taste through ordinary finetuning — no separate
-reward model, no human labeling.
-
-The eval harness can close the loop on the values half: point `[eval].judge` at
-an endpoint and it scores **constitution-adherence** of the tuned model, so a
-round can be gated on "did this actually move toward the constitution?" rather
-than just "does it parse?"
+Both are optional (neither set ⇒ the built-in template). Because the steering
+shapes the generated pairs, the model internalizes it through ordinary
+finetuning — no reward model, no human labeling. The eval harness closes the
+loop on the values half: point `[eval].judge` at an endpoint and it scores
+**constitution-adherence**, so a round can gate on "did this move toward the
+constitution?" rather than just "does it parse?"
 
 ## Model orchestration: many goals, one evolving model
 
 The product shape is **one locally-tuned model that evolves with a user's goals
-across all their projects.** A config can declare any number of `[[goals]]`, each
-a named subject to evolve toward, and the multi-goal driver fans the pipeline out
-over them:
+across all their projects.** A config declares any number of `[[goals]]`, and
+the multi-goal driver fans **discover → generate** out over them, writing
+inspectable per-goal artifacts under `work_dir/goals/<name>/`:
 
-- Each goal carries a **`topic`** (scopes the corpus sweep + `discover.palace_search`)
-  and a **`tag`** (the palace tag that marks goal-relevant stashes →
-  `discover.palace_tags`), so a populated mind palace seeds *only* that goal's
-  curated context. An optional **`project`** scopes a goal to one project's corpus.
-- Each goal can **layer its own `constitution` / `taste` on top of the global
-  ones** — global values as the base, per-goal additions composed on top — so one
-  goal can tune for terse code answers while another tunes for cited prose, all
-  feeding the same base model.
-- The driver runs **discover → generate per goal**, writing inspectable per-goal
-  artifacts under `work_dir/goals/<name>/`. It's a **bounded fan-out**: one
-  goal's API failure is recorded against that goal, not fatal to the others, and
-  no weights are mutated by the build step — you can read every goal's dataset
-  before anything trains.
-
-Per-goal scheduler hints (`weight`, `cadence`) are carried in config for the
-eventual round driver; the buildable path today is the non-mutating
-discover→generate fan-out.
+- Each goal carries a **`topic`** (scopes the corpus sweep + `palace_search`)
+  and a **`tag`** (marks goal-relevant stashes → `palace_tags`), so the palace
+  seeds *only* that goal's curated context; an optional **`project`** scopes it
+  to one project's corpus.
+- Each goal can **layer its own `constitution` / `taste`** on the global ones —
+  so one goal tunes for terse code answers, another for cited prose, all feeding
+  the same base model.
+- It's a **bounded, non-mutating fan-out**: one goal's API failure is recorded
+  against that goal alone, and no weights move until you've read the datasets.
+  Per-goal scheduler hints (`weight`, `cadence`) are carried for the eventual
+  round driver.
 
 ## Usage
 
@@ -248,22 +212,17 @@ taste   = "Answer as reference-doc prose with a runnable example."  # layered on
 
 ## Honest caveats
 
-- **candle's finetuning ecosystem is thin — so real training runs through
-  Python.** candle has no turnkey PEFT/transformers equivalent, and the in-tree
-  candle model is a *fixture* that can't load real RoPE/GQA/BF16 checkpoints.
-  The validated real-model path is therefore `--backend transformers` (HF
-  `transformers` + a hand-rolled LoRA), driven from the Rust CLI as a
-  subprocess. Reimplementing PyTorch's training stack in candle is explicitly
-  out of scope for now; "100% Rust-native training" remains the north star, not
-  a day-one guarantee. (See the dated amendment in [DESIGN.md](./DESIGN.md).)
-- **Self-generated data can echo-chamber.** A small local model generating
-  its own training data risks amplifying its own errors. The API backend
-  sidesteps this with a stronger teacher; local-gen output is treated as
-  lower-trust (deduped, filtered, optionally critiqued).
+- **Real training runs through Python.** candle has no turnkey PEFT equivalent
+  and its in-tree model is a *fixture* that can't load real RoPE/GQA/BF16
+  checkpoints, so the validated real-model path is `--backend transformers`.
+  "100% Rust-native training" is the north star, not a day-one guarantee (see
+  the dated amendment in [DESIGN.md](./DESIGN.md)).
+- **Self-generated data can echo-chamber.** A small local model risks
+  amplifying its own errors; the API backend sidesteps this with a stronger
+  teacher, and local-gen output is treated as lower-trust (deduped, filtered).
 - **The premise is unproven at quality.** "Self-generated data finetunes a
-  usefully-better model" is plausible, not guaranteed. The pipeline being
-  *wired and inspectable* — you can read the dataset and swap the teacher —
-  is what makes the bet measurable rather than blind.
+  usefully-better model" is plausible, not guaranteed — the pipeline being
+  *wired and inspectable* is what makes the bet measurable rather than blind.
 
 ## License
 

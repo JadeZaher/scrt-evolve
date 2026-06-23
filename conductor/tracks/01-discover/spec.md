@@ -26,8 +26,8 @@ No ML.
     seed queries, OR sweep the corpus, OR both.
   - scrt-search the corpus via `scrt_core::search_with_meta(&SearchConfig)`.
   - `dedup = "simhash"` — drop near-duplicate passages using
-    `scrt_core::palace::simhash` (the chunked best-pair / Jaccard signals from
-    SPIKE-NOTES §B, already shipped in scrt-core).
+    `scrt_core::palace::simhash` (the chunked best-pair / Jaccard signals
+    already shipped in scrt-core).
   - rank, then `cluster = true` to spread coverage across distinct topics
     (cluster stashes by similarity, sample across clusters) so generation
     doesn't re-mine one topic.
