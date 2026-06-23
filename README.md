@@ -101,6 +101,56 @@ Finetunes a model into a reusable **adapter artifact**. Two backends:
 Load the base model with the trained adapter and generate — `--ab` runs base
 vs base+adapter side by side so you can see what the tuning changed.
 
+## Constitution + taste: steering what gets learned
+
+Discovery decides *what context* to learn from; **constitution and taste decide
+what the model learns to do with it.** They are two plain-text config fields that
+compose into the generation system prompt — the `custom_prompt` steering seam —
+so they shape the *dataset* itself, and therefore the trained model:
+
+- **`constitution`** — the **values** that drive *how* the model should
+  process and answer (e.g. "cite file:line for every claim", "prefer the
+  smallest correct change", "never invent an API that isn't in the context").
+- **`taste`** — the **representational form** ideas should take: style,
+  structure, conventions (e.g. "answer in imperative steps", "lead with the
+  one-line takeaway", "code blocks over prose").
+
+Both are optional. With neither set, generation uses its built-in template; set
+either and it's injected as a labelled steering block before generation. Because
+the steering shapes the generated QA/instruction pairs, the model internalizes
+the constitution and taste through ordinary finetuning — no separate
+reward model, no human labeling.
+
+The eval harness can close the loop on the values half: point `[eval].judge` at
+an endpoint and it scores **constitution-adherence** of the tuned model, so a
+round can be gated on "did this actually move toward the constitution?" rather
+than just "does it parse?"
+
+## Model orchestration: many goals, one evolving model
+
+The product shape is **one locally-tuned model that evolves with a user's goals
+across all their projects.** A config can declare any number of `[[goals]]`, each
+a named subject to evolve toward, and the multi-goal driver fans the pipeline out
+over them:
+
+- Each goal carries a **`topic`** (scopes the corpus sweep + `discover.palace_search`)
+  and a **`tag`** (the palace tag that marks goal-relevant stashes →
+  `discover.palace_tags`), so a populated mind palace seeds *only* that goal's
+  curated context. An optional **`project`** scopes a goal to one project's corpus.
+- Each goal can **layer its own `constitution` / `taste` on top of the global
+  ones** — global values as the base, per-goal additions composed on top — so one
+  goal can tune for terse code answers while another tunes for cited prose, all
+  feeding the same base model.
+- The driver runs **discover → generate per goal**, writing inspectable per-goal
+  artifacts under `work_dir/goals/<name>/`. It's a **bounded fan-out**: one
+  goal's API failure is recorded against that goal, not fatal to the others, and
+  no weights are mutated by the build step — you can read every goal's dataset
+  before anything trains.
+
+Per-goal scheduler hints (`weight`, `cadence`) are carried in config for the
+eventual round driver; the buildable path today is the non-mutating
+discover→generate fan-out.
+
 ## Usage
 
 ```bash
@@ -148,6 +198,11 @@ model_path  = "/models/my-model"      # the one required thing
 corpus_dir  = "./src"
 palace_path = ".mpg/mind-palace.json"
 
+# global steering — composed into the generate system prompt (see
+# "Constitution + taste" above). both optional.
+constitution = "Cite file:line for every claim. Prefer the smallest correct change."
+taste        = "Lead with the one-line takeaway, then imperative steps."
+
 [discover]
 seed = "palace"                        # palace | corpus | both
 palace_search = "auth"                 # only seed from stashes matching this
@@ -168,6 +223,27 @@ preset = "lora"
   rank = 16
   alpha = 32
   lr = 2e-4
+
+[eval]
+  [eval.judge]                          # optional: score constitution-adherence
+  base_url    = "https://api.…/v1"
+  model       = "…"
+  api_key_env = "SCRT_EVOLVE_JUDGE_KEY"
+
+# orchestrate many goals against the one model; each fans out
+# discover → generate into work_dir/goals/<name>/
+[[goals]]
+name  = "auth-hardening"
+topic = "authentication"               # scopes corpus sweep + palace_search
+tag   = "security"                     # palace tag marking this goal's stashes
+constitution = "Flag every place input crosses a trust boundary."  # layered on global
+
+[[goals]]
+name    = "api-docs"
+topic   = "public api"
+tag     = "docs"
+project = "./packages/sdk"             # scope this goal to one project's corpus
+taste   = "Answer as reference-doc prose with a runnable example."  # layered on global
 ```
 
 ## Honest caveats
