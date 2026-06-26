@@ -37,6 +37,8 @@ thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 # HTTP for the API GenBackend (rustls to avoid a system OpenSSL dependency).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
+# Content-addressing for branch artifacts (manifest `gguf_sha`, registry keys).
+sha2 = "0.10"
 
 # scrt-core — the retrieval engine, consumed as an in-process Rust crate.
 # Interim git dep pinned to a commit until scrt is published.

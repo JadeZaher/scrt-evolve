@@ -292,6 +292,12 @@ enum Command {
         #[command(subcommand)]
         command: QuarantineCommand,
     },
+    /// Branch-Train-Merge **branch factory** (track 29): create, list, route +
+    /// serve standalone domain-specialized branches (BTM Expert LMs).
+    Branch {
+        #[command(subcommand)]
+        command: BranchCommand,
+    },
     /// Point at a PROJECT directory: auto-detect its mpg palace + corpus and run
     /// the whole self-routing pipeline (discover → plan → generate → export).
     ///
@@ -373,6 +379,94 @@ enum QuarantineCommand {
     Clear {
         #[arg(long, default_value = "evolve.toml")]
         config: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum BranchCommand {
+    /// Create a branch: scope a per-branch config (override base + corpus) and
+    /// compose discover → teacher-QA generate → train → eval gate → GGUF export
+    /// inside the track-15 transaction; eval-passing branches are registered.
+    Create {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// Branch name (the registry/router key). Overrides `[branch].name`.
+        #[arg(long)]
+        name: String,
+        /// The small base model to specialize. Overrides `[branch].base` /
+        /// `[evolve].model_path`.
+        #[arg(long)]
+        base: Option<String>,
+        /// Per-branch corpus dir (overrides `[branch].corpus` / `[evolve].corpus_dir`).
+        #[arg(long)]
+        corpus: Option<PathBuf>,
+        /// Human-readable domain label for the manifest (e.g. `legal/tool-calling`).
+        #[arg(long)]
+        domain: Option<String>,
+        /// Python interpreter for the train / eval / export subprocesses.
+        #[arg(long)]
+        python: Option<String>,
+    },
+    /// List the registered branches (reads `branches/registry.json`).
+    List {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+    },
+    /// Register an EXTERNALLY-built branch GGUF into the fleet: compute its
+    /// `router_signature` from the branch dataset, assemble the manifest, and admit
+    /// it into `branches/registry.json`. The native-Rust counterpart to the export
+    /// step of `create` — used when train/export ran out-of-process (e.g. a WSL GPU
+    /// box) or to import a peer's branch artifact. ML-free.
+    Register {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// Branch name (registry/router key).
+        #[arg(long)]
+        name: String,
+        /// The finished branch GGUF to register (content-addressed by SHA-256).
+        #[arg(long)]
+        gguf: PathBuf,
+        /// Base model id/path recorded in the manifest (overrides `[branch].base`).
+        #[arg(long)]
+        base: Option<String>,
+        /// Domain label (overrides `[branch].domain`).
+        #[arg(long)]
+        domain: Option<String>,
+        /// Branch dataset the signature is computed from (default:
+        /// `work_dir/branches/<name>/dataset.jsonl`).
+        #[arg(long)]
+        dataset: Option<PathBuf>,
+        /// Eval correctness recorded in the manifest's `eval_report`.
+        #[arg(long)]
+        correctness: Option<f64>,
+        /// Parent branch (lineage), if this forks from another.
+        #[arg(long)]
+        parent: Option<String>,
+    },
+    /// Resolve a query to branch(es) + scores WITHOUT serving (the router).
+    Route {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// The request to route.
+        query: String,
+    },
+    /// Serve a branch. Pass a `<name>` to serve a specific branch, or `--route
+    /// <query>` to route the request to the best branch(es) and serve those
+    /// (`[branch.ensemble]`: `single_best` ⇒ top-1, `average_topk` ⇒ blend top-k).
+    Serve {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// The branch to serve (omit when using `--route`).
+        name: Option<String>,
+        /// Route this query to the best branch(es) and serve, instead of `<name>`.
+        #[arg(long)]
+        route: Option<String>,
+        /// The prompt to run (one-shot v1, mirrors `run-model`).
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Python interpreter (for a `transformers` runtime backend).
+        #[arg(long)]
+        python: Option<String>,
     },
 }
 
@@ -590,6 +684,59 @@ fn run() -> Result<()> {
             QuarantineCommand::Clear { config } => {
                 let cfg = EvolveConfig::load(&config)?;
                 cmd_quarantine_clear(&cfg)
+            }
+        },
+        Command::Branch { command } => match command {
+            BranchCommand::Create {
+                config,
+                name,
+                base,
+                corpus,
+                domain,
+                python,
+            } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_branch_create(&cfg, &name, base, corpus, domain, python)
+            }
+            BranchCommand::List { config } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_branch_list(&cfg)
+            }
+            BranchCommand::Register {
+                config,
+                name,
+                gguf,
+                base,
+                domain,
+                dataset,
+                correctness,
+                parent,
+            } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_branch_register(
+                    &cfg,
+                    &name,
+                    &gguf,
+                    base,
+                    domain,
+                    dataset,
+                    correctness,
+                    parent,
+                )
+            }
+            BranchCommand::Route { config, query } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_branch_route(&cfg, &query)
+            }
+            BranchCommand::Serve {
+                config,
+                name,
+                route,
+                prompt,
+                python,
+            } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_branch_serve(&cfg, name, route, prompt, python)
             }
         },
         Command::Run { config, export } => {
@@ -1805,6 +1952,362 @@ fn cmd_export_gguf(
 /// helper so the CLI and the eval subprocess scorer agree on resolution.
 fn find_python_pkg_dir() -> Option<PathBuf> {
     scrt_evolve::python_pkg_dir()
+}
+
+// ───────────────────────── Branch factory (track 29) ─────────────────────────
+
+/// `branch create` — compose discover → teacher-QA generate → train → eval gate →
+/// GGUF export inside the track-15 transaction; register an eval-passing branch.
+/// Mirrors the `evolve --schedule` production hooks (no new ML).
+fn cmd_branch_create(
+    cfg: &EvolveConfig,
+    name: &str,
+    base: Option<String>,
+    corpus: Option<PathBuf>,
+    domain: Option<String>,
+    python: Option<String>,
+) -> Result<()> {
+    use scrt_evolve::branch::{self, BranchHooks};
+
+    // CLI flags override `[branch]` config defaults.
+    let bcfg = cfg.branch.clone().unwrap_or_default();
+    let base = base.or_else(|| bcfg.base.clone());
+    let corpus = corpus.or_else(|| bcfg.corpus.clone());
+    let domain = domain.or_else(|| bcfg.domain.clone());
+    let py = python;
+
+    // --- Production hooks (mirror cmd_evolve_schedule) ---
+    let discover = |c: &EvolveConfig| scrt_evolve::discover::run(c);
+    let generate =
+        |c: &EvolveConfig, ctx: &scrt_evolve::DiscoveredContext| scrt_evolve::generate::run(c, ctx);
+    let py_train = py.clone();
+    let train = |c: &EvolveConfig, train_set: &scrt_evolve::Dataset| -> Result<Vec<String>> {
+        let wd = WorkDir::from_config(c);
+        let data_path = wd.root().join("dataset.branch-train.jsonl");
+        train_set.write_jsonl(&data_path)?;
+        cmd_train_transformers(c, Some(data_path), py_train.clone(), None, 40, 256)?;
+        Ok(provenance_of(train_set))
+    };
+    let py_score = py.clone();
+    let score = |c: &EvolveConfig| -> Result<scrt_evolve::ScoreReport> {
+        scrt_evolve::eval::run_eval(c, py_score.as_deref())
+    };
+    let py_export = py.clone();
+    let export = |c: &EvolveConfig, path: &std::path::Path| -> Result<PathBuf> {
+        let adapter = WorkDir::from_config(c).root().join("adapter");
+        let quant = c
+            .export
+            .as_ref()
+            .map(|e| e.quant.clone())
+            .unwrap_or_else(|| "Q4_K_M".to_string());
+        cmd_export_gguf(
+            c,
+            Some(adapter),
+            Some(path.to_path_buf()),
+            &quant,
+            None,
+            false,
+            py_export.clone(),
+        )?;
+        Ok(path.to_path_buf())
+    };
+
+    let hooks = BranchHooks {
+        discover: &discover,
+        generate: &generate,
+        train: &train,
+        score: &score,
+        export: &export,
+    };
+
+    // Conservative baseline: an uncovered start (the branch can only improve); a
+    // catastrophic collapse still trips the catastrophe floor.
+    let baseline = scrt_evolve::ScoreReport::uncovered("probe-none", "baseline");
+    let created = now_iso8601();
+
+    let report = branch::create(
+        cfg,
+        name,
+        base.as_deref(),
+        corpus.as_deref(),
+        domain.as_deref(),
+        &baseline,
+        &created,
+        &hooks,
+    )?;
+
+    let action = report
+        .action
+        .map(|a| format!("{a:?}"))
+        .unwrap_or_else(|| "bailed".to_string());
+    println!("branch create [{name}]: {action} — {}", report.note);
+    if let Some(m) = &report.manifest {
+        let sha = &m.gguf_sha[..m.gguf_sha.len().min(12)];
+        println!(
+            "  base={} domain={} gguf_sha={sha}…",
+            m.base_model, m.domain
+        );
+    }
+    if report.halt {
+        anyhow::bail!("branch create halted (catastrophe) — see quarantine + evolution-log");
+    }
+    Ok(())
+}
+
+/// `branch list` — print the registered fleet.
+fn cmd_branch_list(cfg: &EvolveConfig) -> Result<()> {
+    let reg_path = scrt_evolve::branch::create::registry_path(cfg);
+    let reg = scrt_evolve::branch::BranchRegistry::load(&reg_path)?;
+    if reg.branches.is_empty() {
+        println!("no branches registered (registry: {})", reg_path.display());
+        return Ok(());
+    }
+    println!(
+        "{} branch(es) [{}]:",
+        reg.branches.len(),
+        reg_path.display()
+    );
+    for b in &reg.branches {
+        let corr = b
+            .eval_report
+            .get("correctness")
+            .copied()
+            .unwrap_or(f64::NAN);
+        println!(
+            "  {:<20} base={:<24} domain={:<20} correctness={corr:.3}",
+            b.name, b.base_model, b.domain
+        );
+    }
+    Ok(())
+}
+
+/// `branch register` — admit an externally-built branch GGUF into the fleet. The
+/// native counterpart to `create`'s export step: compute the `router_signature`
+/// from the branch dataset (so it matches what the router uses), assemble the
+/// manifest (content-addressed `gguf_sha`), and admit it into the registry.
+#[allow(clippy::too_many_arguments)]
+fn cmd_branch_register(
+    cfg: &EvolveConfig,
+    name: &str,
+    gguf: &std::path::Path,
+    base: Option<String>,
+    domain: Option<String>,
+    dataset: Option<PathBuf>,
+    correctness: Option<f64>,
+    parent: Option<String>,
+) -> Result<()> {
+    use scrt_evolve::branch::router::corpus_signature;
+    use scrt_evolve::branch::{admit, AdmitOutcome};
+    use scrt_evolve::branch::{
+        sha256_file, BranchManifest, BranchRegistry, Lineage, MANIFEST_VERSION,
+    };
+
+    if !gguf.exists() {
+        anyhow::bail!("register: gguf not found: {}", gguf.display());
+    }
+    let bcfg = cfg.branch.clone().unwrap_or_default();
+
+    // Signature from the branch dataset (the domain content the branch learned).
+    let ds_path = dataset.unwrap_or_else(|| {
+        cfg.work_dir()
+            .join("branches")
+            .join(name)
+            .join("dataset.jsonl")
+    });
+    let ds = scrt_evolve::Dataset::read_jsonl(&ds_path)
+        .with_context(|| format!("register: reading branch dataset {}", ds_path.display()))?;
+    let texts: Vec<String> = ds.rows.iter().map(row_domain_text).collect();
+    let kind = bcfg
+        .router
+        .as_ref()
+        .map(|r| r.kind.clone())
+        .unwrap_or_else(|| "simhash".to_string());
+    let router_signature = corpus_signature(&kind, &texts);
+
+    let base_model = base
+        .or(bcfg.base)
+        .or_else(|| cfg.evolve.model_path.as_ref().map(|p| p.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let mut eval_report = std::collections::BTreeMap::new();
+    if let Some(c) = correctness {
+        eval_report.insert("correctness".to_string(), c);
+    }
+
+    let manifest = BranchManifest {
+        name: name.to_string(),
+        base_model,
+        domain: domain.or(bcfg.domain).unwrap_or_default(),
+        corpus_descriptor: format!("{} dataset rows", ds.rows.len()),
+        router_signature,
+        eval_report,
+        lineage: Lineage { parent },
+        version: MANIFEST_VERSION.to_string(),
+        gguf_sha: sha256_file(gguf)?,
+        created: now_iso8601(),
+    };
+
+    // Persist the manifest alongside the GGUF (branch dir).
+    let branch_dir = cfg.work_dir().join("branches").join(name);
+    std::fs::create_dir_all(&branch_dir)?;
+    manifest.write(branch_dir.join("manifest.json"))?;
+
+    // Admit into the shared registry (bounded fleet; near-dup merges, no twins).
+    let reg_path = scrt_evolve::branch::create::registry_path(cfg);
+    let mut registry = BranchRegistry::load(&reg_path)?;
+    let max_branches = bcfg.max_branches.max(1);
+    match admit(&mut registry, manifest, max_branches, 0.85) {
+        AdmitOutcome::Added => {
+            registry.write(&reg_path)?;
+            println!("registered branch '{name}' → {}", reg_path.display());
+        }
+        AdmitOutcome::Merged { into } => {
+            println!("branch '{name}' is a near-duplicate of '{into}' — merged (not registered as a twin)");
+        }
+        AdmitOutcome::Rejected { reason } => {
+            anyhow::bail!("register: {reason}");
+        }
+    }
+    Ok(())
+}
+
+/// The domain text of a dataset row (prompt + completion / instruction etc.) used
+/// to compute a branch's `router_signature`.
+fn row_domain_text(row: &scrt_evolve::GenExample) -> String {
+    use scrt_evolve::GenExample::*;
+    match row {
+        Qa {
+            prompt, completion, ..
+        } => format!("{prompt} {completion}"),
+        Instruction {
+            instruction,
+            input,
+            output,
+            ..
+        } => format!("{instruction} {input} {output}"),
+        Completion { text, .. } => text.clone(),
+        Contrastive {
+            query, positive, ..
+        } => format!("{query} {positive}"),
+        ToolCall { prompt, tool, .. } => format!("{prompt} {tool}"),
+        Cli { prompt, command, .. } => format!("{prompt} {command}"),
+    }
+}
+
+/// `branch route "<q>"` — resolve a query to branch(es) + scores; no serving.
+fn cmd_branch_route(cfg: &EvolveConfig, query: &str) -> Result<()> {
+    use scrt_evolve::{BranchRouter, LocalBranchRouter};
+    let reg =
+        scrt_evolve::branch::BranchRegistry::load(scrt_evolve::branch::create::registry_path(cfg))?;
+    let router = LocalBranchRouter::from_config(cfg, &reg);
+    let hits = router.resolve(query);
+    if hits.is_empty() {
+        println!("route: no branch matched {query:?} (base-only)");
+        return Ok(());
+    }
+    println!("route: {} match(es) for {query:?}:", hits.len());
+    for (r, score) in &hits {
+        println!("  {:<20} domain={:<20} score={score:.3}", r.name, r.domain);
+    }
+    Ok(())
+}
+
+/// `branch serve <name>` / `branch serve --route "<q>"` — serve a branch GGUF via
+/// the runtime. `--route` resolves the request to the best branch(es); empty ⇒
+/// base-only fallback (`serve --branches` semantics).
+fn cmd_branch_serve(
+    cfg: &EvolveConfig,
+    name: Option<String>,
+    route: Option<String>,
+    prompt: Option<String>,
+    python: Option<String>,
+) -> Result<()> {
+    use scrt_evolve::branch::create::gguf_path;
+    use scrt_evolve::{BranchRouter, LocalBranchRouter};
+
+    let reg =
+        scrt_evolve::branch::BranchRegistry::load(scrt_evolve::branch::create::registry_path(cfg))?;
+
+    let target = if let Some(q) = &route {
+        let router = LocalBranchRouter::from_config(cfg, &reg);
+        let hits = router.resolve(q);
+        let ensemble = cfg
+            .branch
+            .as_ref()
+            .and_then(|b| b.ensemble.as_ref())
+            .map(|e| e.mode.clone())
+            .unwrap_or_else(|| "single_best".to_string());
+        match hits.into_iter().next() {
+            Some((r, score)) => {
+                if ensemble == "average_topk" {
+                    println!(
+                        "ensemble=average_topk: v1 serves the top-1 representative \
+                         (cross-branch output blend is the hivemind Merge)"
+                    );
+                }
+                println!("serve --route: resolved {:?} (score {score:.3})", r.name);
+                r.name
+            }
+            None => {
+                println!("serve --route: no branch matched — base-only fallback");
+                return match prompt {
+                    Some(p) => cmd_run_model(cfg, &p, python),
+                    None => Ok(()),
+                };
+            }
+        }
+    } else if let Some(n) = name {
+        if reg.get(&n).is_none() {
+            anyhow::bail!("serve: branch '{n}' not in the registry");
+        }
+        n
+    } else {
+        anyhow::bail!("serve: pass a branch <name> or --route \"<query>\"");
+    };
+
+    let gguf = gguf_path(cfg, &target);
+    if !gguf.exists() {
+        anyhow::bail!("serve: gguf for '{target}' missing: {}", gguf.display());
+    }
+
+    // Point the runtime at the branch GGUF (overlay `[branch.serve]` on `[runtime]`).
+    let mut scoped = cfg.clone();
+    let mut rt = scoped.runtime.clone().unwrap_or_default();
+    rt.model_path = Some(gguf.to_string_lossy().into_owned());
+    if let Some(bs) = cfg.branch.as_ref().and_then(|b| b.serve.as_ref()) {
+        if let Some(ngl) = bs.n_gpu_layers {
+            rt.n_gpu_layers = ngl;
+        }
+    }
+    scoped.runtime = Some(rt);
+
+    println!("serve[{target}]: gguf={}", gguf.display());
+    cmd_run_model(&scoped, &prompt.unwrap_or_default(), python)
+}
+
+/// ISO-8601 UTC timestamp (`YYYY-MM-DDThh:mm:ssZ`) for manifest `created`. Uses
+/// Hinnant's civil-from-days so no chrono dependency is needed.
+fn now_iso8601() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64;
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // civil_from_days (Howard Hinnant).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
 }
 
 fn cmd_export(cfg: &EvolveConfig, data: Option<PathBuf>, model: Option<PathBuf>) -> Result<()> {

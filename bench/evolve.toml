@@ -186,3 +186,32 @@ name = "tool-calling"
 topic = "tool call function arguments Read Edit Bash Grep"
 tag = "tools"
 weight = 1.5
+
+# --- Branch factory (track 29): standalone domain branches (BTM Expert LMs). ---
+# `scrt-evolve branch create --name scrt-cli` scopes a per-branch config (override
+# base + corpus), composes discover → teacher-QA → train(end_task) → eval gate →
+# GGUF export INSIDE the track-15 transaction, then writes a manifest + registers
+# the branch in work/branches/registry.json. An eval-failing branch is rolled back
+# and NOT registered. `branch route "<q>"` resolves a request to the best branch;
+# `branch serve <name>` (or `serve --route "<q>"`) serves it via [runtime].
+#   scrt-evolve branch create --config bench/evolve.toml --name scrt-cli \
+#       --base <small-base> --corpus bench/corpus --domain "scrt/cli"
+#   scrt-evolve branch route  --config bench/evolve.toml "how do I stash with mp"
+#   scrt-evolve branch list   --config bench/evolve.toml
+[branch]
+# "Smaller" comes from `base` (a small base, specialized) in v1; teacher→smaller-
+# student distillation is a later mode (precursor: bench/seam_distill).
+base = "C:/Users/atooz/.cache/huggingface/hub/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6"
+name = "scrt-cli"
+domain = "scrt/cli"
+corpus = "C:/Users/atooz/Programming/ai-utils-memory/scrt-evolve/bench/corpus"
+objective = "end_task"   # the data-sensitivity lever (the branch learns the real task)
+max_branches = 16        # bounded fleet; near-duplicate domains merge (no twins)
+  [branch.router]
+  kind = "simhash"        # ML-free default; embedding/tfidf are later kinds
+  confidence_floor = 0.5  # below this ⇒ no branch (base-only) — routing safety floor
+  top_k = 1
+  [branch.ensemble]
+  mode = "single_best"    # `average_topk` blends top-k outputs (the BTM Merge)
+  [branch.serve]
+  n_gpu_layers = 99       # overlay on [runtime] when serving the branch GGUF

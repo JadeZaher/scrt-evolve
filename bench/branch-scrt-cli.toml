@@ -1,0 +1,61 @@
+# Branch factory (track 29) — a standalone scrt-CLI domain-expert branch.
+# Base = TinyLlama-1.1B (small, non-Mamba → trains on the 4060 cleanly).
+# Corpus = the scrt-cli repo (source of truth for the mp-* mind-palace CLI).
+# Teacher = LM Studio meta-llama-3-8b-instruct (forward-only QA generation).
+#
+# Decomposed run (teacher reachable natively; GPU + llama.cpp in WSL):
+#   A) native: scrt-evolve run     --config bench/branch-scrt-cli.toml   (discover+generate)
+#   B) WSL:    scrt_evolve_train + scrt_evolve_gguf                       (LoRA + Q4_K_M GGUF)
+#   C) native: scrt-evolve branch register --name scrt-cli --gguf <path>  (manifest + registry)
+#   D) WSL:    llama-completion -m <gguf> -p "..."                        (serve)
+
+[evolve]
+model_path = "C:/Users/atooz/.cache/huggingface/hub/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6"
+corpus_dir = "C:/Users/atooz/Programming/ai-utils-memory/scrt-cli"
+work_dir   = "C:/Users/atooz/Programming/ai-utils-memory/scrt-evolve/bench/work/scrt-cli-branch"
+
+[discover]
+seed = "corpus"
+max_passages = 40
+dedup = "simhash"
+cluster = true
+corpus_patterns = [
+  "mp-stash", "mp-compose", "mp-intersect", "mp-graph", "mp-link",
+  "mp-similar", "mp-prune", "mp-from", "mp-ttl", "mp-tag",
+  "mind.?palace", "stash", "scrt ", "--in", "--effort", "window.?curve",
+]
+
+[generate]
+backend = "api"
+kinds = ["qa", "instruction"]
+per_passage = 2
+  [generate.api]
+  base_url = "http://localhost:1234/v1"
+  model = "meta-llama-3-8b-instruct"   # forward-only teacher in LM Studio
+  turns = 1
+
+[train]
+preset = "lora"
+  [train.lora]
+  rank = 16
+  alpha = 32
+  target_modules = ["q_proj", "v_proj"]
+  lr = 2e-4
+  epochs = 1
+
+[eval]
+probe_holdout_frac = 0.15
+scorer_backend = "transformers"
+metrics = ["correctness"]
+
+[branch]
+base = "C:/Users/atooz/.cache/huggingface/hub/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6"
+name = "scrt-cli"
+domain = "scrt/cli"
+max_branches = 16
+  [branch.router]
+  kind = "simhash"
+  confidence_floor = 0.5
+  top_k = 1
+  [branch.ensemble]
+  mode = "single_best"

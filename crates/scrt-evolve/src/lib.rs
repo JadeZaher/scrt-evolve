@@ -18,6 +18,7 @@
 //! ML is opt-in behind the `train` feature (candle); the Python bridge is
 //! opt-in behind `pyo3`. A default build pulls neither.
 
+pub mod branch;
 pub mod config;
 pub mod dataset;
 pub mod directive;
@@ -43,11 +44,16 @@ pub mod workdir;
 #[cfg(feature = "pyo3")]
 pub mod bridge;
 
-pub use config::{ConfigError, EvalConfig, EvolveConfig, GoalConfig};
-pub use config::{
-    ExportConfig, FractionalConfig, HardwareConfig, MergeShardsConfig, RegulateConfig,
-    RuntimeConfig, SamplingConfig,
+pub use branch::{
+    BranchManifest, BranchRef, BranchRegistry, BranchRouter, Lineage, LocalBranchRouter,
+    RouterSignature,
 };
+pub use config::{
+    BranchConfig, BranchEnsembleConfig, BranchRouterConfig, BranchServeConfig, ExportConfig,
+    FractionalConfig, HardwareConfig, MergeShardsConfig, RegulateConfig, RuntimeConfig,
+    SamplingConfig,
+};
+pub use config::{ConfigError, EvalConfig, EvolveConfig, GoalConfig};
 pub use dataset::{Dataset, GenExample};
 pub use directive::TrainingDirective;
 pub use discover::DiscoveredContext;

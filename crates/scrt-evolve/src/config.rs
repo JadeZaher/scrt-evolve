@@ -75,6 +75,13 @@ pub struct EvolveConfig {
     /// `infer` uses the transformers fallback. Additive + non-breaking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<RuntimeConfig>,
+    /// `[branch]` — the Branch-Train-Merge **branch factory** (track 29). Turns a
+    /// (small) base + optional domain corpus into a standalone domain-specialized
+    /// branch (a BTM Expert LM), eval-gated + GGUF-packaged + registered + locally
+    /// routed. Absent ⇒ no branch operations (today's single-model path is
+    /// byte-identical). Additive + non-breaking (styleguide §1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<BranchConfig>,
     /// Learning-by-doing **goals** (track 20). Each `[[goals]]` table declares
     /// something a local model should evolve toward and how its traces are
     /// captured (topic ⇄ palace search, tag ⇄ palace tag). Additive + non-
@@ -806,6 +813,145 @@ impl Default for RuntimeConfig {
         }
     }
 }
+
+/// `[branch]` — the Branch-Train-Merge **branch factory** (track 29). A branch is
+/// a standalone domain-specialized model (a BTM Expert LM, arXiv 2208.03306):
+/// `branch create` scopes a per-branch `EvolveConfig` (override `base` + `corpus`)
+/// and composes the shipped stages (discover → teacher-QA generate → train
+/// `objective=end_task` → eval gate → GGUF export) inside the track-15 transaction,
+/// then writes a manifest + registers it. "Smaller" comes from `base` (a small base,
+/// specialized) in v1. Generic + architecture-level — no new ML lives here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchConfig {
+    /// Master switch. `false` ⇒ the branch stage is skipped (back-compat).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// The small base model to specialize (path or HF id) — the "smaller" lever.
+    /// Overrides `[evolve].model_path` for this branch. Absent ⇒ inherit `[evolve]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    /// Default branch name (CLI `--name` overrides). The registry/router key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Human-readable domain label, e.g. `legal/tool-calling`. Stored in the
+    /// manifest; informational (routing uses `router_signature`, not this).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// Per-branch corpus dir/selector — overrides `[evolve].corpus_dir` for this
+    /// branch so each branch trains on its own domain slice. Absent ⇒ inherit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corpus: Option<PathBuf>,
+    /// Training objective for the branch. `end_task` (default) makes the branch
+    /// learn the real downstream task (the data-sensitivity lever); other values
+    /// pass through to the train preset.
+    #[serde(default = "default_branch_objective")]
+    pub objective: String,
+    /// Roster cap: at most `max_branches` live branches; registering past the cap
+    /// merges near-duplicates / evicts per policy (no twins). Bounded fleet.
+    #[serde(default = "default_max_branches")]
+    pub max_branches: usize,
+    /// `[branch.router]` — request→branch routing knobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router: Option<BranchRouterConfig>,
+    /// `[branch.ensemble]` — top-k blend policy for `serve --branches`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ensemble: Option<BranchEnsembleConfig>,
+    /// `[branch.serve]` — how to serve a branch GGUF (reuses `[runtime]` knobs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serve: Option<BranchServeConfig>,
+}
+
+/// `[branch.router]` — descriptor-similarity routing of a request to branch(es).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchRouterConfig {
+    /// Descriptor kind: `simhash` (ML-free default) | `embedding` | `tfidf`. The
+    /// `router_signature` stored in each manifest is computed with this kind.
+    #[serde(default = "default_router_kind")]
+    pub kind: String,
+    /// Minimum similarity for a branch to be a candidate. Below it ⇒ no branch
+    /// (base-only). The routing safety floor.
+    #[serde(default = "default_confidence_floor")]
+    pub confidence_floor: f32,
+    /// How many top branches `resolve` returns (1 ⇒ single-best routing).
+    #[serde(default = "default_router_top_k")]
+    pub top_k: usize,
+}
+
+/// `[branch.ensemble]` — how `serve --branches` combines top-k branch outputs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchEnsembleConfig {
+    /// `single_best` (default — serve top-1) | `average_topk` (blend top-k, the
+    /// BTM inference Merge — output-average weighted by domain posterior).
+    #[serde(default = "default_ensemble_mode")]
+    pub mode: String,
+}
+
+/// `[branch.serve]` — branch serving knobs (a thin overlay on `[runtime]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BranchServeConfig {
+    /// Port for a persistent server (a later extension; v1 serve is one-shot).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// GPU layers to offload when serving the branch (llama.cpp `-ngl`). Absent ⇒
+    /// inherit `[runtime].n_gpu_layers`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_gpu_layers: Option<usize>,
+}
+
+fn default_branch_objective() -> String {
+    "end_task".to_string()
+}
+fn default_max_branches() -> usize {
+    16
+}
+fn default_router_kind() -> String {
+    "simhash".to_string()
+}
+fn default_confidence_floor() -> f32 {
+    0.5
+}
+fn default_router_top_k() -> usize {
+    1
+}
+fn default_ensemble_mode() -> String {
+    "single_best".to_string()
+}
+
+impl Default for BranchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            base: None,
+            name: None,
+            domain: None,
+            corpus: None,
+            objective: default_branch_objective(),
+            max_branches: default_max_branches(),
+            router: None,
+            ensemble: None,
+            serve: None,
+        }
+    }
+}
+
+impl Default for BranchRouterConfig {
+    fn default() -> Self {
+        Self {
+            kind: default_router_kind(),
+            confidence_floor: default_confidence_floor(),
+            top_k: default_router_top_k(),
+        }
+    }
+}
+
+impl Default for BranchEnsembleConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_ensemble_mode(),
+        }
+    }
+}
+
 
 impl Default for SamplingConfig {
     fn default() -> Self {
