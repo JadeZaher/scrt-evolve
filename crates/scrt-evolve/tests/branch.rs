@@ -78,6 +78,70 @@ domain = "legal/tool-calling"
 }
 
 #[test]
+fn distill_config_and_branch_mode_round_trip() {
+    // `[train.distill]` + `[branch].mode = "distill"` parse with the right
+    // defaults and round-trip; absent ⇒ today's behavior (covered elsewhere).
+    let toml = r#"
+[evolve]
+model_path = "/models/tinyllama"
+
+[train.distill]
+teacher_model = "/models/Mistral-7B"
+
+[train.fractional]
+block_size = 2
+
+[branch]
+base = "tinyllama-1.1b"
+mode = "distill"
+"#;
+    let cfg: EvolveConfig = toml::from_str(toml).unwrap();
+    let d = cfg
+        .train
+        .as_ref()
+        .and_then(|t| t.distill.clone())
+        .expect("[train.distill] should parse");
+    assert!(d.enabled, "distill.enabled defaults true");
+    assert_eq!(d.teacher_model.as_deref(), Some("/models/Mistral-7B"));
+    assert_eq!(d.layer_map, "stride", "layer_map default");
+    assert_eq!(d.loss, "cosine_mse", "loss default");
+    assert_eq!(d.projection, "auto", "projection default");
+    assert!(d.teacher_cache.is_none());
+
+    let b = cfg.branch.clone().expect("[branch]");
+    assert_eq!(b.mode, "distill", "branch mode parsed");
+
+    // Serialize → reparse is stable.
+    let out = toml::to_string(&cfg).unwrap();
+    let reparsed: EvolveConfig = toml::from_str(&out).unwrap();
+    assert_eq!(
+        reparsed
+            .train
+            .unwrap()
+            .distill
+            .unwrap()
+            .teacher_model
+            .as_deref(),
+        Some("/models/Mistral-7B")
+    );
+    assert_eq!(reparsed.branch.unwrap().mode, "distill");
+}
+
+#[test]
+fn branch_mode_defaults_to_standard() {
+    let toml = r#"
+[evolve]
+model_path = "/m"
+[branch]
+base = "b"
+"#;
+    let cfg: EvolveConfig = toml::from_str(toml).unwrap();
+    assert_eq!(cfg.branch.unwrap().mode, "standard", "mode default");
+    // No [train.distill] ⇒ None (back-compat).
+    assert!(cfg.train.is_none() || cfg.train.unwrap().distill.is_none());
+}
+
+#[test]
 fn evolve_config_without_branch_unchanged() {
     // A config with no [branch] parses and `branch` is None — today's behavior.
     let toml = r#"

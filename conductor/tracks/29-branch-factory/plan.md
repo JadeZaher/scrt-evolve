@@ -83,11 +83,70 @@ Landed:
   `gen=branch:<name>`) → carve probe → train → eval gate → export INSIDE the track-15 transaction;
   register only on Accept; Regress = no register; Catastrophe = quarantine `branch:<name>` + halt.
   Heavy stages injected as `BranchHooks` (SDK stays ML-free + testable) — `branch/create.rs`.
-- CLI `branch {create,list,route,serve}` (+ `serve --route` = `serve --branches`; ensemble note)
-  wiring the real subprocess stages — `crates/scrt-evolve-cli/src/main.rs`.
+- CLI `branch {create,list,register,route,serve}` (+ `serve --route` = `serve --branches`;
+  ensemble note) wiring the real subprocess stages — `crates/scrt-evolve-cli/src/main.rs`.
+  `branch register` = the native counterpart to `create`'s export step: compute the
+  `router_signature` (real `scrt_core` simhash) + assemble manifest + admit into the registry
+  for an **externally-built** GGUF (out-of-process train/export, or importing a peer's branch).
 - Cross-repo schema-contract test vs `SCRT-EVOLVE-INTEGRATION.md`; `tracks.md` graph node + "After 29"
   gate; runnable `[branch]` example in `bench/evolve.toml`.
 
 The distributed **Merge** (P2P serve + ensemble across peers) remains the **hivemind** repo's,
 contracted via `SCRT-EVOLVE-INTEGRATION.md`. Precursor for a future teacher→smaller-student
 compression mode: `bench/seam_distill/` (de-risk PASSED 2026-06-25).
+
+## Live local-branch validation (2026-06-26)
+First real end-to-end branch on this box (RTX 4060 8GB): **TinyLlama-1.1B → scrt-CLI domain expert**.
+Config: `bench/branch-scrt-cli.toml`. Work dir: `bench/work/scrt-cli-branch/`.
+- discover: 40 passages from the scrt-cli repo; generate (teacher = LM Studio `meta-llama-3-8b-instruct`):
+  **60 teacher-QA rows**; probe carve: 13 probe / 47 train.
+- train: TinyLlama LoRA on the GPU (WSL `~/scrt-gpu-venv`), 200 steps, q_proj/v_proj, bf16 —
+  **loss 3.70 → 0.05** (44 LoRA modules); export: merge → f16 → quantize → **667 MB Q4_K_M GGUF**
+  (`bench/work/scrt-cli-branch/scrt-cli.gguf`); registered (`branch list` shows it; `branch route`
+  on a mind-palace query resolves to it at score 0.53); served via `llama-completion` — returns
+  domain-shaped output (talks about stashing search results into the mind palace).
+- **Honest quality note:** eval correctness = **0.0** on the 13-item probe — TinyLlama-1.1B on ~60
+  teacher-QA rows hallucinates exact CLI syntax. The **machinery** is proven end-to-end (train →
+  export → register → route → serve); **quality** needs a bigger base / more data — and the eval
+  gate correctly would NOT auto-admit a 0.0 branch (a real `branch create` rolls it back). The
+  factory works; this base+data is a demo, not a production expert.
+
+**Run as DECOMPOSED, not one `branch create`** — environment split: the teacher (LM Studio) is reachable
+**only from native Windows**; the GPU + llama.cpp + torch live **only in WSL2**; `cargo`/`cmake` absent in
+WSL. So the *identical shipped stages* ran across native + WSL. The one thing skipped vs `branch create`:
+the **track-15 transaction** wrapper (train/export ran outside it) — compensated by gating manually
+(register only on eval pass). Technique = genuine BTM Branch+Train; only the orchestration was split.
+
+### Resume commands (for a fresh session, if the run was interrupted)
+Native = `./target/debug/scrt-evolve`; `$M` = the TinyLlama snapshot (`/mnt/c/...`); `$W` =
+`/mnt/c/Users/atooz/Programming/ai-utils-memory/scrt-evolve/bench/work/scrt-cli-branch`.
+Free GPU first: `"/c/Users/atooz/.lmstudio/bin/lms" unload --all`.
+```bash
+# eval (WSL): correctness of base+adapter on the probe
+MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- bash -lc 'source ~/scrt-gpu-venv/bin/activate; \
+  export PYTHONPATH=/mnt/c/.../scrt-evolve/python; \
+  python3 -m scrt_evolve_score --model $M --probe $W/probe.jsonl --adapter $W/adapter --metrics correctness'
+# export Q4_K_M GGUF (WSL)
+MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- bash -lc 'source ~/scrt-gpu-venv/bin/activate; \
+  export PYTHONPATH=/mnt/c/.../scrt-evolve/python; \
+  python3 -m scrt_evolve_gguf --model $M --adapter $W/adapter --out $W/scrt-cli.gguf \
+    --quant Q4_K_M --llama-cpp ~/llama.cpp'
+# register (native): manifest + registry + router_signature
+./target/debug/scrt-evolve branch register --config bench/branch-scrt-cli.toml --name scrt-cli \
+  --gguf bench/work/scrt-cli-branch/scrt-cli.gguf --correctness <score>
+# serve (WSL): prompt the branch
+MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- bash -lc '~/llama.cpp/build/bin/llama-completion \
+  -m $W/scrt-cli.gguf -p "How do I stash search results with the mind palace CLI?" -n 200'
+```
+
+## Follow-ups (next session)
+1. **2nd branch + routing demo** — create a `conductor` (track/spec/plan) branch and show `branch route`
+   picking between scrt-cli vs conductor (this is where BTM **Merge** value first appears; one branch only
+   proves Branch+Train + the routing surface).
+2. **Real `serve --branches` ensemble** — `average_topk` currently serves the top-1 representative + logs
+   intent; implement actual cross-branch output blending (or hand it to hivemind's Merge leg).
+3. **Transactional `branch create` in this env** — the decomposed run skipped the track-15 txn wrapper;
+   either build the CLI in WSL (needs `sudo apt install cmake` + rustup) for one-command GPU `branch create`,
+   or enable LM Studio "Serve on Local Network" so WSL can reach the teacher.
+4. **teacher→smaller-student distillation mode** — the v1 "smaller" is small-base+specialize; the true
+   distill-to-smaller mode (precursor `bench/seam_distill`, de-risk PASSED) is the next BTM capability.

@@ -47,6 +47,8 @@ prints a copy-pasteable template.)
     target_modules = ["auto"]     # "auto" => generic nn.Linear auto-detect
     lr = 2e-4
     epochs = 1
+    # init_adapter = "<dir>"      # CONTINUE from an existing adapter (further
+                                  # training); absent => fresh adapter
   [train.qat]                     # quantization-aware training (toward deploy quant)
     enabled = true
     quant = "Q4_K_M"
@@ -62,9 +64,26 @@ prints a copy-pasteable template.)
                                   # end_task (final shard learns CE on completions
                                   # via LM head — THE knowledge signal; use to
                                   # teach new content). Pair w/ rank up + epochs.
+  [train.distill]                 # cross-MODEL seam distillation (compress a
+                                  # larger teacher -> smaller student branch)
+    enabled = true
+    teacher_model = "/models/Mistral-7B"  # REQUIRED: the larger teacher (shared
+                                  # tokenizer w/ student). Two decoupled phases:
+                                  # teacher pre-captures seam targets to disk,
+                                  # student trains against the cache (never
+                                  # co-resident). Reuses [train.fractional] knobs.
+    layer_map = "stride"          # stride (nearest teacher seam) | block_avg
+    loss = "cosine_mse"           # cosine_mse | mse | cosine
+    projection = "auto"           # auto (lift student->teacher width if differ) |
+                                  # none (require equal widths). Scaffold, dropped.
+    grad_clip = 1.0               # gradient-clip max-norm (caps spike steps; 0 => off)
+    lr_mode = "auto"              # auto: DYNAMIC per-block LR (from seam magnitude)
+                                  # + warmup->cosine schedule | fixed: constant --lr
 
 [eval]                            # held-out probe gate (keep|rollback)
-  scorer_backend = "transformers" # api (no ML) | transformers (real forward pass)
+  scorer_backend = "api"          # api (default, no ML) | transformers (real forward pass)
+  stable_probe   = false          # true => reuse a fixed probe across rounds (REAL
+                                  # cross-round gate for `branch evolve`); false re-carves each round
 
 [regulate]                        # transactional homeostasis (checkpoint->apply->eval->keep|rollback)
   # present => every weight-mutating step is guarded + catastrophe halts
@@ -74,8 +93,18 @@ prints a copy-pasteable template.)
   vram_gb     = 8.0
   ram_gb      = 26.0
   kernels     = ["mamba-ssm","causal-conv1d"]  # accel kernels present
-  python      = "<venv python>"   # interpreter for ML subprocesses (planned binding)
+  python      = "<venv python>"   # interpreter for ML subprocesses (scrt-evolve-ml
+                                  # venv); precedence: --python > $SCRT_EVOLVE_PYTHON > here
   machine     = "<provenance string>"
+  free_gpu_command = "lms unload --all"  # evict a GPU teacher before training
+                                  # (single-GPU box; run before each train step)
+
+[store]                           # bounded model-weight VERSION ring (storage+loading)
+  # dir         = "<work_dir>/store"  # version ring + store.json
+  keep_versions = 2               # current + N-1 prior (older pruned on commit)
+  deploy_to     = "<live .gguf>"  # swap the kept GGUF in place here (e.g. LM Studio)
+  # A version = the tiny adapter (reverse trace) + optional GGUF over the shared
+  # immutable base; `branch evolve` commits + deploys, `branch rollback` reverts.
 
 [export]                          # merge (sharded) adapter -> GGUF -> quantize -> place
   quant          = "Q4_K_M"       # format/quant target (f16|none skip quantize)
@@ -102,6 +131,18 @@ prints a copy-pasteable template.)
     top_p       = 1.0
     max_tokens  = 256
 
+[daemon]                          # ambient continuous-evolution daemon (track 26)
+  max_vram_gb       = 4.0          # train only when >= this much VRAM is FREE (0 => ungated)
+  poll_interval_secs = 30          # wait this long when throttled / queue idle
+  batch             = 1            # queued items folded into one microshard step
+  granularity       = "module"     # track-25 microshard granularity (module | block)
+  eval_cadence      = 1            # reserved; v1 eval-gates EVERY step (safe default)
+  # --- gentle background (coexist with gaming / video) ---
+  pause_on_gpu_process = true      # yield the GPU when ANOTHER process uses it
+  cpu_fallback      = true         # when GPU busy/starved, train a light step on CPU (else pause)
+  rotation_blocks   = 0            # >0: train one block/step, rotate (ordinal % N) — bounds VRAM, spreads coverage
+  cooldown_secs     = 0            # sleep after each step to cap GPU duty cycle (0 => none)
+
 [[goals]]                         # learning-by-doing goals (repeatable)
   name          = "<goal>"
   topic         = "<subject>"     # feeds discover palace-search + corpus scope
@@ -112,6 +153,8 @@ prints a copy-pasteable template.)
 
 Umbrella commands:
   scrt-evolve evolve --schedule --max-rounds N   # eval-gated multi-goal loop
+  scrt-evolve daemon start [--max-vram 4G]       # ambient continuous-evolution loop
+  scrt-evolve teach --prompt "..." --completion "..."  # explicit priority-lane capture
   scrt-evolve export-gguf                         # the [export] pipeline
   scrt-evolve run-model --prompt "..."            # the [runtime] serving lane
 "#;
@@ -169,4 +212,79 @@ n_gpu_layers = 99
   [runtime.sampling]
   temperature = 0.0
   max_tokens = 256
+"#;
+
+/// Dataset (`dataset.jsonl`) + branch manifest/registry schema reference.
+/// Printed by `scrt-evolve dataset-reference`. These are the cross-language
+/// (Rust writer ↔ Python reader) and cross-repo (hivemind Merge) contracts;
+/// changing a field is a breaking change.
+pub const DATASET_REFERENCE: &str = r#"scrt-evolve — DATA CONTRACTS REFERENCE
+================================================================================
+The cross-language / cross-repo data shapes. `dataset.jsonl` is the
+generate↔train boundary (Rust writer ↔ Python reader); the branch manifest +
+registry are the contract feeding hivemind's Merge fabric. Changing a field is
+a breaking change.
+
+dataset.jsonl — one JSON object per line, tagged by `kind`
+--------------------------------------------------------------------------------
+Common optional fields on most rows:
+  source : string   # provenance (which passage/stash the row came from)
+  gen    : string   # generation stamp (e.g. "regen:swap2", "branch:<name>") —
+                    # the quarantine key (track 15). Absent on completion/contrastive.
+
+kind = "qa"                 # a prompt → answer pair (the workhorse SFT row)
+  prompt     : string  (req)
+  completion : string  (req)
+  source?, gen?
+
+kind = "instruction"        # instruction-tuning triple
+  instruction : string  (req)
+  input       : string  (default "")
+  output      : string  (req)
+  source?, gen?
+
+kind = "completion"         # raw continued-pretraining text (no prompt/response split)
+  text   : string  (req)
+  source?
+
+kind = "contrastive"        # embedding-adapter row (InfoNCE)
+  query     : string        (req)
+  positive  : string        (req)
+  negatives : [string]      (default [])
+  stash?    : string
+
+kind = "tool_call"          # user intent → structured tool call (function-calling)
+  prompt    : string        (req)  # the NL request
+  tool      : string        (req)  # tool name, e.g. "scrt_stash"
+  arguments : object        (req)  # JSON args; keys must be valid params for `tool`
+  source?, gen?
+
+kind = "cli"                # user intent → exact runnable command line (CLI fluency)
+  prompt  : string  (req)
+  command : string  (req)   # e.g.  scrt "auth" --mp-stash auth --mp-ttl 4h
+  source?, gen?
+
+Example line:
+  {"kind":"qa","prompt":"What does --mp-ttl do?","completion":"Sets a stash TTL.","gen":"branch:scrt-cli"}
+
+branch manifest.json — one per branch (work_dir/branches/<name>/manifest.json)
+--------------------------------------------------------------------------------
+  version           : string   # MANIFEST_VERSION ("1")
+  name              : string   # registry/router key
+  base_model        : string   # the base this branch specialized
+  domain            : string   # human label, e.g. "legal/tool-calling"
+  corpus_descriptor : string   # e.g. "128 dataset rows"
+  router_signature  : object   # { kind, ... } — how the router matches queries
+  eval_report       : { string: float }   # e.g. {"correctness": 0.83}
+  lineage           : { parent: string|null }
+  gguf_sha          : string   # SHA-256 of the branch GGUF (content address)
+  created           : string   # ISO-8601 UTC
+
+branches/registry.json — the fleet (work_dir/branches/registry.json)
+--------------------------------------------------------------------------------
+  schema_version : int                  # REGISTRY_SCHEMA_VERSION (1); mismatch refused
+  branches       : [ manifest, ... ]    # the registered BranchManifest entries
+
+Produced by: `generate` (dataset.jsonl), `branch create` / `branch register`
+(manifest + registry). Print the config schema with `config-reference`.
 "#;

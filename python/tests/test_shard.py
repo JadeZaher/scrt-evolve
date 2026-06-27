@@ -10,9 +10,15 @@ import torch
 import torch.nn as nn
 
 from scrt_evolve_train.shard import (
+    block_lr_scale,
+    build_projection,
     discover_groups,
+    distill_loss,
     find_decoder_layers,
+    lr_at_step,
+    plan_seam_map,
     plan_shards,
+    _seam_indices,
     _set_group_student,
 )
 from scrt_evolve_train.trainer import (
@@ -197,6 +203,130 @@ def test_set_group_student_isolates_one_group():
     print("OK set_group_student_isolates_one_group")
 
 
+# ─────────────── Cross-model seam distillation (track 29 v1.1) ───────────────
+
+
+def test_seam_map_stride_maps_deeper_teacher_to_student_blocks():
+    # Student: 4 layers in 2 blocks; teacher: 8 layers. Stride maps each student
+    # boundary to the proportional teacher seam (b * L_t / L_s).
+    blocks = plan_shards(4, None, 2)  # [(0,2),(2,4)]
+    smap = plan_seam_map(blocks, 8, "stride")
+    assert smap == {2: [4], 4: [8]}, smap
+    # The final student boundary always lands on the teacher's final seam.
+    assert smap[4] == [8]
+    # Per-layer student (block_size=1) over a 22→student... sanity: monotonic.
+    blocks2 = plan_shards(4, None, 1)  # [(0,1),(1,2),(2,3),(3,4)]
+    smap2 = plan_seam_map(blocks2, 8, "stride")
+    assert smap2 == {1: [2], 2: [4], 3: [6], 4: [8]}, smap2
+    print("OK seam_map_stride")
+
+
+def test_seam_map_block_avg_spans_teacher_layers():
+    # block_avg maps a student block to the SPAN of teacher layers it covers, so
+    # Phase A can average them into a smoother target.
+    blocks = plan_shards(2, None, 1)  # [(0,1),(1,2)]
+    smap = plan_seam_map(blocks, 6, "block_avg")
+    # student boundary 1 -> teacher seam 3; block covers teacher seams 1..3.
+    assert smap[1] == [1, 2, 3], smap
+    assert smap[2] == [4, 5, 6], smap
+    # _seam_indices collects the full distinct set Phase A must capture.
+    assert _seam_indices(smap) == [1, 2, 3, 4, 5, 6]
+    print("OK seam_map_block_avg")
+
+
+def test_build_projection_identity_when_equal_width():
+    # Equal widths (or mode='none') ⇒ identity (no width bridge, nothing to drop).
+    p = build_projection(16, 16, "auto")
+    assert isinstance(p, nn.Identity)
+    x = torch.randn(2, 5, 16)
+    assert torch.equal(p(x), x)
+    p_none = build_projection(8, 12, "none")
+    assert isinstance(p_none, nn.Identity)
+    print("OK build_projection_identity")
+
+
+def test_build_projection_lifts_student_to_teacher_width():
+    # Differing widths ⇒ a linear lift student(d_s) → teacher(d_t), so the loss
+    # is computed in teacher space (the target is never down-sampled).
+    p = build_projection(8, 12, "auto")
+    assert isinstance(p, nn.Linear)
+    assert p.weight.shape == (12, 8)
+    out = p(torch.randn(2, 5, 8))
+    assert out.shape == (2, 5, 12)
+    print("OK build_projection_lift")
+
+
+def test_distill_loss_variants_and_zero_at_match():
+    pred = torch.randn(3, 7, 12)
+    # Perfect match ⇒ mse 0 and cosine 0 (1 - 1).
+    assert distill_loss(pred, pred.clone(), "mse").item() < 1e-6
+    assert distill_loss(pred, pred.clone(), "cosine").item() < 1e-6
+    assert distill_loss(pred, pred.clone(), "cosine_mse").item() < 1e-6
+    # cosine_mse = cosine + mse (both non-negative); strictly ≥ each alone here.
+    tgt = torch.randn(3, 7, 12)
+    cm = distill_loss(pred, tgt, "cosine_mse").item()
+    c = distill_loss(pred, tgt, "cosine").item()
+    m = distill_loss(pred, tgt, "mse").item()
+    assert abs(cm - (c + m)) < 1e-4, (cm, c, m)
+    print("OK distill_loss_variants")
+
+
+def test_distill_training_step_reduces_loss_on_toy_pair():
+    # End-to-end mechanism on a TINY cross-width pair (no model load, CPU): a
+    # student "block" (Linear 8→8) + read-out projection (8→12) learns to match a
+    # fixed teacher target in 12-dim. Loss must fall — proves the projection +
+    # loss + optimizer wire up and the cross-width gradient flows.
+    torch.manual_seed(0)
+    student_block = nn.Linear(8, 8)
+    proj = build_projection(8, 12, "auto")
+    x = torch.randn(4, 6, 8)
+    teacher_target = torch.randn(4, 6, 12)  # a distinct-width "teacher seam"
+    opt = torch.optim.AdamW(
+        list(student_block.parameters()) + list(proj.parameters()), lr=1e-2
+    )
+    first = None
+    last = 0.0
+    for _ in range(200):
+        pred = proj(student_block(x))
+        loss = distill_loss(pred, teacher_target, "cosine_mse")
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        if first is None:
+            first = loss.item()
+        last = loss.item()
+    assert last < first, f"distill loss did not fall: {first:.4f} -> {last:.4f}"
+    assert last < first * 0.7, f"weak fit: {first:.4f} -> {last:.4f}"
+    print(f"OK distill_training_step ({first:.3f} -> {last:.3f})")
+
+
+def test_block_lr_scale_gentler_for_larger_targets():
+    # Reference block (target_rms == ref) keeps the full base LR.
+    assert block_lr_scale(10.0, 10.0) == 1.0
+    # A deeper block with 4× the magnitude gets ~1/4 the LR (clamped at lo).
+    assert abs(block_lr_scale(10.0, 40.0) - 0.25) < 1e-9
+    # Even larger ⇒ clamped to the lo floor, never zero.
+    assert block_lr_scale(10.0, 1000.0) == 0.25
+    # A smaller-magnitude block never exceeds the base LR (clamped at hi).
+    assert block_lr_scale(10.0, 2.0) == 1.0
+    # Degenerate target ⇒ safe hi default.
+    assert block_lr_scale(10.0, 0.0) == 1.0
+    print("OK block_lr_scale")
+
+
+def test_lr_at_step_warmup_then_cosine_decay():
+    base, total, warmup = 1e-3, 100, 10
+    # Warmup ramps up linearly and ends at ~base.
+    assert lr_at_step(base, 0, total, warmup) < lr_at_step(base, 5, total, warmup)
+    assert abs(lr_at_step(base, warmup - 1, total, warmup) - base) < 1e-12
+    # Just after warmup it is near the peak; by the end it decays to ~0.
+    assert lr_at_step(base, warmup, total, warmup) > 0.9 * base
+    assert lr_at_step(base, total - 1, total, warmup) < 0.05 * base
+    # No warmup ⇒ pure cosine from the first step.
+    assert abs(lr_at_step(base, 0, total, 0) - base) < 1e-6
+    print("OK lr_at_step")
+
+
 if __name__ == "__main__":
     test_plan_shards_block_size_and_count()
     test_find_decoder_layers_generic()
@@ -206,4 +336,12 @@ if __name__ == "__main__":
     test_lora_disabled_returns_base()
     test_discover_groups_skips_linear_free_children()
     test_set_group_student_isolates_one_group()
+    test_seam_map_stride_maps_deeper_teacher_to_student_blocks()
+    test_seam_map_block_avg_spans_teacher_layers()
+    test_build_projection_identity_when_equal_width()
+    test_build_projection_lifts_student_to_teacher_width()
+    test_distill_loss_variants_and_zero_at_match()
+    test_distill_training_step_reduces_loss_on_toy_pair()
+    test_block_lr_scale_gentler_for_larger_targets()
+    test_lr_at_step_warmup_then_cosine_decay()
     print("\nALL SHARD/FRACTIONAL PYTHON TESTS PASSED")

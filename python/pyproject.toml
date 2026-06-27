@@ -1,0 +1,77 @@
+# scrt-evolve-ml — the Python ML half of scrt-evolve (track 28 packaging).
+#
+# The Rust CLI is a native binary; the heavy ML (real-model LoRA training, GGUF
+# export, scoring, dequant) lives here and binds at runtime through a configured
+# venv interpreter ([hardware].python / $SCRT_EVOLVE_PYTHON). The two halves ship
+# SEPARATELY by necessity: torch + (for hybrid-SSM) compiled CUDA kernels cannot
+# be frozen into one portable exe. See ../PORTABILITY.md for the env contract.
+#
+# Install:
+#   pip install scrt-evolve-ml[cpu]        # CPU torch (eval/api, small-model train)
+#   pip install scrt-evolve-ml[cuda]       # CUDA torch — see PORTABILITY.md for the
+#                                          # --index-url + mamba-kernel build steps
+#   pip install -e .[cpu]                  # dev (editable)
+#
+# Then point the CLI at this venv:  export SCRT_EVOLVE_PYTHON=/path/to/venv/bin/python
+# (or set [hardware].python in evolve.toml). The CLI runs `<python> -m scrt_evolve_*`.
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scrt-evolve-ml"
+version = "0.1.0"
+description = "The Python ML backend for scrt-evolve: real-model LoRA training, GGUF export, scoring, dequant."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Jade Zaher" }]
+keywords = ["llm", "lora", "finetuning", "gguf", "quantization", "transformers"]
+
+# Core deps shared by all paths. torch is deliberately NOT here — its build flavor
+# (CPU vs CUDA) is platform-specific, so it lives in the [cpu]/[cuda] extras.
+dependencies = [
+    "transformers>=4.40",
+    "safetensors>=0.4",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+# CPU path: a portable torch wheel. Good for eval/api scoring and small-model
+# LoRA; real GPU training needs [cuda].
+cpu = [
+    "torch>=2.2",
+    "gguf>=0.9",
+]
+# CUDA path: the same surface, but install torch from the CUDA index FIRST, e.g.
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# Hybrid-SSM (Mamba) TRAINING additionally needs mamba-ssm + causal-conv1d, which
+# have NO universal wheels — build them from source per PORTABILITY.md. `doctor`
+# reports whether they're importable.
+cuda = [
+    "torch>=2.2",
+    "gguf>=0.9",
+    "accelerate>=0.30",
+]
+# Run the Python-side test suite.
+test = ["pytest>=7"]
+
+[project.scripts]
+scrt-evolve-train = "scrt_evolve_train.__main__:main"
+scrt-evolve-infer = "scrt_evolve_infer.__main__:main"
+scrt-evolve-gguf = "scrt_evolve_gguf.__main__:main"
+scrt-evolve-score = "scrt_evolve_score.__main__:main"
+scrt-evolve-dequant = "scrt_evolve_dequant.__main__:main"
+
+[tool.setuptools]
+packages = [
+    "scrt_evolve_train",
+    "scrt_evolve_infer",
+    "scrt_evolve_gguf",
+    "scrt_evolve_score",
+    "scrt_evolve_dequant",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

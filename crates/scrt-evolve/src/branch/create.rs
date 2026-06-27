@@ -142,14 +142,25 @@ pub fn create(
     let passage_texts: Vec<String> = ctx.passages.iter().map(|p| p.text.clone()).collect();
     let router_signature = corpus_signature(router_kind, &passage_texts);
 
-    // Carve a held-out probe + training remainder (track 10).
-    let frac = scoped
-        .eval
-        .as_ref()
-        .map(|e| e.probe_holdout_frac)
-        .unwrap_or(0.1);
-    let (probe, train_set) = ProbeSet::carve(&dataset, frac)?;
-    let _ = probe.write(crate::eval::probe_path(&scoped));
+    // Carve a held-out probe + training remainder (track 10). With
+    // `[eval].stable_probe`, REUSE an existing probe across rounds so the
+    // candidate and the stored baseline are scored on the SAME exam (a real
+    // cross-round keep|rollback gate); carve a fresh one only on the first round
+    // (none exists yet). The default re-carves each round (one-shot `create`).
+    let ecfg = scoped.eval.clone().unwrap_or_default();
+    let ppath = crate::eval::probe_path(&scoped);
+    // Only `train_set` is consumed here; the probe is reloaded from disk by the
+    // `score` hook (`eval::run_eval`), so the in-memory handle isn't kept.
+    let (_probe, train_set) = if ecfg.stable_probe && ppath.exists() {
+        let probe = ProbeSet::load(&ppath)?;
+        let train_set = probe.exclude_overlap(&dataset);
+        probe.assert_no_overlap(&train_set)?;
+        (probe, train_set)
+    } else {
+        let (probe, train_set) = ProbeSet::carve(&dataset, ecfg.probe_holdout_frac)?;
+        let _ = probe.write(&ppath);
+        (probe, train_set)
+    };
     let _ = train_set.write_jsonl(branch_wd.root().join("dataset.train.jsonl"));
     let rows = train_set.len();
 

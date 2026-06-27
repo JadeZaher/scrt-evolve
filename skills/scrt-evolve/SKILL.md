@@ -106,6 +106,45 @@ Your raw transcripts are also harvested (lower-trust, filtered) — but the
 **goal-tagged stashes are the high-signal curriculum**. The better your notes,
 the better the model.
 
+## Driving the CLI (the verbs)
+
+Stashing is *what to capture*; this is *how to run the loop*. The canonical
+sequence (each stage writes an inspectable artifact under `work_dir/`):
+
+```bash
+scrt-evolve discover                       # corpus + goal-tagged stashes → discovered.json
+scrt-evolve generate                       # → dataset.jsonl
+scrt-evolve probe build                    # carve a held-out eval set
+scrt-evolve train --backend transformers   # REAL model (LoRA via Python). See caveat ↓
+scrt-evolve eval                           # score vs the probe set
+scrt-evolve export-gguf                    # merge → quantized GGUF (LM Studio / llama.cpp)
+scrt-evolve evolve --schedule --max-rounds 4   # the eval-gated multi-goal loop (does all the above, gated)
+```
+
+**The one caveat that bites: `train` defaults to `--backend candle`, a
+mechanical FIXTURE that cannot load real models.** For a real model you MUST
+pass `--backend transformers`. The fixture prints a plausible `final_loss` but
+trained nothing real — don't report success off it.
+
+**Preflight before a long run:** `scrt-evolve doctor` checks the Python interp,
+model path, llama.cpp, and work_dir, printing PASS/FAIL + a fix for each. Run it
+once before `train`/`export` to fail in 2 seconds instead of at minute 9.
+
+**Parsing output as an agent:** pass `--json` for a machine-readable summary
+line (the LAST stdout line) on the artifact commands. Examples:
+- `generate --json` → `{"command":"generate","rows":42,"out":"…","status":"ok"}`
+- `train --backend transformers --json` → includes `"is_fixture":false`; the
+  candle default emits `"is_fixture":true` — branch on that to know what ran.
+- `eval --json` → `correctness`, `n`, `backend` (absent metrics are `null`).
+- `export-gguf --json` → `"quant"` + `"quant_source":"flag"|"config"` so you
+  know whether your `--quant` flag was honored or the config value won.
+
+Schemas are introspectable, no source-reading needed:
+`scrt-evolve config-reference` (the evolve.toml schema),
+`scrt-evolve dataset-reference` (dataset.jsonl + branch manifest rows),
+`scrt-evolve commands --json` (the full subcommand surface),
+`scrt-evolve config-show` (the resolved config for THIS run).
+
 ## Pairing with `scrt-context`
 
 - `scrt-context` = **how** to search/stash/compose/prune (the lens + palace).

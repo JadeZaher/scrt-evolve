@@ -42,11 +42,35 @@ preset = "lora"
   target_modules = ["q_proj", "v_proj"]
   lr = 2e-4
   epochs = 1
+  # Round 1 continues from the EXISTING scrt-cli adapter; subsequent rounds
+  # continue from the [store] current version automatically.
+  init_adapter = "C:/Users/atooz/Programming/ai-utils-memory/scrt-evolve/bench/work/scrt-cli-branch/adapter"
 
 [eval]
 probe_holdout_frac = 0.15
 scorer_backend = "transformers"
 metrics = ["correctness"]
+# Reuse a fixed probe across rounds so the multi-round gate is REAL: round N's
+# candidate and round N-1's stored baseline are scored on the SAME exam (carved
+# once on round 1, reused after). Without this, each round re-carves a different
+# probe and the cross-round verdict isn't comparable.
+stable_probe = true
+
+[hardware]
+device = "cuda"                       # native CUDA venv (one process, GPU)
+# python = "C:/scrt-cuda-venv/Scripts/python.exe"   # or set $SCRT_EVOLVE_PYTHON
+# Free the GPU between teacher-generation and training (single-GPU box):
+free_gpu_command = "lms unload --all"
+
+[export]
+quant = "Q4_K_M"
+llama_cpp_path = "C:/llama.cpp"       # the complete checkout (converter + quantize)
+
+[store]
+# Bounded weight-version ring: base is immutable, a "version" is the tiny adapter
+# (+ optional GGUF). Keeps current + 1 prior; swap-in-place is reversible.
+keep_versions = 2
+deploy_to = "C:/Users/atooz/.lmstudio/models/scrt-evolve/scrt-cli/scrt-cli.gguf"
 
 [branch]
 base = "C:/Users/atooz/.cache/huggingface/hub/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6"

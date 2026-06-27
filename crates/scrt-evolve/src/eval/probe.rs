@@ -92,6 +92,24 @@ impl ProbeSet {
         Ok((probe, train))
     }
 
+    /// Return `dataset` with every row that matches a probe item (by content
+    /// key) removed — the training remainder when REUSING a fixed probe across
+    /// rounds (`[eval].stable_probe`). Unlike [`Self::carve`] (which SPLITS one
+    /// dataset into probe + train), here the probe is fixed and a fresh dataset
+    /// is filtered against it, so the same exam is reused round-to-round while
+    /// the probe is still guaranteed never to be trained on. Deterministic.
+    pub fn exclude_overlap(&self, dataset: &Dataset) -> Dataset {
+        let probe_keys: std::collections::BTreeSet<String> =
+            self.items.iter().map(content_key).collect();
+        let rows = dataset
+            .rows
+            .iter()
+            .filter(|r| !probe_keys.contains(&content_key(r)))
+            .cloned()
+            .collect();
+        Dataset::new(rows)
+    }
+
     /// Assert no probe item appears in `training` (by content). A probe that
     /// leaked into the training set is invalid; this is the spec's hard gate.
     pub fn assert_no_overlap(&self, training: &Dataset) -> anyhow::Result<()> {

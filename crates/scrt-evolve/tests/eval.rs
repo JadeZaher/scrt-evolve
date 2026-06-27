@@ -139,6 +139,35 @@ fn probe_carve_holds_out_with_zero_overlap_and_is_deterministic() {
 }
 
 #[test]
+fn stable_probe_excludes_overlap_to_form_the_train_remainder() {
+    // The `[eval].stable_probe` path: carve a fixed probe once, then on a later
+    // round filter a fresh dataset against it. The probe rows are removed (never
+    // trained on) while the rest survive — the cross-round-stable analogue of carve.
+    let ds = sample_dataset();
+    let (probe, _train) = ProbeSet::carve(&ds, 0.25).unwrap();
+    assert!(!probe.is_empty());
+
+    // Filtering the ORIGINAL dataset against the fixed probe drops exactly the
+    // probe rows, and the result has zero overlap with the probe.
+    let remainder = probe.exclude_overlap(&ds);
+    assert_eq!(remainder.len(), ds.len() - probe.len());
+    probe.assert_no_overlap(&remainder).unwrap();
+
+    // A disjoint fresh dataset (next round's generation) passes through whole.
+    let fresh = Dataset::new(
+        (100..105)
+            .map(|i| GenExample::Cli {
+                prompt: format!("fresh {i}"),
+                command: format!("scrt \"f{i}\" --mp-stash f{i}"),
+                source: Some("fixture".to_string()),
+                gen: Some("test".to_string()),
+            })
+            .collect(),
+    );
+    assert_eq!(probe.exclude_overlap(&fresh).len(), fresh.len());
+}
+
+#[test]
 fn probe_overlap_is_detected() {
     let ds = sample_dataset();
     let (probe, _train) = ProbeSet::carve(&ds, 0.25).unwrap();

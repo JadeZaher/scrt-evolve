@@ -22,9 +22,12 @@ Thumbs.db
 # Conductor session scratch log
 conductor/.conductor_session_log
 
-# Python bytecode caches
+# Python bytecode caches + packaging build artifacts (track 28: the package is
+# pip/uv-installed from pyproject.toml; build/ and *.egg-info/ are regenerated).
 __pycache__/
 *.pyc
+python/build/
+*.egg-info/
 
 # Scratch run dirs keep their config but ignore artifacts (see run-*/.gitignore);
 # belt-and-suspenders for any model weights / datasets that land at the root.
@@ -38,3 +41,6 @@ bench/corpus/
 bench/work/
 bench/.mpg/
 bench/traces/
+
+# Bench: run logs are one-off validation scratch — never commit them.
+bench/**/*.log

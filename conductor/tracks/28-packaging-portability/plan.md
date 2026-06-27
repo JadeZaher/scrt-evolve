@@ -30,6 +30,29 @@ release (5). Keep every change additive; default Rust build stays ML-free; the
 existing sweep must stay green.
 
 ## Status
-NOT STARTED (design locked: pip/uv package + venv-interpreter binding). Prereq
-track 27 (config-driven export) is COMPLETE. This is the track that makes the
-framework distributable. See memory [[portability-packaging-direction]].
+**SHIPPED (2026-06-26)** — the framework is distributable; the only un-automated
+piece is publishing to an index (the artifacts + contract are in place).
+
+- [x] **Task 1 — `python/pyproject.toml`**: packages `scrt-evolve-ml` (the 5
+  modules) with `[cpu]`/`[cuda]`/`[test]` extras + console_scripts
+  (`scrt-evolve-train` …); `python/README.md` added.
+- [x] **Task 2 — interpreter resolution**: `resolve_python()` in the CLI —
+  `--python` > `$SCRT_EVOLVE_PYTHON` > `[hardware].python` (new config field) >
+  bare `python`. `cmd_train_transformers`/`infer`/`run-model`/`export-gguf`/
+  `dequant`/`eval` all route through it and run `-m <module>` against the
+  INSTALLED package; the checkout `python/` dir is now only a PYTHONPATH fallback
+  (no longer bails when absent). Unit test asserts the precedence.
+- [x] **Task 3 — `scrt-evolve doctor`**: built (extends the UX-review doctor) —
+  config parse, model_path, python pkg dir, a torch/cuda/transformers/safetensors/
+  mamba probe, llama.cpp auto-detect, writable work_dir; PASS/FAIL + fix per check;
+  `--json` for agents.
+- [x] **Task 4 — `PORTABILITY.md`**: OS×accelerator matrix, the verified WSL2+CUDA
+  recipe, WSL gotchas (9p/RAM/disk), the ecosystem gaps (no Windows mamba wheels,
+  llama.cpp arch lag), and the CLI↔package version contract.
+- [~] **Task 5 — release wiring**: `[profile.release]` (lto/codegen/strip) present;
+  the version contract is documented (PORTABILITY.md). Per-platform binary CI +
+  index publishing remain un-automated (deferred — environment-specific).
+- [x] **Task 6 — tests**: interpreter-resolution precedence unit test (env > config
+  > flag ordering). pyproject `python -m build` is a manual check (needs network).
+
+See memory [[portability-packaging-direction]].

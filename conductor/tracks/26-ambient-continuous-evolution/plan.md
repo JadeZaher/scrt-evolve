@@ -33,6 +33,31 @@
   regenerate better QA mid-run (iterated teaching / self-distillation).
 
 ## Status
-NOT STARTED (design locked). Prereq track 25 is COMPLETE. Build order: queue →
-tail → daemon → eval-gated commit → constitution/taste synthesis, then the three
-future axes. All additive; default build must stay ML-free + green.
+**MACHINERY SHIPPED (2026-06-26)** — the ML-free, testable core is built + green;
+the live GPU run is the only deferred piece.
+
+- [x] **Task 1 — `living_queue`** (`src/living_queue.rs`): two-lane (raw/priority)
+  append-only JSONL queue under `work_dir/queue/`, atomic enqueue + cursor-based
+  pop (priority drains first), restart-safe `cursor.json` (temp+rename). 4 unit
+  tests (round-trip, priority ordering, cursor-survives-reopen, batch drain).
+- [~] **Task 2 — activity tail → enqueue**: explicit `teach` → PRIORITY lane is
+  DONE (CLI `teach --prompt --completion`); raw-lane ingestion helper
+  `LivingQueue::enqueue_raw(Dataset)` is present for distilled harvest rows. The
+  always-on filesystem *watcher* over `~/.claude/projects` is the deferred
+  production wiring (reuses `harvest::harvest_entries`).
+- [ ] **Task 3 — constitution/taste synthesis**: deferred — depends on tracks
+  21/22 (taste/meta-objects), which are not built.
+- [x] **Task 4 — `daemon` subcommand** (`src/daemon.rs` + CLI `daemon start/stop/
+  status`): VRAM-gated loop (`[hardware]`/`[daemon]` + `--max-vram`), per step →
+  track-15 transaction (keep|rollback), catastrophe → halt, durable
+  `logs/daemon.log`, explicit stop-file control, resume from the queue cursor.
+- [x] **Task 5 — `[daemon]` config block**: `max_vram_gb`, `poll_interval_secs`,
+  `batch`, `granularity` (default `module`), `eval_cadence`. Additive.
+- [x] **Task 6 — tests**: queue round-trip + VRAM-gate/stop/max-steps + stubbed-
+  trainer transactional commit (3 daemon tests, injected-closure pattern).
+- [ ] **Task 7 — real GPU verification** on Granite (WSL2): DEFERRED (needs the
+  GPU box; the machinery is exercised ML-free).
+
+The three future axes (curriculum refinement, memory consolidation, teaching-as-
+evolution) remain backlog. Build order delivered: queue → daemon → eval-gated
+commit; tail (explicit) + synthesis are the remaining wiring.

@@ -128,6 +128,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--resume-adapter",
+        default=None,
+        metavar="DIR",
+        help=(
+            "CONTINUE training from an existing adapter dir (loads its "
+            "adapter.safetensors into the attached LoRA before training). The "
+            "config-driven 'further training' path — a branch keeps evolving "
+            "instead of restarting each round. Absent ⇒ fresh adapter."
+        ),
+    )
+    p.add_argument(
         "--seed",
         type=int,
         default=0,
@@ -228,6 +239,88 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # --- Cross-MODEL seam distillation (compress a larger teacher → smaller
+    #     student branch; track 29 v1.1). Two-phase + decoupled so teacher and
+    #     student are never co-resident. Reuses --block-size/--calib-batches.
+    p.add_argument(
+        "--distill-mode",
+        action="store_true",
+        help=(
+            "Cross-MODEL seam distillation: train the student's per-block output "
+            "to match a DISTINCT, larger --teacher-model's hidden state at a "
+            "mapped seam (genuine teacher→smaller-student compression). Requires "
+            "a SHARED tokenizer. Absent ⇒ same-model / dense behavior."
+        ),
+    )
+    p.add_argument(
+        "--teacher-model",
+        default=None,
+        metavar="PATH",
+        help="Local path/id of the larger TEACHER model (required with --distill-mode).",
+    )
+    p.add_argument(
+        "--layer-map",
+        default="stride",
+        choices=["stride", "block_avg"],
+        help=(
+            "Teacher→student seam correspondence. 'stride' (default): each student "
+            "block maps to one nearest teacher seam (uniform depth ratio). "
+            "'block_avg': averages the teacher layers spanning the student block."
+        ),
+    )
+    p.add_argument(
+        "--distill-loss",
+        default="cosine_mse",
+        choices=["mse", "cosine", "cosine_mse"],
+        help="Hidden-state distillation loss. Default: cosine_mse (direction + magnitude).",
+    )
+    p.add_argument(
+        "--projection",
+        default="auto",
+        choices=["auto", "none", "student_up"],
+        help=(
+            "Width bridge when teacher/student hidden sizes differ. 'auto' "
+            "(default): identity if equal, else lift student→teacher width. "
+            "'none': require equal widths. The projection is a distill-time "
+            "scaffold, discarded after (only the LoRA is saved)."
+        ),
+    )
+    p.add_argument(
+        "--teacher-cache",
+        default=None,
+        metavar="DIR",
+        help="Directory for the teacher seam cache (Phase A writes, Phase B reads). "
+        "Default: <out>/distill_cache.",
+    )
+    p.add_argument(
+        "--grad-clip",
+        type=float,
+        default=1.0,
+        metavar="F",
+        help="Gradient-clipping max-norm for the distill student (caps spike steps "
+        "that diverge a block). 0 ⇒ off. Default: 1.0.",
+    )
+    p.add_argument(
+        "--lr-mode",
+        default="auto",
+        choices=["auto", "fixed"],
+        help=(
+            "Distill LR adaptivity. 'auto' (default): a DYNAMIC per-block LR from "
+            "each block's teacher-target magnitude + a warmup→cosine schedule. "
+            "'fixed': constant --lr everywhere."
+        ),
+    )
+    p.add_argument(
+        "--distill-phase",
+        default="both",
+        choices=["capture", "train", "both"],
+        help=(
+            "Which phase to run. 'capture': teacher → cache only. 'train': student "
+            "← cache only. 'both' (default): capture then train (teacher freed "
+            "before the student loads)."
+        ),
+    )
+
     return p
 
 
@@ -237,7 +330,11 @@ def main() -> None:
         parser.print_help()
         sys.exit(0)
     args = parser.parse_args()
-    if getattr(args, "shard_mode", False):
+    if getattr(args, "distill_mode", False):
+        from .shard import train_distill
+
+        train_distill(args)
+    elif getattr(args, "shard_mode", False):
         from .shard import train_sharded
 
         train_sharded(args)

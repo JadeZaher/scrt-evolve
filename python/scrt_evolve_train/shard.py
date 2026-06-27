@@ -35,6 +35,7 @@ untouched.
 """
 
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -599,6 +600,538 @@ def _train_block_by_module(
             layer_inputs = [_run_layer(layer, x, layer_kwargs) for x in layer_inputs]
 
     return (first_loss or 0.0, last_loss, n_groups)
+
+
+# ---------------------------------------------------------------------------
+# Cross-MODEL seam distillation — compress a larger TEACHER into a smaller
+# STUDENT branch (track 29 v1.1). The same-model path above distills a block
+# against ITS OWN frozen output (a regularization signal). This path distills
+# the student's per-block output against a DISTINCT, larger teacher's
+# hidden-state at a mapped seam — genuine cross-model compression.
+#
+# Two fully-DECOUPLED phases so teacher + student are NEVER co-resident (the
+# VRAM crux for a 32B→3B on a small box):
+#   Phase A (capture): load the teacher ALONE, stream it one layer at a time,
+#     write its per-seam hidden states to a disk cache, then UNLOAD it. Peak
+#     VRAM = one teacher layer. The cache also stores the exact token ids so
+#     Phase B feeds the student an identical sequence (positional alignment).
+#   Phase B (train): load the student ALONE; for each student block, stream its
+#     boundary input and train the block's LoRA (+ a discard-after read-out
+#     projection that bridges width) to match the cached teacher seam.
+#
+# Requires a SHARED tokenizer (hidden states are matched position-by-position,
+# so teacher + student must tokenize identically) — guarded at runtime.
+#
+# Findings carried from bench/seam_distill/RESULTS.md (the de-risked precursor):
+#   * capture teacher targets in fp32 and train the student block in fp32
+#     (bf16 AdamW updates for a small delta round away → the student stalls);
+#   * match the full (projected) hidden state with cosine+MSE. Unlike the
+#     same-model delta case, the teacher target is a DIFFERENT model's state
+#     (not ≈ the student input), so it cannot trivially collapse to identity.
+# ---------------------------------------------------------------------------
+
+# Cache layout written by Phase A and read by Phase B (under --teacher-cache).
+_SEAM_MANIFEST = "seam_manifest.json"
+
+
+def plan_seam_map(
+    student_blocks: list[tuple[int, int]], teacher_layers: int, strategy: str = "stride"
+) -> dict[int, list[int]]:
+    """Map each student block's OUTPUT boundary onto teacher seam layer(s).
+
+    A student block ``[a, b)`` produces the hidden state entering student layer
+    ``b`` (HF ``hidden_states[b]``: 0 = embeddings, k = output of layer k-1). The
+    teacher (deeper) is sampled at the proportionally-corresponding depth.
+
+    Returns ``{student_b: [teacher_seam_idx, ...]}`` where each teacher index is
+    into the teacher's ``hidden_states`` (0..=teacher_layers). ``stride`` maps to
+    a single nearest teacher seam (uniform depth ratio); ``block_avg`` maps to
+    the span of teacher layers covered by this student block (averaged in
+    Phase A) — a smoother target when the depth ratio is large.
+    """
+    n_student = max(b for _, b in student_blocks)
+    out: dict[int, list[int]] = {}
+    prev_t = 0
+    for _, b in student_blocks:
+        # Proportional teacher depth for this student boundary.
+        t_hi = round(b * teacher_layers / n_student)
+        t_hi = max(1, min(teacher_layers, t_hi))
+        if strategy == "block_avg":
+            lo = max(prev_t + 1, 1)
+            out[b] = list(range(lo, t_hi + 1)) or [t_hi]
+        else:  # "stride" (default): single nearest teacher seam
+            out[b] = [t_hi]
+        prev_t = t_hi
+    return out
+
+
+def build_projection(d_student: int, d_teacher: int, mode: str = "auto") -> nn.Module:
+    """Read-out projection bridging the student's output width to the teacher's.
+
+    The loss is computed in TEACHER space (project the student UP), so the
+    teacher target is never lossily down-sampled. Identity when widths already
+    match or ``mode='none'``. This module is a distill-time SCAFFOLD — trained
+    jointly with the student LoRA and DISCARDED afterwards (only the LoRA is
+    saved), so it never enters the exported model.
+    """
+    if mode == "none" or d_student == d_teacher:
+        return nn.Identity()
+    # "auto" / "student_up": a plain linear lift d_student → d_teacher.
+    proj = nn.Linear(d_student, d_teacher, bias=False)
+    if min(d_student, d_teacher) > 1:
+        nn.init.orthogonal_(proj.weight)
+    return proj
+
+
+def distill_loss(pred: torch.Tensor, target: torch.Tensor, kind: str = "cosine_mse") -> torch.Tensor:
+    """Hidden-state distillation loss between (projected) student output and the
+    teacher seam target, both ``[*, d_teacher]``. Computed in fp32.
+
+    * ``mse``        — plain mean-squared error (scale-sensitive).
+    * ``cosine``     — 1 − mean cosine similarity (direction only; scale-free).
+    * ``cosine_mse`` — their sum (default): direction + magnitude. Robust across
+      models with different residual-stream scales.
+    """
+    p = pred.float().reshape(-1, pred.shape[-1])
+    t = target.float().reshape(-1, target.shape[-1])
+    mse = torch.nn.functional.mse_loss(p, t)
+    if kind == "mse":
+        return mse
+    cos = 1.0 - torch.nn.functional.cosine_similarity(p, t, dim=-1).mean()
+    if kind == "cosine":
+        return cos
+    return cos + mse
+
+
+def _rotary_kwargs(model: nn.Module, hidden: torch.Tensor, device: torch.device) -> dict[str, Any]:
+    """Build the kwargs a decoder layer needs to be called DIRECTLY on recent
+    transformers. As of ~4.41 the rotary embeddings moved to the model level and
+    are passed DOWN to each layer as ``position_embeddings``; a bare
+    ``layer(hidden)`` then crashes ("cannot unpack non-iterable NoneType"). We
+    recompute them from the backbone's ``rotary_emb`` for the given sequence
+    length. (Attention defaults to causal when no mask is given.) Arches without a
+    model-level rotary return ``{}`` — the bare call already works there."""
+    backbone = getattr(model, "model", model)
+    rotary = getattr(backbone, "rotary_emb", None)
+    seq = hidden.shape[1]
+    pos = torch.arange(seq, device=device).unsqueeze(0)
+    if rotary is None:
+        return {}
+    rotary = rotary.to(device)
+    pe = rotary(hidden.to(device), pos)
+    return {"position_ids": pos, "position_embeddings": pe}
+
+
+def block_lr_scale(ref_rms: float, target_rms: float, lo: float = 0.25, hi: float = 1.0) -> float:
+    """DYNAMIC per-block LR multiplier from teacher-target magnitudes.
+
+    A student block whose teacher seam has a larger residual-stream magnitude than
+    the reference (shallowest) block produces proportionally larger MSE gradients,
+    so a single global LR overshoots there. Scale the base LR by
+    ``ref_rms / target_rms`` (block at the reference magnitude ⇒ 1.0; larger ⇒
+    gentler), clamped to ``[lo, hi]`` so it never explodes or vanishes."""
+    if target_rms <= 0:
+        return hi
+    return max(lo, min(hi, ref_rms / target_rms))
+
+
+def lr_at_step(base_lr: float, step: int, total_steps: int, warmup: int) -> float:
+    """Warmup→cosine-decay schedule within a block: linear ramp for the first
+    ``warmup`` steps (prevents the early spike that diverges a block), then a
+    cosine decay to ~0 (settles convergence). Pure for unit testing."""
+    if warmup > 0 and step < warmup:
+        return base_lr * (step + 1) / warmup
+    denom = max(1, total_steps - warmup)
+    prog = (step - warmup) / denom
+    return 0.5 * base_lr * (1.0 + math.cos(math.pi * min(1.0, max(0.0, prog))))
+
+
+def _seam_indices(seam_map: dict[int, list[int]]) -> list[int]:
+    """All distinct teacher seam indices Phase A must capture, sorted."""
+    idxs: set[int] = set()
+    for v in seam_map.values():
+        idxs.update(v)
+    return sorted(idxs)
+
+
+def _read_model_depth_width(model_path: str) -> tuple[int, int, int]:
+    """Read (num_layers, hidden_size, vocab_size) from a model's config WITHOUT
+    loading weights (cheap — Phase A needs the student's depth to plan seams)."""
+    from transformers import AutoConfig
+
+    cfg = AutoConfig.from_pretrained(model_path, local_files_only=True)
+    n = getattr(cfg, "num_hidden_layers", None) or getattr(cfg, "n_layer", None)
+    d = getattr(cfg, "hidden_size", None) or getattr(cfg, "n_embd", None)
+    v = getattr(cfg, "vocab_size", 0)
+    if n is None or d is None:
+        sys.exit(f"ERROR: could not read num_hidden_layers/hidden_size from {model_path}")
+    return int(n), int(d), int(v)
+
+
+@torch.no_grad()
+def _capture_teacher_seams(
+    model: nn.Module,
+    layers: nn.ModuleList,
+    seam_idxs: list[int],
+    embeds: torch.Tensor,
+    device: torch.device,
+    layer_kwargs: dict[str, Any],
+) -> dict[int, torch.Tensor]:
+    """Stream the teacher one layer at a time, capturing residual-stream hidden
+    states at the requested ``hidden_states`` indices (0 = embeddings). One
+    layer is resident on ``device`` at a time → peak VRAM = one teacher layer.
+    Targets are returned in fp32 on CPU (RESULTS.md: fp32 avoids the small-delta
+    cancellation). Mirrors :func:`capture_boundaries` but indexes by hidden-state
+    position (after-layer-k) rather than by layer input."""
+    want = set(seam_idxs)
+    deepest = max(seam_idxs)
+    captured: dict[int, torch.Tensor] = {}
+    hidden = embeds.to(device)
+    if 0 in want:
+        captured[0] = hidden.detach().float().to("cpu")
+    for i, layer in enumerate(layers):
+        layer.to(device)
+        hidden = _layer_call(layer, hidden, **layer_kwargs)
+        layer.to("cpu")
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        hs_idx = i + 1  # hidden state AFTER layer i
+        if hs_idx in want:
+            captured[hs_idx] = hidden.detach().float().to("cpu")
+        if hs_idx >= deepest:
+            break
+    return captured
+
+
+def _distill_capture(args: Any, seam_map: dict[int, list[int]], cache_dir: Path) -> None:
+    """Phase A: capture the teacher's per-seam hidden states to ``cache_dir``.
+
+    Loads the teacher ALONE, streams it over the calibration batches, writes one
+    safetensors per calib batch (``teacher_b{batch}.safetensors`` keyed by seam
+    index) plus a manifest with token ids + dims, then frees the teacher.
+    """
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    device = torch.device(_resolve_device(getattr(args, "device", "auto")))
+    dtype = _resolve_dtype(getattr(args, "dtype", "auto"), device)
+    teacher_path = args.teacher_model
+    if not Path(teacher_path).exists():
+        sys.exit(f"ERROR: teacher model path not found: {teacher_path}")
+
+    print(f"INFO[distill/capture]: teacher={teacher_path} device={device}", file=sys.stderr)
+    tok = AutoTokenizer.from_pretrained(teacher_path, local_files_only=True)
+    if tok.pad_token_id is None:
+        tok.pad_token_id = tok.eos_token_id
+
+    model = AutoModelForCausalLM.from_pretrained(
+        teacher_path, torch_dtype=dtype, low_cpu_mem_usage=True, local_files_only=True
+    )
+    model.config.use_cache = False
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    layers, _ = find_decoder_layers(model)
+    l_teacher = len(layers)
+    d_teacher = model.config.hidden_size
+    embed = model.get_input_embeddings().to(device)
+    seam_idxs = _seam_indices(seam_map)
+    print(
+        f"INFO[distill/capture]: teacher {l_teacher} layers, d={d_teacher}; "
+        f"capturing seams {seam_idxs}",
+        file=sys.stderr,
+    )
+
+    pairs = load_dataset(args.dataset)
+    n_batches = max(1, getattr(args, "calib_batches", 8))
+    # Rotary kwargs for direct layer calls (constant across batches — positions
+    # 0..max_seq_len-1). Computed in the teacher's compute dtype.
+    _dummy = torch.zeros(1, args.max_seq_len, d_teacher, device=device, dtype=dtype)
+    layer_kwargs = _rotary_kwargs(model, _dummy, device)
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    batch_token_ids: list[list[list[int]]] = []
+    for step in range(n_batches):
+        batch = build_batch(pairs, tok, step, args.batch_size, args.max_seq_len)
+        ids = batch["input_ids"].to(device)
+        with torch.no_grad():
+            emb = embed(ids).to(dtype)
+        caps = _capture_teacher_seams(model, layers, seam_idxs, emb, device, layer_kwargs)
+        # Persist this batch's seam tensors (fp32, CPU) keyed by seam index.
+        state = {f"seam_{k}": v.contiguous() for k, v in caps.items()}
+        save_file(state, str(cache_dir / f"teacher_b{step}.safetensors"))
+        batch_token_ids.append(batch["input_ids"].tolist())
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        print(f"INFO[distill/capture]: batch {step+1}/{n_batches} cached", file=sys.stderr)
+
+    manifest = {
+        "teacher_model": str(Path(teacher_path).resolve()),
+        "teacher_layers": l_teacher,
+        "teacher_width": d_teacher,
+        "teacher_vocab": int(getattr(model.config, "vocab_size", 0)),
+        "seam_map": {str(k): v for k, v in seam_map.items()},
+        "n_batches": n_batches,
+        "max_seq_len": args.max_seq_len,
+        "batch_token_ids": batch_token_ids,
+    }
+    (cache_dir / _SEAM_MANIFEST).write_text(json.dumps(manifest), encoding="utf-8")
+    print(f"INFO[distill/capture]: wrote {n_batches} batch(es) + manifest → {cache_dir}", file=sys.stderr)
+    del model
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
+def _load_seam_manifest(cache_dir: Path) -> dict[str, Any]:
+    mpath = cache_dir / _SEAM_MANIFEST
+    if not mpath.exists():
+        sys.exit(
+            f"ERROR[distill/train]: teacher seam cache not found at {mpath}. "
+            "Run the capture phase first (--distill-phase capture)."
+        )
+    return json.loads(mpath.read_text(encoding="utf-8"))
+
+
+def _distill_train(args: Any, cache_dir: Path) -> dict[str, Any]:
+    """Phase B: train the student branch against the cached teacher seams.
+
+    Loads the student ALONE (teacher is gone). For each student block, streams
+    its boundary input over the SAME token ids the teacher saw, then trains the
+    block's LoRA + a discard-after read-out projection to match the cached
+    teacher seam (cosine+MSE in fp32). Saves the LoRA adapter (projection
+    dropped) keyed by global layer index — so it merges/exports unchanged.
+    """
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    device = torch.device(_resolve_device(getattr(args, "device", "auto")))
+    manifest = _load_seam_manifest(cache_dir)
+    l_teacher = manifest["teacher_layers"]
+    d_teacher = manifest["teacher_width"]
+    seam_map = {int(k): v for k, v in manifest["seam_map"].items()}
+
+    model_path = args.model
+    if not Path(model_path).exists():
+        sys.exit(f"ERROR: student model path not found: {model_path}")
+
+    tok = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+    student_vocab = int(getattr(tok, "vocab_size", 0) or 0)
+    teacher_vocab = int(manifest.get("teacher_vocab", 0))
+    if teacher_vocab and student_vocab and teacher_vocab != student_vocab:
+        sys.exit(
+            f"ERROR[distill]: teacher/student tokenizer mismatch "
+            f"(teacher vocab={teacher_vocab}, student vocab={student_vocab}). "
+            "Seam distillation matches hidden states position-by-position and "
+            "requires a SHARED tokenizer. Pick a same-family teacher/student "
+            "pair, or use sequence-level (data) distillation instead."
+        )
+
+    # fp32 student (master weights — bf16 stalls small-delta learning per RESULTS.md).
+    print(f"INFO[distill/train]: student={model_path} device={device} (fp32 master weights)", file=sys.stderr)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path, torch_dtype=torch.float32, low_cpu_mem_usage=True, local_files_only=True
+    )
+    model.config.use_cache = False
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    layers, layers_name = find_decoder_layers(model)
+    n_layers = len(layers)
+    d_student = model.config.hidden_size
+    shards = plan_shards(n_layers, getattr(args, "shards", None), getattr(args, "block_size", None))
+    print(
+        f"INFO[distill/train]: student {n_layers} layers d={d_student} → teacher "
+        f"{l_teacher} layers d={d_teacher}; {len(shards)} block(s): {shards}",
+        file=sys.stderr,
+    )
+
+    embed = model.get_input_embeddings().to(device)
+    target_modules = _resolve_targets(args, model)
+    proj_mode = getattr(args, "projection", "auto") or "auto"
+    loss_kind = getattr(args, "distill_loss", "cosine_mse") or "cosine_mse"
+    # Stability: gradient clipping + dynamic per-block LR (auto) vs constant (fixed).
+    grad_clip = float(getattr(args, "grad_clip", 1.0) or 0.0)
+    lr_mode = getattr(args, "lr_mode", "auto") or "auto"
+    ref_rms: float | None = None  # set from the first (shallowest) block
+    # Rotary kwargs for direct layer calls (fp32 student; constant positions).
+    _dummy = torch.zeros(1, args.max_seq_len, d_student, device=device, dtype=torch.float32)
+    lk_student = _rotary_kwargs(model, _dummy, device)
+
+    # Reconstruct the token-id batches the teacher saw (identical sequences).
+    token_batches = [torch.tensor(b, dtype=torch.long) for b in manifest["batch_token_ids"]]
+    n_batches = len(token_batches)
+
+    out_dir = Path(args.out) if args.out else Path(args.dataset).parent / "adapter"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    all_summaries: list[dict[str, Any]] = []
+    total_adapters = 0
+    for shard_id, (a, b) in enumerate(shards):
+        seam_targets_for_block = seam_map.get(b, [l_teacher])
+
+        # Student boundary input (input to layer a), streamed per calib batch.
+        per_batch_in: list[torch.Tensor] = []
+        for ids in token_batches:
+            ids_dev = ids.to(device)
+            with torch.no_grad():
+                emb = embed(ids_dev).float()
+            caps = capture_boundaries(model, layers, [a], emb, device, lk_student)
+            per_batch_in.append(caps[a])
+
+        # Build this block + attach LoRA (all-linear auto targets recommended).
+        block = nn.ModuleList([layers[i] for i in range(a, b)]).float()
+        n_added = 0
+        for li in range(len(block)):
+            n_added += attach_lora(block[li], target_modules, rank=args.rank, alpha=args.alpha, dropout=args.dropout)
+        if n_added == 0:
+            auto = auto_detect_targets(block)
+            for li in range(len(block)):
+                n_added += attach_lora(block[li], auto, rank=args.rank, alpha=args.alpha, dropout=args.dropout)
+            target_modules = auto
+        if n_added == 0:
+            sys.exit(f"ERROR[distill]: shard {shard_id}: zero LoRA adapters on layers {a}:{b}")
+        block.to(device)
+        total_adapters += n_added
+
+        # Read-out projection bridging student→teacher width (scaffold, dropped).
+        proj = build_projection(d_student, d_teacher, proj_mode).to(device).float()
+
+        lora_params = [
+            p for m in block.modules() if isinstance(m, LoRALinear) for p in (m.lora_A, m.lora_B)
+        ]
+        params = lora_params + list(proj.parameters())
+
+        # DYNAMIC per-block LR (auto): scale the base LR by this block's teacher
+        # seam magnitude relative to the shallowest block (which trains well at the
+        # base LR). Deep, larger-magnitude seams ⇒ gentler steps ⇒ no divergence.
+        tgt0 = _load_block_target(cache_dir, 0, seam_targets_for_block, device)
+        target_rms = float(tgt0.float().pow(2).mean().sqrt().item())
+        if ref_rms is None:
+            ref_rms = target_rms
+        if lr_mode == "auto":
+            block_lr = args.lr * block_lr_scale(ref_rms, target_rms)
+        else:
+            block_lr = args.lr
+        optimizer = torch.optim.AdamW(params, lr=block_lr)
+        warmup = max(1, args.steps // 10) if lr_mode == "auto" else 0
+
+        first_loss: float | None = None
+        last_loss = 0.0
+        for step in range(args.steps):
+            if lr_mode == "auto":
+                lr_t = lr_at_step(block_lr, step, args.steps, warmup)
+                for g in optimizer.param_groups:
+                    g["lr"] = lr_t
+            bi = step % n_batches
+            in_k = per_batch_in[bi].to(device).float()
+            # Teacher target for this block = the cached seam(s), averaged.
+            tgt = _load_block_target(cache_dir, bi, seam_targets_for_block, device)
+
+            student_out = _run_block(block, in_k, lk_student, lora_enabled=True)
+            pred = proj(student_out)
+            loss = distill_loss(pred, tgt, loss_kind)
+
+            optimizer.zero_grad()
+            loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(params, grad_clip)
+            optimizer.step()
+
+            lv = loss.item()
+            if first_loss is None:
+                first_loss = lv
+            last_loss = lv
+            if (step + 1) % args.log_every == 0 or step == 0:
+                print(
+                    f"distill shard {shard_id} (L{a}:{b}→seam{seam_targets_for_block}) "
+                    f"step {step+1}/{args.steps} loss={lv:.6f} lr={block_lr:.2e}",
+                    file=sys.stderr,
+                )
+
+        _save_shard_adapter(block, a, layers_name, out_dir, shard_id, args, target_modules,
+                            str(Path(model_path).resolve()))
+        block.to("cpu")
+        if device.type == "cuda":
+            peak = round(torch.cuda.max_memory_allocated() / 1e9, 3)
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.empty_cache()
+        else:
+            peak = None
+        all_summaries.append({
+            "shard": shard_id,
+            "layers": [a, b],
+            "teacher_seams": seam_targets_for_block,
+            "adapters": n_added,
+            "target_rms": round(target_rms, 4),
+            "block_lr": round(block_lr, 8),
+            "first_loss": round(first_loss or 0.0, 6),
+            "final_loss": round(last_loss, 6),
+            "peak_vram_gb": peak,
+        })
+
+    return {
+        "mode": "distill",
+        "teacher_model": manifest["teacher_model"],
+        "teacher_layers": l_teacher,
+        "teacher_width": d_teacher,
+        "student_width": d_student,
+        "loss": loss_kind,
+        "projection": "identity" if d_student == d_teacher or proj_mode == "none" else "student_up",
+        "shards": all_summaries,
+        "total_adapters": total_adapters,
+        "out": str(out_dir.resolve()),
+    }
+
+
+def _load_block_target(
+    cache_dir: Path, batch_idx: int, seam_idxs: list[int], device: torch.device
+) -> torch.Tensor:
+    """Load (and average, for block_avg) the cached teacher seam target(s) for
+    one calib batch. Returns fp32 on ``device``."""
+    from safetensors.torch import load_file
+
+    state = load_file(str(cache_dir / f"teacher_b{batch_idx}.safetensors"))
+    tensors = [state[f"seam_{i}"] for i in seam_idxs if f"seam_{i}" in state]
+    if not tensors:
+        sys.exit(f"ERROR[distill]: no cached seams {seam_idxs} in batch {batch_idx}")
+    stacked = torch.stack(tensors, 0).mean(0) if len(tensors) > 1 else tensors[0]
+    return stacked.to(device).float()
+
+
+def train_distill(args: Any) -> None:
+    """Entry for cross-model seam distillation (``--distill-mode``). Runs the
+    requested phase(s): ``capture`` (teacher → cache), ``train`` (student ←
+    cache), or ``both`` (default — capture then train sequentially; the teacher
+    is freed before the student loads, so they are never co-resident)."""
+    import random
+
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+
+    if not getattr(args, "teacher_model", None):
+        sys.exit("ERROR[distill]: --teacher-model is required for --distill-mode")
+
+    cache_dir = Path(
+        getattr(args, "teacher_cache", None)
+        or (Path(args.out) if args.out else Path(args.dataset).parent / "adapter") / "distill_cache"
+    )
+    phase = getattr(args, "distill_phase", "both") or "both"
+
+    if phase in ("capture", "both"):
+        # Plan seams from the STUDENT's depth (read cheaply from its config).
+        n_student, _, _ = _read_model_depth_width(args.model)
+        l_teacher, _, _ = _read_model_depth_width(args.teacher_model)
+        student_blocks = plan_shards(
+            n_student, getattr(args, "shards", None), getattr(args, "block_size", None)
+        )
+        seam_map = plan_seam_map(student_blocks, l_teacher, getattr(args, "layer_map", "stride"))
+        _distill_capture(args, seam_map, cache_dir)
+
+    if phase in ("train", "both"):
+        summary = _distill_train(args, cache_dir)
+        print(json.dumps(summary))
+    elif phase == "capture":
+        print(json.dumps({"mode": "distill", "phase": "capture", "cache": str(cache_dir.resolve())}))
 
 
 def _resolve_device(spec: str) -> str:

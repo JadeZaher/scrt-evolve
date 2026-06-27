@@ -20,6 +20,7 @@
 
 pub mod branch;
 pub mod config;
+pub mod daemon;
 pub mod dataset;
 pub mod directive;
 pub mod discover;
@@ -29,7 +30,9 @@ pub mod generate;
 pub mod goals;
 pub mod harvest;
 pub mod interview;
+pub mod living_queue;
 pub mod model;
+pub mod model_store;
 pub mod plan;
 pub mod project;
 pub mod regulate;
@@ -53,7 +56,8 @@ pub use config::{
     FractionalConfig, HardwareConfig, MergeShardsConfig, RegulateConfig, RuntimeConfig,
     SamplingConfig,
 };
-pub use config::{ConfigError, EvalConfig, EvolveConfig, GoalConfig};
+pub use config::{ConfigError, DaemonConfig, EvalConfig, EvolveConfig, GoalConfig, StoreConfig};
+pub use daemon::{run_daemon, DaemonHooks, DaemonOptions, DaemonReport, DaemonStep};
 pub use dataset::{Dataset, GenExample};
 pub use directive::TrainingDirective;
 pub use discover::DiscoveredContext;
@@ -61,6 +65,8 @@ pub use eval::{ProbeSet, ScoreReport, StepVerdict};
 pub use export::{export_llamacpp, ExportReport, ToolFormat};
 pub use goals::{GoalRun, GoalsReport};
 pub use harvest::{capture_and_harvest, HarvestResult, TranscriptEntry};
+pub use living_queue::{Lane, LivingQueue, QueuedItem};
+pub use model_store::{ModelStore, ModelVersion, ResolvedVersion, StoreManifest};
 pub use regulate::{CheckpointStore, Quarantine, Regulator, TxnOutcome};
 pub use rounds::{
     run_round, run_schedule, RoundHooks, RoundReport, SchedulePolicy, ScheduleReport,

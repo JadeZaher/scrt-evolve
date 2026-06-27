@@ -31,8 +31,53 @@ use config_reference::{CONFIG_REFERENCE, CONFIG_TEMPLATE};
         `evolve --schedule` umbrella runs the eval-gated multi-goal loop."
 )]
 struct Cli {
+    /// Emit a machine-readable JSON summary line for artifact-producing
+    /// commands (`generate`, `eval`, `plan`, `train`, `export-gguf`,
+    /// `branch list|route|create`, `discover`, `probe build`, …), in addition
+    /// to the human-readable output. The JSON object is always the LAST line on
+    /// stdout. Intended for coding agents driving the CLI. Accepted in either
+    /// position (`scrt-evolve --json generate` or `scrt-evolve generate --json`).
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Command,
+}
+
+/// Process-global `--json` flag. Set once from the parsed CLI in `run()`; read
+/// by `emit_json`. A binary-wide toggle avoids threading a bool through every
+/// `cmd_*` signature for what is purely an output-formatting concern.
+static JSON_OUTPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Print `value` as a single compact JSON line on stdout when `--json` is set;
+/// a no-op otherwise. The artifact-producing commands call this AFTER their
+/// human output so an agent can parse the final line.
+fn emit_json(value: serde_json::Value) {
+    if JSON_OUTPUT.load(std::sync::atomic::Ordering::Relaxed) {
+        println!(
+            "{}",
+            serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+        );
+    }
+}
+
+/// Build an actionable error for a failed ML subprocess. The real-model paths
+/// (train/infer/score/export/dequant/run-model) are all subprocess-driven, so a
+/// bare "exited with N" leaves an operator staring at a raw Python traceback with
+/// no scrt-evolve guidance. This names the failed module, the most likely cause
+/// (missing deps in the chosen interpreter), the `--python` remediation, and the
+/// captured log path when `SCRT_EVOLVE_LOG_FILE` is set.
+fn subprocess_failure(module: &str, py: &str, status: std::process::ExitStatus) -> anyhow::Error {
+    let log_hint = std::env::var("SCRT_EVOLVE_LOG_FILE")
+        .ok()
+        .map(|p| format!("\n  full output captured at: {p}"))
+        .unwrap_or_default();
+    anyhow::anyhow!(
+        "the `{module}` subprocess (`{py} -m {module}`) failed ({status}).\n  \
+         → Most often the interpreter is missing deps: ensure `{py}` has \
+         torch + transformers + safetensors (plus `gguf` for export/dequant). \
+         Pass `--python /path/to/venv/python` to select the right interpreter. \
+         The subprocess output is above.{log_hint}"
+    )
 }
 
 #[derive(Subcommand)]
@@ -201,6 +246,32 @@ enum Command {
         #[arg(long)]
         toml: bool,
     },
+    /// Print the fully-resolved `EvolveConfig` (defaults applied) as JSON.
+    /// Answers "what will actually run?" without launching anything — the loaded
+    /// config after parsing, including defaults for blocks you omitted.
+    ConfigShow {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+    },
+    /// Print the `dataset.jsonl` row schema + the branch `manifest.json` /
+    /// `registry.json` schema — the cross-language/cross-repo contracts. The
+    /// command-surface analogue of `config-reference` for data shapes.
+    DatasetReference,
+    /// Print a machine-readable manifest of every subcommand (name, summary,
+    /// flags) — the command-surface analogue of `config-reference`. Use `--json`
+    /// for a parseable object; default prints a readable list.
+    Commands,
+    /// Preflight check: validate config parse, model_path, the python/ package
+    /// dir, the `--python` interpreter's ML deps, llama.cpp auto-detect, and a
+    /// writable work_dir. Prints PASS/FAIL + a fix for each — turns "long run
+    /// dies at minute 9" into "told you in 2 seconds". `--json` for agents.
+    Doctor {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// Python interpreter to check for torch/transformers (default: python).
+        #[arg(long)]
+        python: Option<String>,
+    },
     /// Merge a LoRA adapter into the base model and export a quantized GGUF
     /// (for LM Studio / llama.cpp).
     ///
@@ -220,9 +291,10 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
         /// Quantization type: Q2_K | Q3_K_S | Q3_K_M | Q3_K_L | Q4_0 | Q4_K_M |
-        /// Q5_K_M | Q6_K | Q8_0 | f16 | none. Default Q4_K_M.
-        #[arg(long, default_value = "Q4_K_M")]
-        quant: String,
+        /// Q5_K_M | Q6_K | Q8_0 | f16 | none. Omitted ⇒ use `[export].quant`
+        /// (default Q4_K_M); passing this is an explicit override.
+        #[arg(long)]
+        quant: Option<String>,
         /// Path to a llama.cpp checkout (with convert_hf_to_gguf.py +
         /// llama-quantize). Auto-detected if omitted (~/.unsloth/llama.cpp,
         /// ~/llama.cpp, $LLAMA_CPP).
@@ -298,6 +370,27 @@ enum Command {
         #[command(subcommand)]
         command: BranchCommand,
     },
+    /// Ambient continuous-evolution **daemon** (track 26): an always-on,
+    /// VRAM-bounded background trainer fed by the living activity queue. Every
+    /// step is eval-gated through the track-15 transaction (keep|rollback), so
+    /// ambient training can never silently degrade the model.
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
+    /// Teach the daemon explicitly: enqueue a prompt→completion pair onto the
+    /// PRIORITY lane of the living queue (skips the relevance filter, trains
+    /// before passive activity). The cheap "learn this" capture.
+    Teach {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// The prompt / user intent the model should learn to handle.
+        #[arg(long)]
+        prompt: String,
+        /// The desired completion for that prompt.
+        #[arg(long)]
+        completion: String,
+    },
     /// Point at a PROJECT directory: auto-detect its mpg palace + corpus and run
     /// the whole self-routing pipeline (discover → plan → generate → export).
     ///
@@ -308,6 +401,13 @@ enum Command {
     /// optional (goals carry their own `project` scoping). For the EVAL-GATED
     /// schedule (train → eval → keep|rollback across goals, halt on catastrophe),
     /// use `--schedule`. The regen flywheel (track 11) remains optional/un-wired.
+    ///
+    /// Three distinct invocations (the flags pick the mode):
+    ///   scrt-evolve evolve ./my-project          # single-project self-route
+    ///   scrt-evolve evolve --goals               # multi-goal generate (no gate)
+    ///   scrt-evolve evolve --schedule --max-rounds 4   # eval-gated multi-goal loop
+    /// In `--goals` / `--schedule` mode the `project` positional is ignored
+    /// (goals carry their own scoping); without either, `project` is REQUIRED.
     Evolve {
         /// The project directory to evolve a model against. Optional in
         /// `--goals` mode.
@@ -403,9 +503,56 @@ enum BranchCommand {
         /// Human-readable domain label for the manifest (e.g. `legal/tool-calling`).
         #[arg(long)]
         domain: Option<String>,
+        /// Cross-MODEL seam distillation mode: a DISTINCT larger `--teacher`
+        /// supervises this branch's smaller `--base` at layer seams (genuine
+        /// compression). Overrides `[branch].mode = "distill"`.
+        #[arg(long)]
+        distill: bool,
+        /// The larger TEACHER model (path/id) for distill mode. Overrides
+        /// `[train.distill].teacher_model`. Implies `--distill`.
+        #[arg(long)]
+        teacher: Option<String>,
+        /// Training steps per block (distill) / total (standard). Default 40.
+        #[arg(long, default_value_t = 40)]
+        steps: usize,
         /// Python interpreter for the train / eval / export subprocesses.
         #[arg(long)]
         python: Option<String>,
+    },
+    /// FURTHER-train an existing branch (config-driven): load the branch's
+    /// persisted config, continue from its current stored adapter, run an
+    /// eval-gated round vs the live version, and on KEEP commit a new version to
+    /// the bounded `[store]` ring + deploy the GGUF. The self-describing,
+    /// repeatable evolution step a `.cmd` loops.
+    Evolve {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// Branch name to evolve (its `branches/<name>/branch.toml` drives the run).
+        #[arg(long)]
+        name: String,
+        /// Training steps this round. Default 120.
+        #[arg(long, default_value_t = 120)]
+        steps: usize,
+        /// Python interpreter for the train / eval / export subprocesses.
+        #[arg(long)]
+        python: Option<String>,
+    },
+    /// Show a branch's bounded weight-version ring (`[store]`): each version's
+    /// adapter, optional GGUF, score, and which is `current` (live).
+    Versions {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        name: String,
+    },
+    /// Roll a branch's live model back to the current version's PARENT (the
+    /// reverse trace) and re-deploy that GGUF. Reversible — the rolled-back
+    /// version stays in the ring until pruned.
+    Rollback {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        name: String,
     },
     /// List the registered branches (reads `branches/registry.json`).
     List {
@@ -471,6 +618,42 @@ enum BranchCommand {
 }
 
 #[derive(Subcommand)]
+enum DaemonCommand {
+    /// Start the ambient loop — runs until `daemon stop`. Pops the living queue
+    /// microshard-by-microshard, training ONLY when free VRAM ≥ the budget, every
+    /// step through the track-15 transaction. Resumes from the queue cursor.
+    Start {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// Python interpreter for the train + score subprocesses.
+        #[arg(long)]
+        python: Option<String>,
+        /// VRAM budget in GB (override `[daemon].max_vram_gb`): train only when at
+        /// least this much is free. 0 ⇒ ungated.
+        #[arg(long)]
+        max_vram: Option<f64>,
+        /// Stop after N committed/attempted steps (a bound for a supervised run).
+        /// Omit for an unbounded daemon (until `daemon stop`).
+        #[arg(long)]
+        max_steps: Option<u64>,
+        /// Drain mode: process the queue once and exit when it empties (instead
+        /// of waiting for new activity). Good for a one-shot catch-up.
+        #[arg(long)]
+        drain: bool,
+    },
+    /// Signal a running daemon to stop (drops the stop-file it polls each step).
+    Stop {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+    },
+    /// Show the daemon run-state + the living queue's pending counts per lane.
+    Status {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 enum ProbeCommand {
     /// Carve a held-out probe set out of a dataset (asserted zero-overlap with
     /// the training remainder). Writes `probe.jsonl` + the training remainder.
@@ -495,6 +678,21 @@ enum ProbeCommand {
 }
 
 fn main() -> ExitCode {
+    // clap's derive-generated command tree (now ~26 subcommands, several with
+    // nested subcommands + many args) builds one large stack frame during parse.
+    // In DEBUG builds that frame can exceed the 1 MB Windows main-thread stack
+    // and overflow before `run()` is even entered (release is fine — smaller
+    // frames). Run the whole program on a thread with a generous stack so the
+    // debug binary (which the test suite exercises) parses reliably.
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(run_main)
+        .expect("spawn main worker thread")
+        .join()
+        .unwrap_or(ExitCode::FAILURE)
+}
+
+fn run_main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -506,6 +704,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    JSON_OUTPUT.store(cli.json, std::sync::atomic::Ordering::Relaxed);
     match cli.command {
         Command::Init { path } => cmd_init(&path),
         Command::Discover { config } => {
@@ -615,6 +814,16 @@ fn run() -> Result<()> {
             );
             Ok(())
         }
+        Command::ConfigShow { config } => {
+            let cfg = EvolveConfig::load(&config)?;
+            cmd_config_show(&cfg)
+        }
+        Command::DatasetReference => {
+            print!("{}", config_reference::DATASET_REFERENCE);
+            Ok(())
+        }
+        Command::Commands => cmd_commands(),
+        Command::Doctor { config, python } => cmd_doctor(&config, python),
         Command::ExportGguf {
             config,
             adapter,
@@ -629,7 +838,7 @@ fn run() -> Result<()> {
                 &cfg,
                 adapter,
                 out,
-                &quant,
+                quant,
                 llama_cpp,
                 keep_intermediates,
                 python,
@@ -693,10 +902,29 @@ fn run() -> Result<()> {
                 base,
                 corpus,
                 domain,
+                distill,
+                teacher,
+                steps,
                 python,
             } => {
                 let cfg = EvolveConfig::load(&config)?;
-                cmd_branch_create(&cfg, &name, base, corpus, domain, python)
+                cmd_branch_create(
+                    &cfg, &name, base, corpus, domain, distill, teacher, steps, python,
+                )
+            }
+            BranchCommand::Evolve {
+                config,
+                name,
+                steps,
+                python,
+            } => cmd_branch_evolve(&config, &name, steps, python),
+            BranchCommand::Versions { config, name } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_branch_versions(&cfg, &name)
+            }
+            BranchCommand::Rollback { config, name } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_branch_rollback(&cfg, &name)
             }
             BranchCommand::List { config } => {
                 let cfg = EvolveConfig::load(&config)?;
@@ -739,6 +967,34 @@ fn run() -> Result<()> {
                 cmd_branch_serve(&cfg, name, route, prompt, python)
             }
         },
+        Command::Daemon { command } => match command {
+            DaemonCommand::Start {
+                config,
+                python,
+                max_vram,
+                max_steps,
+                drain,
+            } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_daemon_start(&cfg, python, max_vram, max_steps, drain)
+            }
+            DaemonCommand::Stop { config } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_daemon_stop(&cfg)
+            }
+            DaemonCommand::Status { config } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_daemon_status(&cfg)
+            }
+        },
+        Command::Teach {
+            config,
+            prompt,
+            completion,
+        } => {
+            let cfg = EvolveConfig::load(&config)?;
+            cmd_teach(&cfg, &prompt, &completion)
+        }
         Command::Run { config, export } => {
             let cfg = EvolveConfig::load(&config)?;
             cmd_discover(&cfg)?;
@@ -784,10 +1040,12 @@ fn cmd_init(path: &PathBuf) -> Result<()> {
     let report = scrt_evolve::scaffold::init(path)?;
     println!("wrote scaffold to {}", path.display());
     if report.model_path_missing {
-        eprintln!(
-            "warning: the scaffolded `model_path` does not exist yet — \
-             edit [evolve].model_path in {} to point at your model directory \
-             before running.",
+        // Instruct rather than warn: on a fresh scaffold the placeholder path is
+        // EXPECTED to be absent — the user has done nothing wrong yet. Frame it
+        // as the next step, not an error (D7). `doctor` validates it for real.
+        println!(
+            "next: edit [evolve].model_path in {} to point at your HF model dir, \
+             then run `scrt-evolve doctor` to preflight your environment.",
             path.display()
         );
     }
@@ -807,11 +1065,24 @@ fn cmd_discover(cfg: &EvolveConfig) -> Result<()> {
         ctx.anchors.len(),
         path.display()
     );
+    emit_json(serde_json::json!({
+        "command": "discover",
+        "passages": ctx.passages.len(),
+        "anchors": ctx.anchors.len(),
+        "out": path.display().to_string(),
+        "status": "ok",
+    }));
     Ok(())
 }
 
 fn load_discovered(wd: &WorkDir, input: Option<PathBuf>) -> Result<scrt_evolve::DiscoveredContext> {
     let in_path = input.unwrap_or_else(|| wd.discovered_json());
+    if !in_path.exists() {
+        anyhow::bail!(
+            "discovered context not found at {} — run `scrt-evolve discover` first",
+            in_path.display()
+        );
+    }
     let text = std::fs::read_to_string(&in_path)
         .with_context(|| format!("reading discovered context {}", in_path.display()))?;
     serde_json::from_str(&text).with_context(|| format!("parsing {}", in_path.display()))
@@ -826,6 +1097,12 @@ fn cmd_generate(cfg: &EvolveConfig, input: Option<PathBuf>) -> Result<()> {
     let out = wd.dataset_jsonl();
     dataset.write_jsonl(&out)?;
     println!("generate: {} rows → {}", dataset.len(), out.display());
+    emit_json(serde_json::json!({
+        "command": "generate",
+        "rows": dataset.len(),
+        "out": out.display().to_string(),
+        "status": "ok",
+    }));
     Ok(())
 }
 
@@ -895,6 +1172,17 @@ fn cmd_interview(
             println!("[{}] {}\n{}\n", q.id, q.text, opts);
         }
         println!("(no --answer given; not writing directive.json)");
+        emit_json(serde_json::json!({
+            "command": "interview",
+            "status": "questions_only",
+            "wrote_directive": false,
+            "questions": questions.iter().map(|q| serde_json::json!({
+                "id": q.id,
+                "text": q.text,
+                "options": q.options,
+                "multi": q.multi,
+            })).collect::<Vec<_>>(),
+        }));
         return Ok(());
     }
 
@@ -909,6 +1197,13 @@ fn cmd_interview(
     directive.write(&path)?;
     println!("wrote training directive → {}", path.display());
     println!("{}", directive.prompt_block());
+    emit_json(serde_json::json!({
+        "command": "interview",
+        "status": "ok",
+        "wrote_directive": true,
+        "directive": path.display().to_string(),
+        "answers": qa.len(),
+    }));
     Ok(())
 }
 
@@ -941,6 +1236,14 @@ fn cmd_plan(cfg: &EvolveConfig, input: Option<PathBuf>) -> Result<()> {
             s.rationale.chars().take(80).collect::<String>()
         );
     }
+    emit_json(serde_json::json!({
+        "command": "plan",
+        "specs": plan.specs.len(),
+        "examples_planned": plan.total_count(),
+        "strategy": plan.strategy,
+        "out": out.display().to_string(),
+        "status": "ok",
+    }));
     Ok(())
 }
 
@@ -1226,7 +1529,9 @@ fn provenance_of(ds: &scrt_evolve::Dataset) -> Vec<String> {
             Qa { gen, .. } | Instruction { gen, .. } | ToolCall { gen, .. } | Cli { gen, .. } => {
                 gen.clone()
             }
-            _ => None,
+            // Variants without a `gen` field carry no provenance. Listed
+            // explicitly so a new variant forces a compile-time decision here.
+            Completion { .. } | Contrastive { .. } => None,
         };
         if let Some(g) = g {
             set.insert(g);
@@ -1253,7 +1558,10 @@ fn cmd_eval(cfg: &EvolveConfig, probe: Option<PathBuf>, python: Option<String>) 
         );
     }
 
-    let report = scrt_evolve::eval::run_eval(&cfg, python.as_deref())?;
+    // Resolve the interpreter (flag > $SCRT_EVOLVE_PYTHON > [hardware].python) so
+    // the transformers scorer honors the same binding as train/export (track 28).
+    let py = resolve_python(Some(&cfg), python);
+    let report = scrt_evolve::eval::run_eval(&cfg, Some(py.as_str()))?;
     let out = wd.root().join("score.json");
     report.write(&out)?;
 
@@ -1271,6 +1579,18 @@ fn cmd_eval(cfg: &EvolveConfig, probe: Option<PathBuf>, python: Option<String>) 
         println!("  perplexity={p:.3}");
     }
     println!("  report → {}", out.display());
+    emit_json(serde_json::json!({
+        "command": "eval",
+        "correctness": report.correctness,
+        "n": report.n,
+        "backend": report.backend,
+        "probe_version": report.probe_version,
+        "constitution_adherence": report.constitution_adherence,
+        "mean_exit_depth": report.mean_exit_depth,
+        "perplexity": report.perplexity,
+        "out": out.display().to_string(),
+        "status": "ok",
+    }));
     Ok(())
 }
 
@@ -1287,6 +1607,12 @@ fn cmd_probe_build(
     wd.ensure()?;
 
     let from_path = from.unwrap_or_else(|| wd.dataset_jsonl());
+    if !from_path.exists() {
+        anyhow::bail!(
+            "probe build: dataset not found at {} — run `scrt-evolve generate` first",
+            from_path.display()
+        );
+    }
     let dataset = scrt_evolve::Dataset::read_jsonl(&from_path)
         .with_context(|| format!("reading dataset {}", from_path.display()))?;
 
@@ -1311,6 +1637,16 @@ fn cmd_probe_build(
     );
     println!("  probe → {}", probe_out.display());
     println!("  train → {}", train_out.display());
+    emit_json(serde_json::json!({
+        "command": "probe-build",
+        "probe_items": probe.len(),
+        "train_rows": train.len(),
+        "holdout_frac": frac,
+        "probe_version": probe.version,
+        "probe": probe_out.display().to_string(),
+        "train": train_out.display().to_string(),
+        "status": "ok",
+    }));
     Ok(())
 }
 
@@ -1394,8 +1730,19 @@ fn cmd_quarantine_clear(cfg: &EvolveConfig) -> Result<()> {
 /// Load the dataset and run training, printing the report. Thin shim — all
 /// orchestration lives in `scrt_evolve::train::run` (styleguide §1).
 fn cmd_train(cfg: &EvolveConfig, data: Option<PathBuf>) -> Result<()> {
+    eprintln!(
+        "train: the candle backend is a mechanical FIXTURE — it cannot load real \
+         pretrained models. For real training use the Python/transformers path \
+         (`train-transformers`) or the eval-gated schedule (`evolve --schedule`)."
+    );
     let wd = WorkDir::from_config(cfg);
     let data_path = data.unwrap_or_else(|| wd.dataset_jsonl());
+    if !data_path.exists() {
+        anyhow::bail!(
+            "train(candle): dataset not found at {} — run `scrt-evolve generate` first",
+            data_path.display()
+        );
+    }
     let dataset = scrt_evolve::Dataset::read_jsonl(&data_path)
         .with_context(|| format!("reading dataset {}", data_path.display()))?;
 
@@ -1412,6 +1759,16 @@ fn cmd_train(cfg: &EvolveConfig, data: Option<PathBuf>) -> Result<()> {
     if let Some(artifact) = &report.artifact {
         println!("train: artifact → {}", artifact.display());
     }
+    emit_json(serde_json::json!({
+        "command": "train",
+        "backend": "candle",
+        "is_fixture": true,
+        "preset": report.preset,
+        "steps": report.steps,
+        "final_loss": report.final_loss,
+        "artifact": report.artifact.as_ref().map(|a| a.display().to_string()),
+        "status": "ok",
+    }));
     Ok(())
 }
 
@@ -1452,13 +1809,10 @@ fn cmd_train_transformers(
         .unwrap_or_default();
     let targets = lora.target_modules.join(",");
 
-    // Locate the python/ package dir: it ships next to the repo root. Search
-    // upward from the current dir for a `python/scrt_evolve_train` so the CLI
-    // works from a checkout regardless of cwd.
-    let pkg_parent = find_python_pkg_dir()
-        .ok_or_else(|| anyhow::anyhow!("train(transformers): could not locate python/ dir"))?;
-
-    let py = python.unwrap_or_else(|| "python".to_string());
+    // Interpreter from config/env/flag (track 28 binding); the installed
+    // `scrt-evolve-ml` package is preferred. A repo checkout's `python/` dir is
+    // added to PYTHONPATH only as a fallback (dev mode).
+    let py = resolve_python(Some(cfg), python);
     let mut cmd = std::process::Command::new(&py);
     cmd.arg("-m")
         .arg("scrt_evolve_train")
@@ -1479,8 +1833,15 @@ fn cmd_train_transformers(
         .arg("--alpha")
         .arg(lora.alpha.to_string())
         .arg("--target-modules")
-        .arg(&targets)
-        .env("PYTHONPATH", &pkg_parent);
+        .arg(&targets);
+    // CONTINUE from an existing adapter (config-driven "further training") so a
+    // branch keeps evolving across rounds instead of restarting fresh.
+    if let Some(init) = lora.init_adapter.as_ref() {
+        cmd.arg("--resume-adapter").arg(init);
+    }
+    if let Some(pkg_parent) = find_python_pkg_dir() {
+        cmd.env("PYTHONPATH", &pkg_parent);
+    }
 
     // Hardware pass-through: forward [hardware].device so GPU usage is fully
     // config-driven (default "auto" lets the Python side pick cuda-if-available).
@@ -1501,17 +1862,36 @@ fn cmd_train_transformers(
         }
     }
 
-    // Fractional / sharded layer-block training pass-through: if
-    // [train.fractional] is set + enabled, switch the trainer to block-local
-    // distillation (bounds peak VRAM to one block). Config-driven so the same
-    // pipeline runs on a small GPU without code changes.
-    if let Some(frac) = cfg.train.as_ref().and_then(|t| t.fractional.clone()) {
+    // Cross-MODEL seam distillation pass-through: if [train.distill] is set +
+    // enabled + has a teacher, switch the trainer to two-phase distillation
+    // (teacher pre-captures seam targets → student trains against the cache).
+    // Takes precedence over plain fractional (it IS the fractional streaming,
+    // re-targeted at a distinct teacher). Reuses [train.fractional] for the
+    // block-size / calib-batches VRAM knobs.
+    let frac = cfg.train.as_ref().and_then(|t| t.fractional.clone());
+    let distill = cfg.train.as_ref().and_then(|t| t.distill.clone());
+    let distill_active = distill
+        .as_ref()
+        .is_some_and(|d| d.enabled && d.teacher_model.is_some());
+    if distill_active {
+        for a in distill_args(distill.as_ref().unwrap(), frac.as_ref()) {
+            cmd.arg(a);
+        }
+    } else if let Some(frac) = frac.as_ref() {
+        // Fractional / sharded layer-block training pass-through: if
+        // [train.fractional] is set + enabled, switch the trainer to block-local
+        // distillation (bounds peak VRAM to one block). Config-driven so the same
+        // pipeline runs on a small GPU without code changes.
         if frac.enabled {
             cmd.arg("--shard-mode");
             if let Some(bs) = frac.block_size {
                 cmd.arg("--block-size").arg(bs.to_string());
             } else if let Some(n) = frac.shards {
                 cmd.arg("--shards").arg(n.to_string());
+            }
+            // Block ROTATION (ambient daemon): train only this block index.
+            if let Some(idx) = frac.shard_index {
+                cmd.arg("--shard-index").arg(idx.to_string());
             }
             cmd.arg("--calib-batches")
                 .arg(frac.calib_batches.to_string());
@@ -1533,10 +1913,114 @@ fn cmd_train_transformers(
     // is captured automatically instead of vanishing with the console.
     let status = run_subprocess_logged(&mut cmd, &py, "scrt_evolve_train")?;
     if !status.success() {
-        anyhow::bail!("train(transformers): trainer exited with {status}");
+        return Err(subprocess_failure("scrt_evolve_train", &py, status));
     }
     println!("train(transformers): adapter → {}", out_dir.display());
+    emit_json(serde_json::json!({
+        "command": "train",
+        "backend": "transformers",
+        "is_fixture": false,
+        "model": model_path.display().to_string(),
+        "adapter": out_dir.display().to_string(),
+        "steps": steps,
+        "status": "ok",
+    }));
     Ok(())
+}
+
+/// Build the `scrt_evolve_train` flags for cross-MODEL seam distillation from
+/// `[train.distill]` (+ the `[train.fractional]` VRAM knobs it reuses). Pure +
+/// total so it is unit-testable without spawning a subprocess. Caller guarantees
+/// `distill.teacher_model` is `Some` (checked at the call site).
+fn distill_args(
+    distill: &scrt_evolve::config::DistillConfig,
+    frac: Option<&scrt_evolve::config::FractionalConfig>,
+) -> Vec<String> {
+    let mut args = vec![
+        "--distill-mode".to_string(),
+        "--teacher-model".to_string(),
+        distill.teacher_model.clone().unwrap_or_default(),
+        "--layer-map".to_string(),
+        distill.layer_map.clone(),
+        "--distill-loss".to_string(),
+        distill.loss.clone(),
+        "--projection".to_string(),
+        distill.projection.clone(),
+        "--grad-clip".to_string(),
+        distill.grad_clip.to_string(),
+        "--lr-mode".to_string(),
+        distill.lr_mode.clone(),
+    ];
+    if let Some(cache) = distill.teacher_cache.as_ref() {
+        args.push("--teacher-cache".to_string());
+        args.push(cache.clone());
+    }
+    // VRAM streaming: reuse [train.fractional]'s block-size / calib-batches so a
+    // large teacher streams one block at a time (absent ⇒ Python defaults).
+    if let Some(frac) = frac {
+        if let Some(bs) = frac.block_size {
+            args.push("--block-size".to_string());
+            args.push(bs.to_string());
+        } else if let Some(n) = frac.shards {
+            args.push("--shards".to_string());
+            args.push(n.to_string());
+        }
+        args.push("--calib-batches".to_string());
+        args.push(frac.calib_batches.to_string());
+    }
+    args
+}
+
+#[cfg(test)]
+mod distill_args_tests {
+    use super::distill_args;
+    use scrt_evolve::config::{DistillConfig, FractionalConfig};
+
+    #[test]
+    fn distill_args_emits_teacher_and_map_defaults() {
+        let d = DistillConfig {
+            teacher_model: Some("/models/mistral-7b".to_string()),
+            ..DistillConfig::default()
+        };
+        let args = distill_args(&d, None);
+        // Mode + teacher are always present; defaults flow through.
+        assert!(args.contains(&"--distill-mode".to_string()));
+        let ti = args.iter().position(|a| a == "--teacher-model").unwrap();
+        assert_eq!(args[ti + 1], "/models/mistral-7b");
+        let li = args.iter().position(|a| a == "--layer-map").unwrap();
+        assert_eq!(args[li + 1], "stride");
+        let lo = args.iter().position(|a| a == "--distill-loss").unwrap();
+        assert_eq!(args[lo + 1], "cosine_mse");
+        // Stability defaults: grad clip 1.0, auto LR.
+        let gc = args.iter().position(|a| a == "--grad-clip").unwrap();
+        assert_eq!(args[gc + 1], "1");
+        let lm = args.iter().position(|a| a == "--lr-mode").unwrap();
+        assert_eq!(args[lm + 1], "auto");
+        // No fractional ⇒ no streaming knobs.
+        assert!(!args.contains(&"--block-size".to_string()));
+        assert!(!args.contains(&"--calib-batches".to_string()));
+    }
+
+    #[test]
+    fn distill_args_reuses_fractional_block_size() {
+        let d = DistillConfig {
+            teacher_model: Some("/t".to_string()),
+            teacher_cache: Some("/tmp/seams".to_string()),
+            ..DistillConfig::default()
+        };
+        let frac = FractionalConfig {
+            block_size: Some(2),
+            calib_batches: 16,
+            ..FractionalConfig::default()
+        };
+        let args = distill_args(&d, Some(&frac));
+        let bi = args.iter().position(|a| a == "--block-size").unwrap();
+        assert_eq!(args[bi + 1], "2");
+        let ci = args.iter().position(|a| a == "--calib-batches").unwrap();
+        assert_eq!(args[ci + 1], "16");
+        let tc = args.iter().position(|a| a == "--teacher-cache").unwrap();
+        assert_eq!(args[tc + 1], "/tmp/seams");
+    }
 }
 
 /// Run a subprocess, optionally teeing its combined output to the file named by
@@ -1607,10 +2091,7 @@ fn cmd_infer(
     let wd = WorkDir::from_config(cfg);
     let adapter_dir = adapter.unwrap_or_else(|| wd.root().join("adapter"));
 
-    let pkg_parent = find_python_pkg_dir()
-        .ok_or_else(|| anyhow::anyhow!("infer: could not locate python/ dir"))?;
-
-    let py = python.unwrap_or_else(|| "python".to_string());
+    let py = resolve_python(Some(cfg), python);
     let mut cmd = std::process::Command::new(&py);
     cmd.arg("-m")
         .arg("scrt_evolve_infer")
@@ -1623,8 +2104,10 @@ fn cmd_infer(
         .arg("--max-new-tokens")
         .arg(max_new_tokens.to_string())
         .arg("--temperature")
-        .arg(temperature.to_string())
-        .env("PYTHONPATH", &pkg_parent);
+        .arg(temperature.to_string());
+    if let Some(pkg_parent) = find_python_pkg_dir() {
+        cmd.env("PYTHONPATH", &pkg_parent);
+    }
 
     if ab {
         cmd.arg("--ab");
@@ -1645,7 +2128,7 @@ fn cmd_infer(
         .status()
         .with_context(|| format!("launching `{py} -m scrt_evolve_infer`"))?;
     if !status.success() {
-        anyhow::bail!("infer: python process exited with {status}");
+        return Err(subprocess_failure("scrt_evolve_infer", &py, status));
     }
     Ok(())
 }
@@ -1715,7 +2198,12 @@ fn cmd_run_model(cfg: &EvolveConfig, prompt: &str, python: Option<String>) -> Re
                 .status()
                 .with_context(|| format!("launching llama-completion at {cli}"))?;
             if !status.success() {
-                anyhow::bail!("run-model(llamacpp): llama-cli exited with {status}");
+                anyhow::bail!(
+                    "run-model(llamacpp): `{cli}` exited with {status}.\n  \
+                     → Check that the llama.cpp build at [runtime].llama_cpp_path has \
+                     `build/bin/llama-completion` (run its build), and that the GGUF \
+                     ({gguf}) is a valid model for this llama.cpp version."
+                );
             }
             Ok(())
         }
@@ -1733,9 +2221,7 @@ fn cmd_run_model(cfg: &EvolveConfig, prompt: &str, python: Option<String>) -> Re
                          [evolve].model_path"
                     )
                 })?;
-            let pkg_parent = find_python_pkg_dir()
-                .ok_or_else(|| anyhow::anyhow!("run-model: could not locate python/ dir"))?;
-            let py = python.unwrap_or_else(|| "python".to_string());
+            let py = resolve_python(Some(cfg), python);
             let mut cmd = std::process::Command::new(&py);
             cmd.arg("-m")
                 .arg("scrt_evolve_infer")
@@ -1746,8 +2232,10 @@ fn cmd_run_model(cfg: &EvolveConfig, prompt: &str, python: Option<String>) -> Re
                 .arg("--max-new-tokens")
                 .arg(sampling.max_tokens.to_string())
                 .arg("--temperature")
-                .arg(sampling.temperature.to_string())
-                .env("PYTHONPATH", &pkg_parent);
+                .arg(sampling.temperature.to_string());
+            if let Some(pkg_parent) = find_python_pkg_dir() {
+                cmd.env("PYTHONPATH", &pkg_parent);
+            }
             println!(
                 "run-model(transformers): {py} -m scrt_evolve_infer  (model={})",
                 model.display()
@@ -1756,7 +2244,7 @@ fn cmd_run_model(cfg: &EvolveConfig, prompt: &str, python: Option<String>) -> Re
                 .status()
                 .with_context(|| format!("launching `{py} -m scrt_evolve_infer`"))?;
             if !status.success() {
-                anyhow::bail!("run-model(transformers): python exited with {status}");
+                return Err(subprocess_failure("scrt_evolve_infer", &py, status));
             }
             Ok(())
         }
@@ -1780,18 +2268,20 @@ fn cmd_dequant(
     if !gguf.exists() {
         anyhow::bail!("dequant: GGUF not found: {}", gguf.display());
     }
-    let pkg_parent = find_python_pkg_dir()
-        .ok_or_else(|| anyhow::anyhow!("dequant: could not locate python/ dir"))?;
+    // PYTHONPATH is assembled from whatever's present: the checkout `python/` dir
+    // (dev fallback — the installed package needs none) and the vendored gguf-py
+    // from a llama.cpp checkout. Either may be absent; an installed `scrt-evolve-ml`
+    // + `gguf` pip package covers both. Platform separator: `;` Windows, `:` else.
+    let sep = if cfg!(windows) { ";" } else { ":" };
+    let mut path_parts: Vec<String> = Vec::new();
+    if let Some(p) = find_python_pkg_dir() {
+        path_parts.push(p.display().to_string());
+    }
+    if let Some(p) = find_llama_gguf_py() {
+        path_parts.push(p.display().to_string());
+    }
 
-    // Put the vendored gguf-py on PYTHONPATH (alongside the package parent), the
-    // same way export-gguf relies on it.
-    let gguf_py = find_llama_gguf_py();
-    let pythonpath = match &gguf_py {
-        Some(p) => format!("{};{}", pkg_parent.display(), p.display()),
-        None => pkg_parent.display().to_string(),
-    };
-
-    let py = python.unwrap_or_else(|| "python".to_string());
+    let py = resolve_python(None, python);
     let mut cmd = std::process::Command::new(&py);
     cmd.arg("-m")
         .arg("scrt_evolve_dequant")
@@ -1800,8 +2290,10 @@ fn cmd_dequant(
         .arg("--out")
         .arg(out)
         .arg("--dtype")
-        .arg(dtype)
-        .env("PYTHONPATH", &pythonpath);
+        .arg(dtype);
+    if !path_parts.is_empty() {
+        cmd.env("PYTHONPATH", path_parts.join(sep));
+    }
     if let Some(tok) = &tokenizer {
         cmd.arg("--tokenizer").arg(tok);
     }
@@ -1817,7 +2309,7 @@ fn cmd_dequant(
         .status()
         .with_context(|| format!("launching `{py} -m scrt_evolve_dequant`"))?;
     if !status.success() {
-        anyhow::bail!("dequant: python process exited with {status}");
+        return Err(subprocess_failure("scrt_evolve_dequant", &py, status));
     }
     println!("dequant: HF model dir → {}", out.display());
     Ok(())
@@ -1858,7 +2350,7 @@ fn cmd_export_gguf(
     cfg: &EvolveConfig,
     adapter: Option<PathBuf>,
     out: Option<PathBuf>,
-    quant: &str,
+    quant: Option<String>,
     llama_cpp: Option<PathBuf>,
     keep_intermediates: bool,
     python: Option<String>,
@@ -1874,18 +2366,13 @@ fn cmd_export_gguf(
     // `[export]` config is the source of defaults; explicit CLI flags override.
     let exp = cfg.export.clone().unwrap_or_default();
 
-    // quant: the CLI default ("Q4_K_M") is also the config default, so prefer
-    // the config value unless the user passed a non-default flag.
-    let quant_eff: String = if quant == "Q4_K_M" {
-        exp.quant.clone()
-    } else {
-        quant.to_string()
-    };
+    // quant: explicit CLI flag wins; otherwise fall back to `[export].quant`
+    // (whose own default is Q4_K_M). Track the source so the --json summary can
+    // tell an agent whether its flag was honored or the config value won (A2).
+    let quant_was_explicit = quant.is_some();
+    let quant_eff: String = quant.unwrap_or_else(|| exp.quant.clone());
 
-    let pkg_parent = find_python_pkg_dir()
-        .ok_or_else(|| anyhow::anyhow!("export-gguf: could not locate python/ dir"))?;
-
-    let py = python.unwrap_or_else(|| "python".to_string());
+    let py = resolve_python(Some(cfg), python);
     let mut cmd = std::process::Command::new(&py);
     cmd.arg("-m")
         .arg("scrt_evolve_gguf")
@@ -1898,8 +2385,10 @@ fn cmd_export_gguf(
         .arg("--dtype")
         .arg(&exp.dtype)
         .arg("--max-shard-size")
-        .arg(&exp.max_shard_size)
-        .env("PYTHONPATH", &pkg_parent);
+        .arg(&exp.max_shard_size);
+    if let Some(pkg_parent) = find_python_pkg_dir() {
+        cmd.env("PYTHONPATH", &pkg_parent);
+    }
 
     // out: CLI flag > [export].out_path > python default.
     if let Some(o) = &out {
@@ -1943,8 +2432,18 @@ fn cmd_export_gguf(
         .status()
         .with_context(|| format!("launching `{py} -m scrt_evolve_gguf`"))?;
     if !status.success() {
-        anyhow::bail!("export-gguf: python process exited with {status}");
+        return Err(subprocess_failure("scrt_evolve_gguf", &py, status));
     }
+    emit_json(serde_json::json!({
+        "command": "export-gguf",
+        "model": model_path.display().to_string(),
+        "adapter": adapter_dir.display().to_string(),
+        "quant": quant_eff,
+        "quant_source": if quant_was_explicit { "flag" } else { "config" },
+        "out": out.as_ref().map(|o| o.display().to_string())
+            .or_else(|| exp.out_path.clone()),
+        "status": "ok",
+    }));
     Ok(())
 }
 
@@ -1954,17 +2453,559 @@ fn find_python_pkg_dir() -> Option<PathBuf> {
     scrt_evolve::python_pkg_dir()
 }
 
+/// Resolve the Python interpreter for the ML subprocesses (track 28 binding).
+/// Precedence: `--python` flag > `$SCRT_EVOLVE_PYTHON` > `[hardware].python` >
+/// bare `python`. This is the ONE place the interpreter is chosen, so the
+/// installed-package path (`<venv>/python -m scrt_evolve_*`) and the dev checkout
+/// agree. The `python/` checkout dir is only a PYTHONPATH fallback (see callers).
+fn resolve_python(cfg: Option<&EvolveConfig>, cli: Option<String>) -> String {
+    cli.or_else(|| {
+        std::env::var("SCRT_EVOLVE_PYTHON")
+            .ok()
+            .filter(|s| !s.is_empty())
+    })
+    .or_else(|| {
+        cfg.and_then(|c| c.hardware.as_ref())
+            .and_then(|h| h.python.clone())
+    })
+    .unwrap_or_else(|| "python".to_string())
+}
+
+/// `config-show` — print the fully-resolved config as JSON (defaults applied).
+/// The dry-run analogue of `config-reference`: the schema vs. THIS run's values.
+fn cmd_config_show(cfg: &EvolveConfig) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(cfg)?);
+    Ok(())
+}
+
+/// `commands` — a machine-readable manifest of every subcommand, derived from
+/// clap so it never drifts from the real surface. Human list by default; a JSON
+/// array with `--json` (the command-surface analogue of `config-reference`).
+fn cmd_commands() -> Result<()> {
+    use clap::CommandFactory;
+    let cli = Cli::command();
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    for sub in cli.get_subcommands() {
+        let flags: Vec<serde_json::Value> = sub
+            .get_arguments()
+            .filter_map(|a| {
+                a.get_long().map(|long| {
+                    serde_json::json!({
+                        "flag": format!("--{long}"),
+                        "help": a.get_help().map(|h| h.to_string()).unwrap_or_default(),
+                        "required": a.is_required_set(),
+                    })
+                })
+            })
+            .collect();
+        items.push(serde_json::json!({
+            "name": sub.get_name(),
+            "about": sub.get_about().map(|a| a.to_string()).unwrap_or_default(),
+            "flags": flags,
+        }));
+    }
+    if JSON_OUTPUT.load(std::sync::atomic::Ordering::Relaxed) {
+        println!("{}", serde_json::to_string(&items)?);
+    } else {
+        println!("scrt-evolve subcommands ({}):", items.len());
+        for sub in cli.get_subcommands() {
+            let about = sub
+                .get_about()
+                .map(|a| a.to_string())
+                .unwrap_or_default()
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            println!("  {:<18} {}", sub.get_name(), about);
+        }
+        println!(
+            "\nRun `scrt-evolve <cmd> --help` for flags, or `commands --json` for a manifest."
+        );
+    }
+    Ok(())
+}
+
+/// `doctor` — preflight the environment so a long real-model run fails in 2
+/// seconds with a fix, not at minute 9 with a traceback. Each check prints
+/// PASS/FAIL + a remediation; `--json` emits a structured report. Reuses the
+/// same finder helpers the real commands use, so it checks what they check.
+fn cmd_doctor(config: &std::path::Path, python: Option<String>) -> Result<()> {
+    let mut checks: Vec<(String, bool, String)> = Vec::new();
+    let mut check = |name: &str, ok: bool, detail: String| {
+        checks.push((name.to_string(), ok, detail));
+    };
+
+    // 1. Config parses.
+    let cfg = match EvolveConfig::load(config) {
+        Ok(c) => {
+            check("config_parse", true, format!("{} parsed", config.display()));
+            Some(c)
+        }
+        Err(e) => {
+            check(
+                "config_parse",
+                false,
+                format!("{} — {e:#}. Fix the toml or run `init`.", config.display()),
+            );
+            None
+        }
+    };
+
+    // 2. model_path exists (only when set).
+    match cfg.as_ref().and_then(|c| c.evolve.model_path.clone()) {
+        Some(p) if p.exists() => check("model_path", true, format!("{} exists", p.display())),
+        Some(p) => check(
+            "model_path",
+            false,
+            format!(
+                "{} does not exist — set [evolve].model_path to your HF model dir",
+                p.display()
+            ),
+        ),
+        None => check(
+            "model_path",
+            false,
+            "[evolve].model_path is unset — required for train/infer/export".to_string(),
+        ),
+    }
+
+    // 3. python/ package dir located (shared helper the real commands use).
+    match find_python_pkg_dir() {
+        Some(p) => check(
+            "python_pkg_dir",
+            true,
+            format!("python/ at {}", p.display()),
+        ),
+        None => check(
+            "python_pkg_dir",
+            false,
+            "could not locate the python/ package dir — run from the repo checkout \
+             or install scrt-evolve-ml on PYTHONPATH"
+                .to_string(),
+        ),
+    }
+
+    // 4. Interpreter ML deps (track 28): one probe reports torch/cuda/
+    //    transformers/safetensors/mamba so `doctor` covers the packaging binding.
+    //    The interpreter is resolved the SAME way the real commands resolve it
+    //    (flag > $SCRT_EVOLVE_PYTHON > [hardware].python > python).
+    let py = resolve_python(cfg.as_ref(), python);
+    let probe = "import json\nr={}\n\
+        try:\n import torch; r['torch']=torch.__version__; r['cuda']=bool(torch.cuda.is_available())\n\
+        except Exception as e: r['torch_err']=str(e)\n\
+        try:\n import transformers; r['transformers']=transformers.__version__\n\
+        except Exception as e: r['transformers_err']=str(e)\n\
+        try:\n import safetensors; r['safetensors']=True\n\
+        except Exception as e: r['safetensors_err']=str(e)\n\
+        try:\n import mamba_ssm, causal_conv1d; r['mamba']=True\n\
+        except Exception: r['mamba']=False\n\
+        print(json.dumps(r))";
+    let probe_out = std::process::Command::new(&py)
+        .arg("-c")
+        .arg(probe)
+        .output();
+    match probe_out {
+        Ok(o) if o.status.success() => {
+            let txt = String::from_utf8_lossy(&o.stdout);
+            let j: serde_json::Value = serde_json::from_str(txt.trim()).unwrap_or_default();
+            let has = |k: &str| j.get(k).map(|v| !v.is_null()).unwrap_or(false);
+            let core_ok = has("torch") && has("transformers") && has("safetensors");
+            if core_ok {
+                check(
+                    "python_deps",
+                    true,
+                    format!(
+                        "`{py}` torch={} transformers={}",
+                        j.get("torch").and_then(|v| v.as_str()).unwrap_or("?"),
+                        j.get("transformers")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?"),
+                    ),
+                );
+            } else {
+                check(
+                    "python_deps",
+                    false,
+                    format!(
+                        "`{py}` is missing torch/transformers/safetensors — \
+                         `pip install scrt-evolve-ml[cuda]` into the venv, then set \
+                         [hardware].python / $SCRT_EVOLVE_PYTHON to it"
+                    ),
+                );
+            }
+            // Capability notes (not hard failures: CPU-only / non-SSM is valid).
+            let cuda = j.get("cuda").and_then(|v| v.as_bool()).unwrap_or(false);
+            check(
+                "cuda",
+                true,
+                if cuda {
+                    "torch.cuda.is_available() = true".to_string()
+                } else {
+                    "CUDA not available (CPU-only — fine for eval/api; real GPU training needs CUDA torch)".to_string()
+                },
+            );
+            let mamba = j.get("mamba").and_then(|v| v.as_bool()).unwrap_or(false);
+            check(
+                "mamba_kernels",
+                true,
+                if mamba {
+                    "mamba-ssm + causal-conv1d importable (hybrid-SSM training OK)".to_string()
+                } else {
+                    "mamba-ssm/causal-conv1d absent (hybrid-SSM TRAINING will segfault; non-SSM models fine). See PORTABILITY.md".to_string()
+                },
+            );
+        }
+        Ok(_) | Err(_) => check(
+            "python_deps",
+            false,
+            format!(
+                "could not run the dep probe with `{py}` — install scrt-evolve-ml \
+                 and set [hardware].python / $SCRT_EVOLVE_PYTHON, or pass --python"
+            ),
+        ),
+    }
+
+    // 5. llama.cpp auto-detect (gguf-py — needed by export/dequant).
+    match find_llama_gguf_py() {
+        Some(p) => check("llama_cpp", true, format!("gguf-py at {}", p.display())),
+        None => check(
+            "llama_cpp",
+            false,
+            "no llama.cpp checkout auto-detected (~/.unsloth/llama.cpp, ~/llama.cpp, \
+             $LLAMA_CPP) — needed for export-gguf/dequant; clone llama.cpp or set \
+             [export].llama_cpp_path"
+                .to_string(),
+        ),
+    }
+
+    // 6. work_dir writable.
+    if let Some(c) = cfg.as_ref() {
+        let wd = WorkDir::from_config(c);
+        let writable =
+            wd.ensure().is_ok() && std::fs::write(wd.root().join(".doctor-probe"), b"ok").is_ok();
+        let _ = std::fs::remove_file(wd.root().join(".doctor-probe"));
+        if writable {
+            check(
+                "work_dir",
+                true,
+                format!("{} writable", wd.root().display()),
+            );
+        } else {
+            check(
+                "work_dir",
+                false,
+                format!("{} is not writable", wd.root().display()),
+            );
+        }
+    }
+
+    let failed = checks.iter().filter(|(_, ok, _)| !ok).count();
+
+    if JSON_OUTPUT.load(std::sync::atomic::Ordering::Relaxed) {
+        let arr: Vec<serde_json::Value> = checks
+            .iter()
+            .map(|(name, ok, detail)| {
+                serde_json::json!({"check": name, "pass": ok, "detail": detail})
+            })
+            .collect();
+        emit_json(serde_json::json!({
+            "command": "doctor",
+            "checks": arr,
+            "failed": failed,
+            "status": if failed == 0 { "ok" } else { "fail" },
+        }));
+    } else {
+        println!("scrt-evolve doctor:");
+        for (name, ok, detail) in &checks {
+            println!(
+                "  [{}] {:<16} {detail}",
+                if *ok { "PASS" } else { "FAIL" },
+                name
+            );
+        }
+        if failed == 0 {
+            println!("\nall checks passed.");
+        } else {
+            println!("\n{failed} check(s) failed — fix the FAILs above before a real run.");
+        }
+    }
+    Ok(())
+}
+
+// ───────────────────────── Ambient daemon (track 26) ─────────────────────────
+
+/// Best-effort free-VRAM probe for the daemon's throttle gate (parses
+/// `nvidia-smi`). Returns GB free on the first GPU, or `None` when unavailable —
+/// then the gate is skipped (we can't throttle what we can't measure).
+fn probe_free_vram_gb() -> Option<f64> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mb: f64 = text.lines().next()?.trim().parse().ok()?;
+    Some(mb / 1024.0)
+}
+
+/// Probe whether ANOTHER process is using the GPU (gentle-background gate): list
+/// the GPU's compute apps and report `true` if any PID other than ours is present.
+/// `None` when `nvidia-smi` is unavailable (then the gate treats the GPU as free).
+fn probe_gpu_busy() -> Option<bool> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-compute-apps=pid", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let me = std::process::id();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let others = text
+        .lines()
+        .filter_map(|l| l.trim().parse::<u32>().ok())
+        .any(|pid| pid != me);
+    Some(others)
+}
+
+/// `daemon start` — run the ambient continuous-evolution loop (track 26).
+/// Mirrors the `evolve --schedule` production hooks (train via the transformers
+/// subprocess, score via the eval harness) but is driven by the living activity
+/// queue instead of bounded goal rounds. Runs until `daemon stop`, or bounded by
+/// `--max-steps` / `--drain`.
+fn cmd_daemon_start(
+    cfg: &EvolveConfig,
+    python: Option<String>,
+    max_vram: Option<f64>,
+    max_steps: Option<u64>,
+    drain: bool,
+) -> Result<()> {
+    use scrt_evolve::daemon::{self, DaemonHooks, DaemonOptions};
+
+    let wd = WorkDir::from_config(cfg);
+    wd.ensure()?;
+
+    let dcfg = cfg.daemon.clone().unwrap_or_default();
+    // Budget: --max-vram > [daemon].max_vram_gb; 0 ⇒ ungated.
+    let max_vram_gb = max_vram.or(if dcfg.max_vram_gb > 0.0 {
+        Some(dcfg.max_vram_gb)
+    } else {
+        None
+    });
+
+    // Resume the monotonic ordinal from the checkpoint store, and take the last
+    // good score as the baseline (else a conservative uncovered baseline).
+    let reg = scrt_evolve::Regulator::new(cfg)?;
+    let start_ordinal = reg
+        .store()
+        .list()?
+        .iter()
+        .map(|m| m.ordinal)
+        .max()
+        .map(|o| o + 1)
+        .unwrap_or(1);
+    let baseline = reg
+        .store()
+        .last_good()
+        .and_then(|id| reg.store().load_manifest(&id).ok())
+        .and_then(|m| m.metrics)
+        .unwrap_or_else(|| scrt_evolve::ScoreReport::uncovered("probe-none", "baseline"));
+
+    // Capture train/score subprocess output to one durable daemon log.
+    let _ = std::fs::create_dir_all(wd.root().join("logs"));
+    let log_path = wd.root().join("logs").join("daemon.log");
+    std::env::set_var("SCRT_EVOLVE_LOG_FILE", &log_path);
+
+    // Clear any stale stop-file; write a run marker for `daemon status`.
+    let _ = std::fs::remove_file(daemon::stop_file(wd.root()));
+    let _ = std::fs::write(daemon::run_file(wd.root()), b"running");
+
+    // --- Production hooks (mirror cmd_evolve_schedule) ---
+    let py_train = python.clone();
+    let train = |c: &EvolveConfig, ds: &scrt_evolve::Dataset| -> Result<Vec<String>> {
+        let w = WorkDir::from_config(c);
+        let data_path = w.root().join("dataset.daemon-step.jsonl");
+        ds.write_jsonl(&data_path)?;
+        cmd_train_transformers(c, Some(data_path), py_train.clone(), None, 40, 256)?;
+        Ok(provenance_of(ds))
+    };
+    let py_score = python.clone();
+    let score = |c: &EvolveConfig| -> Result<scrt_evolve::ScoreReport> {
+        scrt_evolve::eval::run_eval(c, py_score.as_deref())
+    };
+    let free_vram = probe_free_vram_gb;
+    let gpu_busy = probe_gpu_busy;
+    let hooks = DaemonHooks {
+        free_vram_gb: &free_vram,
+        gpu_busy: &gpu_busy,
+        train: &train,
+        score: &score,
+    };
+
+    let opts = DaemonOptions {
+        max_vram_gb,
+        batch: dcfg.batch.max(1),
+        max_steps,
+        exit_when_empty: drain,
+        poll_interval: std::time::Duration::from_secs(dcfg.poll_interval_secs.max(1)),
+        start_ordinal,
+        pause_on_gpu_process: dcfg.pause_on_gpu_process,
+        cpu_fallback: dcfg.cpu_fallback,
+        rotation_blocks: dcfg.rotation_blocks,
+        cooldown: std::time::Duration::from_secs(dcfg.cooldown_secs),
+    };
+
+    println!(
+        "daemon start: budget={} batch={} {}{}{}{} (stop with `scrt-evolve daemon stop`)",
+        max_vram_gb
+            .map(|v| format!("{v:.1}G"))
+            .unwrap_or_else(|| "ungated".into()),
+        opts.batch,
+        if drain { "drain-once" } else { "continuous" },
+        if opts.pause_on_gpu_process {
+            " yield-to-gpu"
+        } else {
+            ""
+        },
+        if opts.cpu_fallback {
+            " cpu-fallback"
+        } else {
+            ""
+        },
+        if opts.rotation_blocks > 0 {
+            format!(" rotate/{}", opts.rotation_blocks)
+        } else {
+            String::new()
+        },
+    );
+
+    let stop_root = wd.root().to_path_buf();
+    let report = daemon::run_daemon(cfg, &opts, &baseline, &hooks, &|| {
+        daemon::stop_requested(&stop_root)
+    })?;
+
+    std::env::remove_var("SCRT_EVOLVE_LOG_FILE");
+    let _ = std::fs::remove_file(daemon::run_file(wd.root()));
+    let _ = std::fs::remove_file(daemon::stop_file(wd.root()));
+
+    let reason = if report.halted {
+        "HALTED on catastrophe"
+    } else if report.stopped {
+        "stopped"
+    } else if report.drained {
+        "queue drained"
+    } else {
+        "done"
+    };
+    println!(
+        "daemon: {} step(s), {} committed — {reason}",
+        report.steps.len(),
+        report.committed()
+    );
+    for s in &report.steps {
+        println!("  #{:<3} items={:<3} {}", s.ordinal, s.items, s.note);
+    }
+    emit_json(serde_json::json!({
+        "command": "daemon-start",
+        "steps": report.steps.len(),
+        "committed": report.committed(),
+        "halted": report.halted,
+        "stopped": report.stopped,
+        "drained": report.drained,
+        "status": if report.halted { "halted" } else { "ok" },
+    }));
+    if report.halted {
+        anyhow::bail!(
+            "daemon halted (catastrophe) — see `quarantine list` + evolution-log; \
+             re-arm with `quarantine clear`"
+        );
+    }
+    Ok(())
+}
+
+/// `daemon stop` — signal a running daemon to exit after its current step.
+fn cmd_daemon_stop(cfg: &EvolveConfig) -> Result<()> {
+    use scrt_evolve::daemon;
+    let wd = WorkDir::from_config(cfg);
+    wd.ensure()?;
+    daemon::request_stop(wd.root())?;
+    println!("daemon stop: requested (the running daemon exits after its current step)");
+    emit_json(serde_json::json!({"command": "daemon-stop", "status": "ok"}));
+    Ok(())
+}
+
+/// `daemon status` — run-state + living-queue pending counts.
+fn cmd_daemon_status(cfg: &EvolveConfig) -> Result<()> {
+    use scrt_evolve::daemon;
+    use scrt_evolve::LivingQueue;
+    let wd = WorkDir::from_config(cfg);
+    wd.ensure()?;
+    let queue = LivingQueue::from_config(cfg)?;
+    let (prio, raw) = queue.pending();
+    let running = daemon::run_file(wd.root()).exists();
+    let stopping = daemon::stop_requested(wd.root());
+    let state = if stopping {
+        "stopping"
+    } else if running {
+        "running"
+    } else {
+        "stopped"
+    };
+    println!("daemon status: {state}");
+    println!("  queue pending: priority={prio} raw={raw}");
+    emit_json(serde_json::json!({
+        "command": "daemon-status",
+        "state": state,
+        "pending_priority": prio,
+        "pending_raw": raw,
+        "status": "ok",
+    }));
+    Ok(())
+}
+
+/// `teach` — enqueue an explicit prompt→completion onto the PRIORITY lane.
+fn cmd_teach(cfg: &EvolveConfig, prompt: &str, completion: &str) -> Result<()> {
+    use scrt_evolve::{GenExample, Lane, LivingQueue};
+    let wd = WorkDir::from_config(cfg);
+    wd.ensure()?;
+    let queue = LivingQueue::from_config(cfg)?;
+    let example = GenExample::Qa {
+        prompt: prompt.to_string(),
+        completion: completion.to_string(),
+        source: Some("teach".to_string()),
+        gen: Some("teach".to_string()),
+    };
+    queue.enqueue(Lane::Priority, &example)?;
+    let (prio, raw) = queue.pending();
+    println!("teach: enqueued to PRIORITY lane (pending: priority={prio} raw={raw})");
+    emit_json(serde_json::json!({
+        "command": "teach",
+        "lane": "priority",
+        "pending_priority": prio,
+        "pending_raw": raw,
+        "status": "ok",
+    }));
+    Ok(())
+}
+
 // ───────────────────────── Branch factory (track 29) ─────────────────────────
 
 /// `branch create` — compose discover → teacher-QA generate → train → eval gate →
 /// GGUF export inside the track-15 transaction; register an eval-passing branch.
 /// Mirrors the `evolve --schedule` production hooks (no new ML).
+#[allow(clippy::too_many_arguments)]
 fn cmd_branch_create(
     cfg: &EvolveConfig,
     name: &str,
     base: Option<String>,
     corpus: Option<PathBuf>,
     domain: Option<String>,
+    distill: bool,
+    teacher: Option<String>,
+    steps: usize,
     python: Option<String>,
 ) -> Result<()> {
     use scrt_evolve::branch::{self, BranchHooks};
@@ -1976,6 +3017,34 @@ fn cmd_branch_create(
     let domain = domain.or_else(|| bcfg.domain.clone());
     let py = python;
 
+    // Distill mode: `--distill`/`--teacher` or `[branch].mode = "distill"`. When
+    // active, inject `[train.distill]` into the working config so the branch's
+    // train hook runs cross-MODEL seam distillation. The teacher comes from
+    // `--teacher` (highest), else the existing `[train.distill].teacher_model`.
+    let distill_mode = distill || teacher.is_some() || bcfg.mode == "distill";
+    let cfg_owned;
+    let cfg: &EvolveConfig = if distill_mode {
+        let mut c = cfg.clone();
+        let mut train_cfg = c.train.clone().unwrap_or_default();
+        let mut dcfg = train_cfg.distill.clone().unwrap_or_default();
+        dcfg.enabled = true;
+        if let Some(t) = teacher.clone() {
+            dcfg.teacher_model = Some(t);
+        }
+        if dcfg.teacher_model.is_none() {
+            anyhow::bail!(
+                "branch create --distill: no teacher model — pass --teacher <path> \
+                 or set [train.distill].teacher_model"
+            );
+        }
+        train_cfg.distill = Some(dcfg);
+        c.train = Some(train_cfg);
+        cfg_owned = c;
+        &cfg_owned
+    } else {
+        cfg
+    };
+
     // --- Production hooks (mirror cmd_evolve_schedule) ---
     let discover = |c: &EvolveConfig| scrt_evolve::discover::run(c);
     let generate =
@@ -1985,7 +3054,7 @@ fn cmd_branch_create(
         let wd = WorkDir::from_config(c);
         let data_path = wd.root().join("dataset.branch-train.jsonl");
         train_set.write_jsonl(&data_path)?;
-        cmd_train_transformers(c, Some(data_path), py_train.clone(), None, 40, 256)?;
+        cmd_train_transformers(c, Some(data_path), py_train.clone(), None, steps, 256)?;
         Ok(provenance_of(train_set))
     };
     let py_score = py.clone();
@@ -1995,16 +3064,13 @@ fn cmd_branch_create(
     let py_export = py.clone();
     let export = |c: &EvolveConfig, path: &std::path::Path| -> Result<PathBuf> {
         let adapter = WorkDir::from_config(c).root().join("adapter");
-        let quant = c
-            .export
-            .as_ref()
-            .map(|e| e.quant.clone())
-            .unwrap_or_else(|| "Q4_K_M".to_string());
+        // quant=None ⇒ cmd_export_gguf resolves it from `[export].quant`
+        // (default Q4_K_M), the same value this site used to compute inline.
         cmd_export_gguf(
             c,
             Some(adapter),
             Some(path.to_path_buf()),
-            &quant,
+            None,
             None,
             false,
             py_export.clone(),
@@ -2047,9 +3113,407 @@ fn cmd_branch_create(
             "  base={} domain={} gguf_sha={sha}…",
             m.base_model, m.domain
         );
+        // Persist the branch's config so it is SELF-DESCRIBING: `branch evolve
+        // <name>` reloads this to re-run the same recipe (model paths, train,
+        // teacher, eval) with no flags. Best-effort (a write failure is non-fatal).
+        persist_branch_config(cfg, name);
     }
+    emit_json(serde_json::json!({
+        "command": "branch-create",
+        "name": name,
+        "action": action,
+        "registered": report.manifest.is_some() && !report.halt,
+        "halt": report.halt,
+        "base": report.manifest.as_ref().map(|m| m.base_model.clone()),
+        "domain": report.manifest.as_ref().map(|m| m.domain.clone()),
+        "gguf_sha": report.manifest.as_ref().map(|m| m.gguf_sha.clone()),
+        "note": report.note,
+        "status": if report.halt { "halted" } else { "ok" },
+    }));
     if report.halt {
         anyhow::bail!("branch create halted (catastrophe) — see quarantine + evolution-log");
+    }
+    Ok(())
+}
+
+/// Persist a branch's config to `branches/<name>/branch.toml` so the branch is
+/// SELF-DESCRIBING — `branch evolve <name>` reloads it to re-run the same recipe
+/// with no flags. Best-effort (a write failure is non-fatal).
+fn persist_branch_config(cfg: &EvolveConfig, name: &str) {
+    let dir = cfg.work_dir().join("branches").join(name);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    if let Ok(text) = cfg.to_toml() {
+        let _ = std::fs::write(dir.join("branch.toml"), text);
+    }
+}
+
+/// Run the configured `[hardware].free_gpu_command` (e.g. `lms unload --all`) to
+/// evict a GPU-resident teacher before training — on a single-GPU box the teacher
+/// and trainer can't both hold VRAM. Best-effort; a failure is logged, not fatal.
+fn maybe_free_gpu(cfg: &EvolveConfig) {
+    let cmd = match cfg
+        .hardware
+        .as_ref()
+        .and_then(|h| h.free_gpu_command.clone())
+    {
+        Some(c) if !c.trim().is_empty() => c,
+        _ => return,
+    };
+    println!("free-gpu: {cmd}");
+    let result = if cfg!(windows) {
+        std::process::Command::new("cmd")
+            .args(["/C", &cmd])
+            .status()
+    } else {
+        std::process::Command::new("sh").args(["-c", &cmd]).status()
+    };
+    if let Err(e) = result {
+        eprintln!("free-gpu: command failed (non-fatal): {e}");
+    }
+}
+
+/// Build the eval baseline for the next `branch evolve` round from the live
+/// stored version: its recorded `correctness` scored on its recorded
+/// `probe_version`. This is what makes the cross-round gate REAL — with
+/// `[eval].stable_probe`, the candidate is scored on the SAME probe, so both
+/// reports carry the same `probe_version` and [`scrt_evolve::eval::classify`]
+/// does a genuine same-exam Accept/Regress/Catastrophic.
+///
+/// `stable_pv` is the version of the on-disk stable probe, if one exists. A
+/// version committed before `probe_version` tracking carries `None`; under a
+/// stable probe it WAS scored on that same fixed exam, so we anchor its baseline
+/// to `stable_pv` rather than dropping to the uncovered path — this makes the
+/// very next round a real gate without a manual migration. A stored
+/// `probe_version` always wins (a version committed under the feature). With no
+/// probe version from either source, the baseline is uncovered (the `n == 0`
+/// accept-unless-NaN path) rather than fabricating an id that can never match.
+///
+/// The sole place a baseline `ScoreReport` is hand-built (Goal 3 centralization).
+fn baseline_from_version(
+    v: &scrt_evolve::model_store::ModelVersion,
+    stable_pv: Option<&str>,
+) -> scrt_evolve::ScoreReport {
+    let pv = v.probe_version.as_deref().or(stable_pv);
+    match (v.metrics.get("correctness"), pv) {
+        (Some(c), Some(pv)) => {
+            let mut r = scrt_evolve::ScoreReport::uncovered(pv, "live");
+            r.correctness = *c;
+            r.n = 1;
+            r
+        }
+        _ => scrt_evolve::ScoreReport::uncovered("probe-none", "baseline"),
+    }
+}
+
+/// Flatten a `ScoreReport` into the model-store's per-version metric map.
+fn score_to_metrics(r: &scrt_evolve::ScoreReport) -> std::collections::BTreeMap<String, f64> {
+    let mut m = std::collections::BTreeMap::new();
+    m.insert("correctness".to_string(), r.correctness);
+    if let Some(v) = r.constitution_adherence {
+        m.insert("constitution_adherence".to_string(), v);
+    }
+    if let Some(v) = r.perplexity {
+        m.insert("perplexity".to_string(), v);
+    }
+    m
+}
+
+/// `branch evolve <name>` — config-driven FURTHER training of a branch. Loads the
+/// branch's persisted config, continues from its current stored adapter, runs an
+/// eval-gated round vs the live version, and on KEEP commits a new version to the
+/// bounded `[store]` ring + deploys the GGUF. The repeatable step a `.cmd` loops.
+fn cmd_branch_evolve(
+    config: &std::path::Path,
+    name: &str,
+    steps: usize,
+    python: Option<String>,
+) -> Result<()> {
+    use scrt_evolve::branch::{self, BranchHooks};
+    use scrt_evolve::model_store::ModelStore;
+    use scrt_evolve::regulate::StepAction;
+
+    // 1. Prefer the branch's persisted (self-describing) config.
+    let base_cfg = EvolveConfig::load(config)?;
+    let branch_dir = base_cfg.work_dir().join("branches").join(name);
+    let persisted = branch_dir.join("branch.toml");
+    let mut cfg = if persisted.exists() {
+        println!(
+            "branch evolve [{name}]: using persisted config {}",
+            persisted.display()
+        );
+        EvolveConfig::load(&persisted)?
+    } else {
+        println!("branch evolve [{name}]: no persisted branch.toml — using {config:?}");
+        base_cfg
+    };
+
+    // 2. Open the bounded per-branch model store.
+    let store_dir = branch_dir.join("store");
+    let base_model = cfg
+        .branch
+        .as_ref()
+        .and_then(|b| b.base.clone())
+        .or_else(|| {
+            cfg.evolve
+                .model_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default();
+    let keep = ModelStore::keep_from_config(&cfg);
+    let mut store = ModelStore::open(&store_dir, &base_model, keep)
+        .map_err(|e| anyhow::anyhow!("open model store: {e}"))?;
+
+    // 3. CONTINUE from the current version's adapter (config-driven resume).
+    if let Some(cur) = store.resolve_current() {
+        let mut train_cfg = cfg.train.clone().unwrap_or_default();
+        let mut lora = train_cfg.lora.clone().unwrap_or_default();
+        lora.init_adapter = Some(cur.adapter_dir.to_string_lossy().into_owned());
+        train_cfg.lora = Some(lora);
+        cfg.train = Some(train_cfg);
+        println!("branch evolve [{name}]: continuing from version {}", cur.id);
+    } else {
+        println!("branch evolve [{name}]: no stored version yet — training fresh");
+    }
+    let cfg = cfg;
+
+    // 4. Baseline = the live version's score (this round must IMPROVE on it),
+    //    rebuilt from its stored correctness + probe_version so the candidate
+    //    (scored on the same stable probe) is genuinely comparable. Under a
+    //    stable probe, anchor a pre-feature version's baseline to the on-disk
+    //    exam (the branch's `probe.jsonl`) so even the next round is a real gate.
+    let stable_pv = if cfg.eval.as_ref().map(|e| e.stable_probe).unwrap_or(false) {
+        let ppath = branch_dir.join("probe.jsonl");
+        ppath
+            .exists()
+            .then(|| {
+                scrt_evolve::eval::ProbeSet::load(&ppath)
+                    .ok()
+                    .map(|p| p.version)
+            })
+            .flatten()
+    } else {
+        None
+    };
+    let baseline = store
+        .current()
+        .map(|v| baseline_from_version(v, stable_pv.as_deref()))
+        .unwrap_or_else(|| scrt_evolve::ScoreReport::uncovered("probe-none", "baseline"));
+
+    // 5. Production hooks (mirror create; free the GPU before training).
+    let py = python;
+    let discover = |c: &EvolveConfig| scrt_evolve::discover::run(c);
+    let generate =
+        |c: &EvolveConfig, ctx: &scrt_evolve::DiscoveredContext| scrt_evolve::generate::run(c, ctx);
+    let py_train = py.clone();
+    let train = |c: &EvolveConfig, train_set: &scrt_evolve::Dataset| -> Result<Vec<String>> {
+        maybe_free_gpu(c);
+        let wd = WorkDir::from_config(c);
+        let data_path = wd.root().join("dataset.branch-train.jsonl");
+        train_set.write_jsonl(&data_path)?;
+        cmd_train_transformers(c, Some(data_path), py_train.clone(), None, steps, 256)?;
+        Ok(provenance_of(train_set))
+    };
+    let py_score = py.clone();
+    let score = |c: &EvolveConfig| -> Result<scrt_evolve::ScoreReport> {
+        scrt_evolve::eval::run_eval(c, py_score.as_deref())
+    };
+    let py_export = py.clone();
+    let export = |c: &EvolveConfig, path: &std::path::Path| -> Result<PathBuf> {
+        let adapter = WorkDir::from_config(c).root().join("adapter");
+        cmd_export_gguf(
+            c,
+            Some(adapter),
+            Some(path.to_path_buf()),
+            None,
+            None,
+            false,
+            py_export.clone(),
+        )?;
+        Ok(path.to_path_buf())
+    };
+    let hooks = BranchHooks {
+        discover: &discover,
+        generate: &generate,
+        train: &train,
+        score: &score,
+        export: &export,
+    };
+
+    let created = now_iso8601();
+    let domain = cfg.branch.as_ref().and_then(|b| b.domain.clone());
+    let report = branch::create(
+        &cfg,
+        name,
+        None,
+        None,
+        domain.as_deref(),
+        &baseline,
+        &created,
+        &hooks,
+    )?;
+
+    let action = report
+        .action
+        .map(|a| format!("{a:?}"))
+        .unwrap_or_else(|| "bailed".to_string());
+
+    // 6. On KEEP: commit a new version to the bounded ring + deploy the GGUF.
+    if matches!(report.action, Some(StepAction::Commit)) {
+        let adapter_dir = branch_dir.join("adapter");
+        let gguf = scrt_evolve::branch::create::gguf_path(&cfg, name);
+        let metrics = report
+            .metrics
+            .as_ref()
+            .map(score_to_metrics)
+            .unwrap_or_default();
+        // Carry the exam this candidate was scored on, so the NEXT round's
+        // baseline (via `baseline_from_version`) is comparable to its candidate.
+        let probe_version = report.metrics.as_ref().map(|m| m.probe_version.clone());
+        let gguf_arg = if gguf.exists() {
+            Some(gguf.as_path())
+        } else {
+            None
+        };
+        let vid = store
+            .commit(&adapter_dir, gguf_arg, metrics, probe_version, &created)
+            .map_err(|e| anyhow::anyhow!("store commit: {e}"))?;
+        println!(
+            "branch evolve [{name}]: KEEP — committed {vid} ({} version(s) retained)",
+            store.versions().len()
+        );
+        if let Some(dst) = cfg.store.as_ref().and_then(|s| s.deploy_to.clone()) {
+            if let Some(g) = store.resolve(&vid).and_then(|r| r.gguf) {
+                if let Some(parent) = std::path::Path::new(&dst).parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                std::fs::copy(&g, &dst)?;
+                println!("  deployed → {dst}");
+            }
+        }
+    } else {
+        println!(
+            "branch evolve [{name}]: {action} — live model unchanged ({})",
+            report.note
+        );
+    }
+
+    emit_json(serde_json::json!({
+        "command": "branch-evolve",
+        "name": name,
+        "action": action,
+        "halt": report.halt,
+        "versions": store.versions().iter().map(|v| v.id.clone()).collect::<Vec<_>>(),
+        "current": store.manifest().current,
+        "status": if report.halt { "halted" } else { "ok" },
+    }));
+    if report.halt {
+        anyhow::bail!("branch evolve halted (catastrophe) — see quarantine + evolution-log");
+    }
+    Ok(())
+}
+
+/// Open a branch's per-branch model store.
+fn open_branch_store(
+    cfg: &EvolveConfig,
+    name: &str,
+) -> Result<scrt_evolve::model_store::ModelStore> {
+    use scrt_evolve::model_store::ModelStore;
+    let branch_dir = cfg.work_dir().join("branches").join(name);
+    let base_model = cfg
+        .branch
+        .as_ref()
+        .and_then(|b| b.base.clone())
+        .or_else(|| {
+            cfg.evolve
+                .model_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default();
+    ModelStore::open(
+        branch_dir.join("store"),
+        &base_model,
+        ModelStore::keep_from_config(cfg),
+    )
+    .map_err(|e| anyhow::anyhow!("open model store: {e}"))
+}
+
+/// `branch versions <name>` — show the bounded weight-version ring.
+fn cmd_branch_versions(cfg: &EvolveConfig, name: &str) -> Result<()> {
+    let store = open_branch_store(cfg, name)?;
+    let current = store.manifest().current.clone();
+    if store.versions().is_empty() {
+        println!("branch '{name}': no stored versions yet");
+    } else {
+        println!(
+            "branch '{name}' versions (keep={}, base={}):",
+            store.manifest().keep_versions,
+            store.manifest().base_model
+        );
+        for v in store.versions() {
+            let live = if Some(&v.id) == current.as_ref() {
+                " *current*"
+            } else {
+                ""
+            };
+            let corr = v
+                .metrics
+                .get("correctness")
+                .map(|c| format!("correctness={c:.4}"))
+                .unwrap_or_default();
+            let gguf = if v.gguf.is_some() { " +gguf" } else { "" };
+            println!(
+                "  {}{live}  parent={}  {corr}{gguf}  {}",
+                v.id,
+                v.parent.as_deref().unwrap_or("-"),
+                v.created
+            );
+        }
+    }
+    emit_json(serde_json::json!({
+        "command": "branch-versions",
+        "name": name,
+        "current": current,
+        "versions": store.versions().iter().map(|v| v.id.clone()).collect::<Vec<_>>(),
+        "status": "ok",
+    }));
+    Ok(())
+}
+
+/// `branch rollback <name>` — revert the live model to the current version's
+/// parent and re-deploy that GGUF.
+fn cmd_branch_rollback(cfg: &EvolveConfig, name: &str) -> Result<()> {
+    let mut store = open_branch_store(cfg, name)?;
+    let reverted = store
+        .rollback()
+        .map_err(|e| anyhow::anyhow!("rollback: {e}"))?;
+    match reverted {
+        Some(id) => {
+            println!("branch '{name}': rolled back → version {id} (live)");
+            // Re-deploy the reverted version's GGUF if a target is configured.
+            if let Some(dst) = cfg.store.as_ref().and_then(|s| s.deploy_to.clone()) {
+                if let Some(g) = store.resolve(&id).and_then(|r| r.gguf) {
+                    if let Some(parent) = std::path::Path::new(&dst).parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    std::fs::copy(&g, &dst)?;
+                    println!("  redeployed → {dst}");
+                }
+            }
+            emit_json(serde_json::json!({
+                "command": "branch-rollback", "name": name, "current": id, "status": "ok",
+            }));
+        }
+        None => {
+            println!("branch '{name}': nothing to roll back to (no parent version)");
+            emit_json(serde_json::json!({
+                "command": "branch-rollback", "name": name, "current": store.manifest().current,
+                "status": "noop",
+            }));
+        }
     }
     Ok(())
 }
@@ -2068,16 +3532,28 @@ fn cmd_branch_list(cfg: &EvolveConfig) -> Result<()> {
         reg_path.display()
     );
     for b in &reg.branches {
-        let corr = b
-            .eval_report
-            .get("correctness")
-            .copied()
-            .unwrap_or(f64::NAN);
+        let corr = b.eval_report.get("correctness").copied();
+        let corr_str = corr
+            .map(|c| format!("{c:.3}"))
+            .unwrap_or_else(|| "n/a".to_string());
         println!(
-            "  {:<20} base={:<24} domain={:<20} correctness={corr:.3}",
+            "  {:<20} base={:<24} domain={:<20} correctness={corr_str}",
             b.name, b.base_model, b.domain
         );
     }
+    emit_json(serde_json::json!({
+        "command": "branch-list",
+        "registry": reg_path.display().to_string(),
+        "branches": reg.branches.iter().map(|b| serde_json::json!({
+            "name": b.name,
+            "base_model": b.base_model,
+            "domain": b.domain,
+            // null (not NaN) when a branch carries no correctness metric (A7).
+            "correctness": b.eval_report.get("correctness").copied(),
+            "gguf_sha": b.gguf_sha,
+        })).collect::<Vec<_>>(),
+        "status": "ok",
+    }));
     Ok(())
 }
 
@@ -2126,7 +3602,12 @@ fn cmd_branch_register(
 
     let base_model = base
         .or(bcfg.base)
-        .or_else(|| cfg.evolve.model_path.as_ref().map(|p| p.to_string_lossy().into_owned()))
+        .or_else(|| {
+            cfg.evolve
+                .model_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+        })
         .unwrap_or_else(|| "unknown".to_string());
 
     let mut eval_report = std::collections::BTreeMap::new();
@@ -2190,7 +3671,9 @@ fn row_domain_text(row: &scrt_evolve::GenExample) -> String {
             query, positive, ..
         } => format!("{query} {positive}"),
         ToolCall { prompt, tool, .. } => format!("{prompt} {tool}"),
-        Cli { prompt, command, .. } => format!("{prompt} {command}"),
+        Cli {
+            prompt, command, ..
+        } => format!("{prompt} {command}"),
     }
 }
 
@@ -2203,12 +3686,28 @@ fn cmd_branch_route(cfg: &EvolveConfig, query: &str) -> Result<()> {
     let hits = router.resolve(query);
     if hits.is_empty() {
         println!("route: no branch matched {query:?} (base-only)");
+        emit_json(serde_json::json!({
+            "command": "branch-route",
+            "query": query,
+            "matches": [],
+            "resolved": serde_json::Value::Null,
+            "status": "base_only",
+        }));
         return Ok(());
     }
     println!("route: {} match(es) for {query:?}:", hits.len());
     for (r, score) in &hits {
         println!("  {:<20} domain={:<20} score={score:.3}", r.name, r.domain);
     }
+    emit_json(serde_json::json!({
+        "command": "branch-route",
+        "query": query,
+        "matches": hits.iter().map(|(r, score)| serde_json::json!({
+            "name": r.name, "domain": r.domain, "score": score,
+        })).collect::<Vec<_>>(),
+        "resolved": hits.first().map(|(r, _)| r.name.clone()),
+        "status": "ok",
+    }));
     Ok(())
 }
 
@@ -2313,6 +3812,12 @@ fn now_iso8601() -> String {
 fn cmd_export(cfg: &EvolveConfig, data: Option<PathBuf>, model: Option<PathBuf>) -> Result<()> {
     let wd = WorkDir::from_config(cfg);
     let data_path = data.unwrap_or_else(|| wd.dataset_jsonl());
+    if !data_path.exists() {
+        anyhow::bail!(
+            "export: dataset not found at {} — run `scrt-evolve generate` first",
+            data_path.display()
+        );
+    }
     let dataset = scrt_evolve::Dataset::read_jsonl(&data_path)
         .with_context(|| format!("reading dataset {}", data_path.display()))?;
     let model_gguf = model
@@ -2337,4 +3842,43 @@ fn cmd_export(cfg: &EvolveConfig, data: Option<PathBuf>, model: Option<PathBuf>)
         report.suggested_command
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with_python(p: Option<&str>) -> EvolveConfig {
+        EvolveConfig {
+            hardware: p.map(|p| scrt_evolve::HardwareConfig {
+                python: Some(p.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Interpreter resolution precedence (track 28): flag > $SCRT_EVOLVE_PYTHON >
+    /// [hardware].python > bare `python`. All assertions in one test so the env
+    /// var isn't raced by parallel tests.
+    #[test]
+    fn python_resolution_precedence() {
+        std::env::remove_var("SCRT_EVOLVE_PYTHON");
+        let cfg = cfg_with_python(Some("/cfg/python"));
+
+        // The --python flag wins over env + config.
+        std::env::set_var("SCRT_EVOLVE_PYTHON", "/env/python");
+        assert_eq!(
+            resolve_python(Some(&cfg), Some("/flag/python".to_string())),
+            "/flag/python"
+        );
+        // Env beats config when no flag.
+        assert_eq!(resolve_python(Some(&cfg), None), "/env/python");
+        // Config beats the default when no flag + no env.
+        std::env::remove_var("SCRT_EVOLVE_PYTHON");
+        assert_eq!(resolve_python(Some(&cfg), None), "/cfg/python");
+        // Bare `python` when nothing is set.
+        let bare = EvolveConfig::default();
+        assert_eq!(resolve_python(Some(&bare), None), "python");
+    }
 }

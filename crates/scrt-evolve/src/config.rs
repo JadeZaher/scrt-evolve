@@ -87,10 +87,62 @@ pub struct EvolveConfig {
     /// captured (topic ⇄ palace search, tag ⇄ palace tag). Additive + non-
     /// breaking: an absent/empty `goals` reproduces today's single-run
     /// behavior (styleguide §1). Goals drive the per-goal discover→generate
-    /// pipeline; eval-gated rounds + the scheduler are lane-gated (tracks
-    /// 10/15) and not yet wired.
+    /// pipeline; the eval-gated schedule across goals is shipped — run it with
+    /// `evolve --schedule` (rounds::run_schedule).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub goals: Vec<GoalConfig>,
+    /// `[daemon]` — the ambient continuous-evolution daemon (track 26). Turns
+    /// evolution into an always-on, VRAM-bounded background process fed by the
+    /// living activity queue, every step eval-gated through track 15. Absent ⇒
+    /// `daemon start` uses its flag/default values. Additive + non-breaking
+    /// (styleguide §1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon: Option<DaemonConfig>,
+    /// `[store]` — the bounded, config-driven model-weight VERSION store. A branch
+    /// keeps a small ring of versions (current + a few prior); each version is the
+    /// tiny adapter (the reverse trace) + optional GGUF (the deploy artifact) over
+    /// the shared immutable base. On a kept evolve round a new version is committed
+    /// and the ring is pruned to `keep_versions`; rollback repoints `current` to
+    /// its parent. Absent ⇒ no version store (today's single-adapter path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<StoreConfig>,
+}
+
+/// `[store]` — bounded model-weight version management (storage + loading).
+///
+/// The base model is immutable and shared; a "version" is just its adapter
+/// (kilobytes–megabytes) plus an optional exported GGUF. So a full rollback
+/// history of N versions costs almost nothing. `keep_versions` bounds the ring
+/// (default 2 = current + one prior); `deploy_to` is where the live GGUF is
+/// placed/swapped (e.g. an LM Studio models path).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreConfig {
+    /// Directory holding the version ring + `store.json` manifest. Absent ⇒
+    /// `<work_dir>/store`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
+    /// How many versions to retain (current + prior). Older versions are pruned
+    /// on commit. Minimum 1. Default 2.
+    #[serde(default = "default_keep_versions")]
+    pub keep_versions: usize,
+    /// Where to place/swap the live deployable GGUF on a kept commit (e.g. an LM
+    /// Studio models file). Absent ⇒ no auto-deploy (the GGUF stays in the ring).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy_to: Option<String>,
+}
+
+fn default_keep_versions() -> usize {
+    2
+}
+
+impl Default for StoreConfig {
+    fn default() -> Self {
+        Self {
+            dir: None,
+            keep_versions: default_keep_versions(),
+            deploy_to: None,
+        }
+    }
 }
 
 /// One learning-by-doing goal (`[[goals]]` in `evolve.toml`).
@@ -123,12 +175,12 @@ pub struct GoalConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_set: Option<PathBuf>,
     /// Optional scheduler weight (priority hint for round-robin vs weighted
-    /// scheduling). `None` ⇒ equal weight. Lane-gated (the scheduler is
-    /// slice 9).
+    /// scheduling). `None` ⇒ equal weight. Consumed by the shipped scheduler
+    /// (`evolve --schedule`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<f32>,
     /// Optional scheduler cadence hint (e.g. `"1h"`, `"daily"`). `None` ⇒
-    /// on-demand. Lane-gated (the scheduler is slice 9).
+    /// on-demand. Reserved hint for the scheduler (`evolve --schedule`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cadence: Option<String>,
     /// Per-goal constitution override/addition — values specific to this goal,
@@ -201,6 +253,16 @@ pub struct EvalConfig {
     /// (`probe build --holdout`). 0.0..=1.0.
     #[serde(default = "default_probe_holdout_frac")]
     pub probe_holdout_frac: f32,
+    /// REUSE a fixed probe across rounds instead of re-carving one from each
+    /// round's fresh dataset. This is what makes a multi-round branch evolve
+    /// gate REAL: candidate and the stored baseline are scored on the SAME exam,
+    /// so [`crate::eval::classify`] does genuine Accept/Regress/Catastrophic
+    /// (re-carving per round gives each round a different probe → not comparable).
+    /// First round carves once (none exists yet); later rounds load it and filter
+    /// the new dataset against it (the probe is never trained on). Default
+    /// `false` ⇒ the carve-each-round behavior (fine for one-shot `branch create`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stable_probe: bool,
     /// Which scorer backend to use: `api` (no ML deps — correctness +
     /// constitution only) | `transformers` (Python subprocess, real forward
     /// pass for perplexity/exit-depth) | `candle` (optional, `--features train`).
@@ -232,6 +294,7 @@ impl Default for EvalConfig {
         Self {
             probe_path: None,
             probe_holdout_frac: default_probe_holdout_frac(),
+            stable_probe: false,
             scorer_backend: default_scorer_backend(),
             judge: None,
             metrics: default_eval_metrics(),
@@ -305,6 +368,94 @@ impl RegulateConfig {
     }
 }
 
+/// `[daemon]` — the ambient continuous-evolution daemon (track 26). All fields
+/// have sane defaults; CLI flags (`--max-vram`, `--max-steps`) override at
+/// invocation. The daemon trains continuously but only when free VRAM ≥
+/// `max_vram_gb`, and every step goes through the track-15 transaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonConfig {
+    /// VRAM budget in GB: the daemon trains only when at least this much is FREE,
+    /// so it self-throttles around the user's foreground GPU use. `0` ⇒ ungated
+    /// (train whenever the queue is non-empty).
+    #[serde(default = "default_daemon_max_vram")]
+    pub max_vram_gb: f64,
+    /// Seconds to wait when throttled or the queue is idle, before re-checking.
+    #[serde(default = "default_daemon_poll")]
+    pub poll_interval_secs: u64,
+    /// Queued items folded into one microshard training step.
+    #[serde(default = "default_daemon_batch")]
+    pub batch: usize,
+    /// Microshard granularity (track 25). `module` is the per-submodule VRAM
+    /// floor — the default for the ambient daemon. `block` trains a layer-block.
+    #[serde(default = "default_daemon_granularity")]
+    pub granularity: String,
+    /// Eval cadence (reserved): v1 gates EVERY step for safety; a value > 1 is
+    /// accepted but does not yet skip evals (documented seam).
+    #[serde(default = "default_daemon_eval_cadence")]
+    pub eval_cadence: u64,
+    /// **Gentle background** (coexist with gaming/video): pause GPU training
+    /// whenever ANOTHER process is using the GPU, not just when VRAM is starved.
+    /// A compute-heavy app with low VRAM use still stutters under contention; this
+    /// yields the GPU to it entirely. Default `true`.
+    #[serde(default = "default_true")]
+    pub pause_on_gpu_process: bool,
+    /// When the GPU is unavailable (busy or VRAM-starved), fall back to a light
+    /// CPU training step instead of fully pausing — the "hybrid/adaptive" lane
+    /// (GPU when free, CPU when you're gaming, pause only if even the CPU is
+    /// loaded). `false` ⇒ pause (wait) instead. Default `true`.
+    #[serde(default = "default_true")]
+    pub cpu_fallback: bool,
+    /// Train ONE layer-block per step and ROTATE which block each step
+    /// (`shard_index = ordinal % rotation_blocks`), so peak VRAM stays at one
+    /// block while coverage spreads over time. `0` ⇒ no rotation (train the whole
+    /// model's adapters each step, today's behavior). Set to the student's layer
+    /// count (or fewer, larger blocks).
+    #[serde(default = "default_daemon_rotation_blocks")]
+    pub rotation_blocks: usize,
+    /// Seconds to sleep AFTER each executed step, capping GPU duty cycle so
+    /// foreground apps get idle gaps (no sustained contention). `0` ⇒ no cooldown.
+    #[serde(default = "default_daemon_cooldown")]
+    pub cooldown_secs: u64,
+}
+
+fn default_daemon_max_vram() -> f64 {
+    4.0
+}
+fn default_daemon_poll() -> u64 {
+    30
+}
+fn default_daemon_batch() -> usize {
+    1
+}
+fn default_daemon_granularity() -> String {
+    "module".to_string()
+}
+fn default_daemon_eval_cadence() -> u64 {
+    1
+}
+fn default_daemon_rotation_blocks() -> usize {
+    0
+}
+fn default_daemon_cooldown() -> u64 {
+    0
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            max_vram_gb: default_daemon_max_vram(),
+            poll_interval_secs: default_daemon_poll(),
+            batch: default_daemon_batch(),
+            granularity: default_daemon_granularity(),
+            eval_cadence: default_daemon_eval_cadence(),
+            pause_on_gpu_process: true,
+            cpu_fallback: true,
+            rotation_blocks: default_daemon_rotation_blocks(),
+            cooldown_secs: default_daemon_cooldown(),
+        }
+    }
+}
+
 /// `[hardware]` — the compute environment for the heavy ML subprocesses
 /// (track 24). Generic + architecture-level: nothing model-specific. Lets the
 /// pipeline reason about whether a given model can TRAIN here (e.g. a hybrid-SSM
@@ -333,6 +484,20 @@ pub struct HardwareConfig {
     /// hardware a benchmark run was actually executed on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
+    /// The Python interpreter that drives the heavy ML subprocesses (track 28
+    /// packaging binding). Point this at the venv where `scrt-evolve-ml` is
+    /// installed (`pip install scrt-evolve-ml[cuda]`). Resolution precedence is
+    /// `--python` flag > `$SCRT_EVOLVE_PYTHON` > this field > `python` on PATH.
+    /// `None` ⇒ bare `python`. The CLI runs `<python> -m scrt_evolve_*` against
+    /// the INSTALLED package; a repo checkout's `python/` dir is only a fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub python: Option<String>,
+    /// Optional shell command run to FREE the GPU before a training step (on a
+    /// single-GPU box the teacher and the trainer can't both hold VRAM). E.g.
+    /// `lms unload --all` to evict the LM Studio teacher after generation. Run
+    /// best-effort (failure is non-fatal). Absent ⇒ no-op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_gpu_command: Option<String>,
 }
 
 fn default_device() -> String {
@@ -347,6 +512,8 @@ impl Default for HardwareConfig {
             ram_gb: 0.0,
             kernels: Vec::new(),
             machine: None,
+            python: None,
+            free_gpu_command: None,
         }
     }
 }
@@ -567,6 +734,98 @@ pub struct TrainConfig {
     /// multi-node distributed). Absent ⇒ dense training. Additive (styleguide §1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fractional: Option<FractionalConfig>,
+    /// `[train.distill]` — cross-MODEL seam distillation: compress a DISTINCT,
+    /// larger teacher into the (smaller) student by matching the student's
+    /// per-block output to the teacher's hidden state at a mapped seam. Unlike
+    /// `[train.fractional]` (which distills a block against ITS OWN frozen
+    /// output — a regularization signal), this imparts the teacher's
+    /// representations into a genuinely smaller model. Runs two decoupled phases
+    /// (teacher pre-captures seam targets to disk → student trains against the
+    /// cache) so the two models are never co-resident. Absent ⇒ no distillation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distill: Option<DistillConfig>,
+}
+
+/// `[train.distill]` — cross-model seam (hidden-state) distillation.
+///
+/// Productizes the `bench/seam_distill` precursor: a larger TEACHER supervises a
+/// smaller STUDENT at layer/seam boundaries. The student's block output is
+/// matched (cosine+MSE) to the teacher's hidden state at the proportionally
+/// corresponding depth. Requires a SHARED tokenizer (hidden states are matched
+/// position-by-position). Pairs with `[train.fractional]` for the VRAM-bounded
+/// per-block streaming (`block_size` / `calib_batches`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DistillConfig {
+    /// Master switch. `false` ⇒ ignored even if present (toggle without deleting).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// The larger TEACHER model (path or HF id). REQUIRED to activate; absent ⇒
+    /// the mode no-ops (falls back to standard training).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teacher_model: Option<String>,
+    /// Teacher→student seam correspondence. `stride` (default — each student
+    /// block maps to the nearest teacher seam by uniform depth ratio) or
+    /// `block_avg` (average the teacher layers spanning the student block).
+    #[serde(default = "default_layer_map")]
+    pub layer_map: String,
+    /// Hidden-state distillation loss: `cosine_mse` (default — direction +
+    /// magnitude, robust across differing residual-stream scales), `mse`, or
+    /// `cosine`.
+    #[serde(default = "default_distill_loss")]
+    pub loss: String,
+    /// Width bridge when teacher/student hidden sizes differ: `auto` (default —
+    /// identity if equal, else lift student→teacher width), `none` (require equal
+    /// widths), or `student_up`. The projection is a distill-time scaffold,
+    /// discarded after training (only the LoRA is exported).
+    #[serde(default = "default_projection")]
+    pub projection: String,
+    /// Directory for the teacher seam cache (Phase A writes, Phase B reads).
+    /// Absent ⇒ `<adapter_out>/distill_cache`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teacher_cache: Option<String>,
+    /// Gradient-clipping max-norm for the student (caps spike steps that diverge a
+    /// block — the higher-magnitude deep seams are prone to this). `0` ⇒ off.
+    /// Default `1.0`.
+    #[serde(default = "default_grad_clip")]
+    pub grad_clip: f64,
+    /// LR adaptivity. `auto` (default): a DYNAMIC per-block learning rate computed
+    /// from each block's teacher-target magnitude (deep, large-magnitude blocks
+    /// get a gentler rate) PLUS a warmup→cosine-decay schedule within each block.
+    /// `fixed`: a constant `--lr` everywhere (the original behavior).
+    #[serde(default = "default_lr_mode")]
+    pub lr_mode: String,
+}
+
+fn default_grad_clip() -> f64 {
+    1.0
+}
+fn default_lr_mode() -> String {
+    "auto".to_string()
+}
+
+fn default_layer_map() -> String {
+    "stride".to_string()
+}
+fn default_distill_loss() -> String {
+    "cosine_mse".to_string()
+}
+fn default_projection() -> String {
+    "auto".to_string()
+}
+
+impl Default for DistillConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            teacher_model: None,
+            layer_map: default_layer_map(),
+            loss: default_distill_loss(),
+            projection: default_projection(),
+            teacher_cache: None,
+            grad_clip: default_grad_clip(),
+            lr_mode: default_lr_mode(),
+        }
+    }
 }
 
 /// `[train.fractional]` — fractional / sharded layer-block training.
@@ -590,6 +849,11 @@ pub struct FractionalConfig {
     /// `block_size` is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shards: Option<usize>,
+    /// Train ONLY this block index (0-based) and exit — for decentralized runs
+    /// (one process per shard) and for the ambient daemon's block ROTATION (train
+    /// a different block each step). Absent ⇒ all blocks in sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_index: Option<usize>,
     /// Token batches each block is distilled over (boundary activations are
     /// captured from these). More ⇒ a stronger local signal.
     #[serde(default = "default_calib_batches")]
@@ -627,6 +891,7 @@ impl Default for FractionalConfig {
             enabled: default_true(),
             block_size: None,
             shards: None,
+            shard_index: None,
             calib_batches: default_calib_batches(),
             granularity: default_granularity(),
             objective: default_objective(),
@@ -846,6 +1111,14 @@ pub struct BranchConfig {
     /// pass through to the train preset.
     #[serde(default = "default_branch_objective")]
     pub objective: String,
+    /// Branch construction mode. `standard` (default) trains the small `base` on
+    /// teacher-QA data (smaller-by-base). `distill` runs cross-MODEL seam
+    /// distillation: a DISTINCT larger teacher (`[train.distill].teacher_model`)
+    /// supervises this branch's smaller `base` at layer seams, producing a
+    /// genuinely compressed model. The weight-touching span still runs inside the
+    /// track-15 transaction (eval-gate → keep|rollback).
+    #[serde(default = "default_branch_mode")]
+    pub mode: String,
     /// Roster cap: at most `max_branches` live branches; registering past the cap
     /// merges near-duplicates / evicts per policy (no twins). Bounded fleet.
     #[serde(default = "default_max_branches")]
@@ -901,6 +1174,9 @@ pub struct BranchServeConfig {
 fn default_branch_objective() -> String {
     "end_task".to_string()
 }
+fn default_branch_mode() -> String {
+    "standard".to_string()
+}
 fn default_max_branches() -> usize {
     16
 }
@@ -926,6 +1202,7 @@ impl Default for BranchConfig {
             domain: None,
             corpus: None,
             objective: default_branch_objective(),
+            mode: default_branch_mode(),
             max_branches: default_max_branches(),
             router: None,
             ensemble: None,
@@ -951,7 +1228,6 @@ impl Default for BranchEnsembleConfig {
         }
     }
 }
-
 
 impl Default for SamplingConfig {
     fn default() -> Self {
@@ -1017,6 +1293,7 @@ impl Default for TrainConfig {
             shard: None,
             qat: None,
             fractional: None,
+            distill: None,
         }
     }
 }
@@ -1034,6 +1311,12 @@ pub struct LoraConfig {
     pub lr: f64,
     #[serde(default = "default_epochs")]
     pub epochs: usize,
+    /// CONTINUE training from an existing adapter dir (its `adapter.safetensors`
+    /// is loaded into the LoRA before training). The config-driven "further
+    /// training" path — a branch keeps evolving across rounds instead of
+    /// restarting from a fresh adapter. Absent ⇒ fresh adapter (today's behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init_adapter: Option<String>,
 }
 
 fn default_lora_rank() -> usize {
@@ -1060,6 +1343,7 @@ impl Default for LoraConfig {
             target_modules: default_lora_targets(),
             lr: default_lora_lr(),
             epochs: default_epochs(),
+            init_adapter: None,
         }
     }
 }
@@ -1192,6 +1476,13 @@ impl EvolveConfig {
         let cfg: EvolveConfig = toml::from_str(text)?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Serialize to a pretty TOML string — used to PERSIST a branch's
+    /// self-describing config (`branches/<name>/branch.toml`) so it can be
+    /// reloaded and re-run with no flags.
+    pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
+        toml::to_string_pretty(self)
     }
 
     /// Stage-independent validation. Stage-specific `model_path` requirements

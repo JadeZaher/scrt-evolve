@@ -587,3 +587,45 @@ fn valid_env_var_name_is_accepted() {
             .unwrap_or_else(|e| panic!("`{name}` should be a valid env var name, got {e:?}"));
     }
 }
+
+#[test]
+fn store_and_continue_knobs_round_trip() {
+    // The config-driven model-store + continue-training knobs parse, default,
+    // and round-trip; absent ⇒ today's behavior.
+    let toml = r#"
+[evolve]
+model_path = "/models/base"
+
+[train.lora]
+init_adapter = "/work/branches/x/store/v2/adapter"
+
+[hardware]
+free_gpu_command = "lms unload --all"
+
+[store]
+keep_versions = 3
+deploy_to = "/lmstudio/x.gguf"
+"#;
+    let cfg = EvolveConfig::from_toml_str(toml).unwrap();
+    let store = cfg.store.clone().expect("[store] parses");
+    assert_eq!(store.keep_versions, 3);
+    assert_eq!(store.deploy_to.as_deref(), Some("/lmstudio/x.gguf"));
+    assert!(store.dir.is_none(), "dir defaults to <work_dir>/store");
+    assert_eq!(
+        cfg.hardware.as_ref().unwrap().free_gpu_command.as_deref(),
+        Some("lms unload --all")
+    );
+    assert_eq!(
+        cfg.train
+            .as_ref()
+            .and_then(|t| t.lora.as_ref())
+            .and_then(|l| l.init_adapter.as_deref()),
+        Some("/work/branches/x/store/v2/adapter")
+    );
+
+    // Round-trips, and the keep_versions default is 2 when the table is bare.
+    let back = EvolveConfig::from_toml_str(&cfg.to_toml().unwrap()).unwrap();
+    assert_eq!(back.store.unwrap().keep_versions, 3);
+    let minimal = EvolveConfig::from_toml_str("[evolve]\nmodel_path=\"/m\"\n[store]\n").unwrap();
+    assert_eq!(minimal.store.unwrap().keep_versions, 2);
+}

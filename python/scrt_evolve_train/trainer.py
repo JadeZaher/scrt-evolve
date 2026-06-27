@@ -339,6 +339,41 @@ def build_batch(
 # Adapter save
 # ---------------------------------------------------------------------------
 
+def _resume_adapter_weights(model: nn.Module, adapter_dir: str, device: Any) -> None:
+    """Load an existing adapter's lora_A/lora_B weights into the model's already
+    -attached LoRALinear modules, so training CONTINUES from it. Mirrors the
+    naming contract in :func:`save_adapter` / ``scrt_evolve_infer.apply_adapter``.
+    Exits if the file is missing; warns (does not fail) on shape/target drift."""
+    from safetensors.torch import load_file
+
+    weights = Path(adapter_dir) / "adapter.safetensors"
+    if not weights.exists():
+        sys.exit(f"ERROR: --resume-adapter: {weights} not found")
+    state = load_file(str(weights))
+    mods = dict(model.named_modules())
+    loaded = 0
+    for key, tensor in state.items():
+        if not (key.endswith(".lora_A") or key.endswith(".lora_B")):
+            continue
+        mod_path, attr = key.rsplit(".", 1)
+        mod = mods.get(mod_path)
+        if not isinstance(mod, LoRALinear):
+            print(f"WARN: resume-adapter: no LoRALinear at '{mod_path}' — skipped", file=sys.stderr)
+            continue
+        param = getattr(mod, attr)
+        if tuple(param.shape) != tuple(tensor.shape):
+            print(
+                f"WARN: resume-adapter: shape mismatch at {key} "
+                f"({tuple(param.shape)} vs {tuple(tensor.shape)}) — skipped",
+                file=sys.stderr,
+            )
+            continue
+        with torch.no_grad():
+            param.copy_(tensor.to(param.device, param.dtype))
+        loaded += 1
+    print(f"INFO: resumed {loaded} adapter tensors from {adapter_dir}", file=sys.stderr)
+
+
 def save_adapter(
     model: nn.Module,
     out_dir: Path,
@@ -403,7 +438,18 @@ def train(args: Any) -> None:
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    print(f"INFO: loading model from {model_path}", file=sys.stderr)
+    # Resolve the accelerator. `--device auto` (default) uses CUDA when available
+    # else CPU; explicit `cuda`/`cpu` force it. The dense trainer historically ran
+    # CPU-only (it ignored --device) — honoring it here makes GPU training ~10x
+    # faster for small models that fit (TinyLlama-class). fp32 master weights are
+    # kept (LoRA needs them); the base in fp32 fits a small model on the GPU.
+    dev_spec = (getattr(args, "device", "auto") or "auto").strip()
+    if dev_spec in ("", "auto"):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(dev_spec)
+
+    print(f"INFO: loading model from {model_path} (device={device})", file=sys.stderr)
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=torch.float32,
@@ -411,6 +457,7 @@ def train(args: Any) -> None:
         local_files_only=True,
     )
     model.config.use_cache = False
+    model.to(device)
     model.train()
 
     # Resolve LoRA targets. `--target-modules auto` (or an empty value) triggers
@@ -442,6 +489,14 @@ def train(args: Any) -> None:
             "inspect the model's module names."
         )
     print(f"INFO: attached {n_adapters} LoRA adapters", file=sys.stderr)
+
+    # CONTINUE training from an existing adapter (config `[train.lora].init_adapter`
+    # / `--resume-adapter`). Loads its weights into the freshly-attached LoRALinears
+    # so a branch keeps evolving instead of restarting from scratch each round —
+    # the config-driven "further training" path (no merge/file-shuffling needed).
+    resume = getattr(args, "resume_adapter", None)
+    if resume:
+        _resume_adapter_weights(model, resume, device)
 
     # QAT setup (track 23): if --qat <quant> is set, configure every LoRALinear to
     # fake-quantize its effective weight during the forward pass. Optional
@@ -492,9 +547,9 @@ def train(args: Any) -> None:
 
         optimizer.zero_grad()
         outputs = model(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-            labels=batch["labels"],
+            input_ids=batch["input_ids"].to(device),
+            attention_mask=batch["attention_mask"].to(device),
+            labels=batch["labels"].to(device),
         )
         loss: torch.Tensor = outputs.loss
         loss.backward()
