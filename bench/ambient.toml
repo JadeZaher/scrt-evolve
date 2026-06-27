@@ -1,0 +1,64 @@
+# Ambient continuous-evolution daemon (track 26) — a gentle background loop that
+# further-trains the scrt-CLI expert on the LIVING QUEUE, eval-gated against the
+# scrt-cli probe. The queue is fed by REAL activity: every `scrt …` tool call in
+# the Claude Code transcripts (+ conductor docs), mined by `daemon ingest`.
+# It yields the GPU to foreground apps (gaming/video) — pause_on_gpu_process.
+#
+#   Feed:  scrt-evolve daemon ingest --config bench/ambient.toml --docs conductor
+#   Run:   scrt-evolve daemon start  --config bench/ambient.toml \
+#            --python C:/scrt-cuda-venv/Scripts/python.exe
+#   Stop:  scrt-evolve daemon stop   --config bench/ambient.toml
+
+[evolve]
+model_path = "C:/Users/atooz/.cache/huggingface/hub/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6"
+work_dir   = "C:/Users/atooz/Programming/ai-utils-memory/scrt-evolve/bench/work/ambient"
+
+[train]
+preset = "lora"
+  [train.lora]
+  rank = 16
+  alpha = 32
+  target_modules = ["q_proj", "v_proj"]
+  lr = 2e-4
+  epochs = 1
+  # Continue the scrt-cli expert AND compound across steps: setup seeds
+  # work_dir/adapter from the branch v1, then each step resumes our own adapter.
+  init_adapter = "C:/Users/atooz/Programming/ai-utils-memory/scrt-evolve/bench/work/ambient/adapter"
+
+[eval]
+scorer_backend = "transformers"             # real forward pass (no teacher needed)
+probe_path     = "C:/Users/atooz/Programming/ai-utils-memory/scrt-evolve/bench/work/scrt-cli-branch/branches/scrt-cli/probe.jsonl"
+stable_probe   = true
+metrics        = ["correctness"]
+
+# Only used by `daemon ingest --relevance` (the LLM relevance judge). The daemon's
+# own eval uses transformers above and needs no teacher. If LM Studio is down, the
+# judge degrades to keep-all; `--match` still bounds the candidate set.
+[generate]
+backend = "api"
+  [generate.api]
+  base_url = "http://localhost:1234/v1"
+  model    = "meta-llama-3-8b-instruct"
+  turns    = 1
+
+[regulate]
+# Every step is guarded: checkpoint → eval → keep | rollback. A tiny model on a
+# hard probe scores low legitimately, so the absolute catastrophe floor is 0
+# (only NaN = broken training halts); low/regressing scores roll back, not halt,
+# so the ambient loop keeps going. accept_tolerance absorbs eval noise.
+catastrophe_floor = 0.0
+accept_tolerance  = 0.05
+keep_checkpoints  = 2     # bound disk: keep only current + one rollback target
+
+[hardware]
+device = "cuda"
+python = "C:/scrt-cuda-venv/Scripts/python.exe"
+
+[daemon]
+max_vram_gb          = 2.0    # train only when >=2GB is FREE (self-throttle)
+batch                = 8      # queued items folded into one microshard step
+poll_interval_secs   = 20     # wait this long when throttled / queue idle
+pause_on_gpu_process = true   # yield the GPU the moment another process computes
+cpu_fallback         = true   # GPU busy/starved => light CPU step (keep going)
+rotation_blocks      = 0      # train the whole (tiny) LoRA adapter each step
+cooldown_secs        = 10     # idle gap after each step so foreground apps breathe

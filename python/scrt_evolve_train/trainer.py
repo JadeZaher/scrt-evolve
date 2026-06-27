@@ -209,8 +209,9 @@ def auto_detect_targets(
 
 def load_dataset(path: str) -> list[tuple[str, str]]:
     """
-    Read dataset.jsonl. Render qa and instruction rows to (prompt, completion)
-    pairs. Skip and count other kinds. Exits on fatal errors.
+    Read dataset.jsonl. Render qa/instruction/cli/tool_call/completion rows to
+    (prompt, completion) pairs; loss is on the completion only. Skip and count
+    unsupported kinds (contrastive). Exits on fatal errors.
     """
     dataset_path = Path(path)
     if not dataset_path.exists():
@@ -253,6 +254,33 @@ def load_dataset(path: str) -> list[tuple[str, str]]:
                 else:
                     prompt_text = instruction
                 pairs.append((prompt_text, output))
+            elif kind == "cli":
+                # CLI training: learn to emit the shell command for the intent.
+                prompt_text = row.get("prompt", "")
+                command = row.get("command", "")
+                if not prompt_text or not command:
+                    skipped += 1
+                    continue
+                pairs.append((prompt_text, command))
+            elif kind == "tool_call":
+                # Tool training: learn to emit the structured tool call.
+                prompt_text = row.get("prompt", "")
+                tool = row.get("tool", "")
+                if not prompt_text or not tool:
+                    skipped += 1
+                    continue
+                call = json.dumps(
+                    {"tool": tool, "arguments": row.get("arguments", {})},
+                    ensure_ascii=False,
+                )
+                pairs.append((prompt_text, call))
+            elif kind == "completion":
+                # Plain language-modeling text (no instruction prompt).
+                text = row.get("text", "")
+                if not text:
+                    skipped += 1
+                    continue
+                pairs.append(("", text))
             else:
                 skipped += 1
 
@@ -261,7 +289,7 @@ def load_dataset(path: str) -> list[tuple[str, str]]:
 
     if not pairs:
         sys.exit(
-            f"ERROR: no qa/instruction rows found in {path} "
+            f"ERROR: no trainable rows found in {path} "
             f"(total lines: {total}, skipped: {skipped})"
         )
 
@@ -449,15 +477,25 @@ def train(args: Any) -> None:
     else:
         device = torch.device(dev_spec)
 
-    print(f"INFO: loading model from {model_path} (device={device})", file=sys.stderr)
+    # bf16 on CUDA (halves weights+activations so dense LoRA SFT fits small GPUs);
+    # fp32 on CPU for numerical stability.
+    load_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    print(
+        f"INFO: loading model from {model_path} (device={device}, dtype={load_dtype})",
+        file=sys.stderr,
+    )
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        torch_dtype=torch.float32,
+        torch_dtype=load_dtype,
         low_cpu_mem_usage=True,
         local_files_only=True,
     )
     model.config.use_cache = False
     model.to(device)
+    if device.type == "cuda":
+        # Trade compute for activation memory — the rest of the headroom on 8GB.
+        model.gradient_checkpointing_enable()
+        model.enable_input_require_grads()  # required: base is frozen, only LoRA trains
     model.train()
 
     # Resolve LoRA targets. `--target-modules auto` (or an empty value) triggers

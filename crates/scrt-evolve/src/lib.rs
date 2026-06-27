@@ -29,6 +29,7 @@ pub mod export;
 pub mod generate;
 pub mod goals;
 pub mod harvest;
+pub mod ingest;
 pub mod interview;
 pub mod living_queue;
 pub mod model;
@@ -65,6 +66,10 @@ pub use eval::{ProbeSet, ScoreReport, StepVerdict};
 pub use export::{export_llamacpp, ExportReport, ToolFormat};
 pub use goals::{GoalRun, GoalsReport};
 pub use harvest::{capture_and_harvest, HarvestResult, TranscriptEntry};
+pub use ingest::{
+    doc_completion_rows, filter_relevant, interaction_log_rows, LlmRelevanceJudge, RelevanceJudge,
+    INGEST_GEN_STAMP,
+};
 pub use living_queue::{Lane, LivingQueue, QueuedItem};
 pub use model_store::{ModelStore, ModelVersion, ResolvedVersion, StoreManifest};
 pub use regulate::{CheckpointStore, Quarantine, Regulator, TxnOutcome};

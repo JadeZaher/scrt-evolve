@@ -641,6 +641,42 @@ enum DaemonCommand {
         #[arg(long)]
         drain: bool,
     },
+    /// Mine real agent ACTIVITY into the living queue's RAW lane (the passive-tail
+    /// feed) — GENERICALLY, across corpus types. Interaction logs (Claude Code
+    /// transcripts) distill into mixed rows: shell calls → `cli`, other tool calls
+    /// → `tool_call`, prose answers → `qa`; project docs (`--docs`) → `completion`.
+    /// With `--relevance`, an LLM judges which rows are worth keeping (no hardcoded
+    /// domain filter). Rows are deduped + stamped `gen=ingest` (quarantine key).
+    Ingest {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// A transcript dir to scan recursively for `*.jsonl` (repeatable).
+        /// Defaults to the Claude Code projects dir (`~/.claude/projects`).
+        #[arg(long = "from")]
+        from: Vec<PathBuf>,
+        /// A docs dir/file to chunk into `completion` rows (repeatable). `*.md`/`*.txt`.
+        #[arg(long = "docs")]
+        docs: Vec<PathBuf>,
+        /// LLM relevance criterion: keep only rows the chat endpoint
+        /// (`[generate.api]`) judges relevant to this free-text description (e.g.
+        /// "uses the scrt CLI"). Omit to keep all candidates.
+        #[arg(long)]
+        relevance: Option<String>,
+        /// Cheap substring pre-filter (repeatable, generic): before any LLM call,
+        /// skip transcript files + candidate rows containing none of these. A cost
+        /// bound for the relevance pass; not domain-specific.
+        #[arg(long = "match")]
+        match_: Vec<String>,
+        /// Cap total rows enqueued (0 = no cap).
+        #[arg(long, default_value_t = 0)]
+        max: usize,
+        /// Enqueue onto the PRIORITY lane (trusted, drains first) instead of RAW.
+        #[arg(long)]
+        priority: bool,
+        /// Report what WOULD be enqueued without writing to the queue.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Signal a running daemon to stop (drops the stop-file it polls each step).
     Stop {
         #[arg(long, default_value = "evolve.toml")]
@@ -977,6 +1013,19 @@ fn run() -> Result<()> {
             } => {
                 let cfg = EvolveConfig::load(&config)?;
                 cmd_daemon_start(&cfg, python, max_vram, max_steps, drain)
+            }
+            DaemonCommand::Ingest {
+                config,
+                from,
+                docs,
+                relevance,
+                match_,
+                max,
+                priority,
+                dry_run,
+            } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_daemon_ingest(&cfg, from, docs, relevance, match_, max, priority, dry_run)
             }
             DaemonCommand::Stop { config } => {
                 let cfg = EvolveConfig::load(&config)?;
@@ -2751,24 +2800,41 @@ fn probe_free_vram_gb() -> Option<f64> {
     Some(mb / 1024.0)
 }
 
-/// Probe whether ANOTHER process is using the GPU (gentle-background gate): list
-/// the GPU's compute apps and report `true` if any PID other than ours is present.
-/// `None` when `nvidia-smi` is unavailable (then the gate treats the GPU as free).
+/// Probe whether ANOTHER process is putting real load on the GPU (gentle-background
+/// gate). `None` when `nvidia-smi` is unavailable (then the gate treats the GPU as
+/// free). See [`gpu_busy_from_csv`] for the (testable) decision rule.
 fn probe_gpu_busy() -> Option<bool> {
     let out = std::process::Command::new("nvidia-smi")
-        .args(["--query-compute-apps=pid", "--format=csv,noheader,nounits"])
+        .args([
+            "--query-compute-apps=pid,used_memory",
+            "--format=csv,noheader,nounits",
+        ])
         .output()
         .ok()?;
     if !out.status.success() {
         return None;
     }
-    let me = std::process::id();
     let text = String::from_utf8_lossy(&out.stdout);
-    let others = text
-        .lines()
-        .filter_map(|l| l.trim().parse::<u32>().ok())
-        .any(|pid| pid != me);
-    Some(others)
+    Some(gpu_busy_from_csv(&text, std::process::id()))
+}
+
+/// Minimum GPU memory (MiB) a process must hold to count as real compute load;
+/// below this is desktop/graphics noise, not a training/inference job.
+const GPU_BUSY_MIB: f64 = 300.0;
+
+/// Pure: decide from `nvidia-smi --query-compute-apps=pid,used_memory` CSV whether
+/// ANOTHER process is loading the GPU. A row counts only if it holds ≥
+/// [`GPU_BUSY_MIB`] — **Windows/WDDM lists desktop graphics apps** (explorer,
+/// chrome, …) under compute-apps with no/`[N/A]` memory, which must NOT be treated
+/// as a GPU workload (else the gate would think the GPU is always busy and never
+/// train). Our own PID is excluded.
+fn gpu_busy_from_csv(csv: &str, me: u32) -> bool {
+    csv.lines().any(|line| {
+        let mut cols = line.split(',').map(str::trim);
+        let pid = cols.next().and_then(|s| s.parse::<u32>().ok());
+        let mem = cols.next().and_then(|s| s.parse::<f64>().ok()); // `[N/A]` → None
+        matches!((pid, mem), (Some(p), Some(m)) if p != me && m >= GPU_BUSY_MIB)
+    })
 }
 
 /// `daemon start` — run the ambient continuous-evolution loop (track 26).
@@ -2964,6 +3030,217 @@ fn cmd_daemon_status(cfg: &EvolveConfig) -> Result<()> {
         "status": "ok",
     }));
     Ok(())
+}
+
+/// `daemon ingest` — mine real agent activity into the living queue, GENERICALLY.
+/// Interaction logs → mixed `cli`/`tool_call`/`qa` rows; docs → `completion` rows.
+/// An optional `--match` substring set cheaply bounds the candidate set; an
+/// optional `--relevance` criterion runs an LLM judge to keep only worthwhile
+/// rows. The config-driven passive-tail feed (replaces ad-hoc munging scripts).
+#[allow(clippy::too_many_arguments)]
+fn cmd_daemon_ingest(
+    cfg: &EvolveConfig,
+    from: Vec<PathBuf>,
+    docs: Vec<PathBuf>,
+    relevance: Option<String>,
+    match_: Vec<String>,
+    max: usize,
+    priority: bool,
+    dry_run: bool,
+) -> Result<()> {
+    use scrt_evolve::{Lane, LivingQueue};
+
+    // Default transcript source: the Claude Code projects dir.
+    let from = if from.is_empty() {
+        vec![claude_projects_dir()?]
+    } else {
+        from
+    };
+
+    // Cheap, generic substring pre-filter (case-insensitive). Empty ⇒ keep all.
+    let needles: Vec<String> = match_.iter().map(|m| m.to_lowercase()).collect();
+
+    let mut rows: Vec<scrt_evolve::GenExample> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut files_scanned = 0usize;
+    let mut files_kept = 0usize;
+
+    // --- Interaction logs → mixed cli/tool_call/qa rows ---
+    for dir in &from {
+        for path in collect_files(dir, &["jsonl"]) {
+            files_scanned += 1;
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if !ingest_matches(&needles, &text) {
+                continue;
+            }
+            files_kept += 1;
+            for row in scrt_evolve::interaction_log_rows(&text) {
+                ingest_push(&mut rows, &mut seen, &needles, row);
+            }
+        }
+    }
+    let log_rows = rows.len();
+
+    // --- Docs → completion rows (<=20 chunks/file so one doc can't dominate) ---
+    for path in &docs {
+        let files = if path.is_dir() {
+            collect_files(path, &["md", "txt"])
+        } else {
+            vec![path.clone()]
+        };
+        for f in files {
+            let Ok(text) = std::fs::read_to_string(&f) else {
+                continue;
+            };
+            let label = f.to_string_lossy().to_string();
+            for row in scrt_evolve::doc_completion_rows(&text, &label, 20) {
+                ingest_push(&mut rows, &mut seen, &needles, row);
+            }
+        }
+    }
+    let doc_rows = rows.len() - log_rows;
+    let candidates = rows.len();
+
+    println!(
+        "ingest: scanned {files_scanned} log file(s) ({files_kept} matched) \
+         → {log_rows} interaction row(s) + {doc_rows} doc row(s) = {candidates} candidate(s)"
+    );
+
+    // --- Optional LLM relevance judge (generic, no domain hardcoding) ---
+    if let Some(criterion) = relevance.as_deref() {
+        match build_relevance_judge(cfg) {
+            Ok(judge) => {
+                let before = rows.len();
+                rows = scrt_evolve::filter_relevant(&judge, criterion, rows)?;
+                println!(
+                    "ingest: LLM judge kept {}/{before} row(s) relevant to: {criterion}",
+                    rows.len()
+                );
+            }
+            Err(e) => {
+                eprintln!("ingest: --relevance set but no usable chat endpoint ({e}); keeping all");
+            }
+        }
+    }
+
+    if max > 0 && rows.len() > max {
+        rows.truncate(max);
+    }
+
+    let lane = if priority { Lane::Priority } else { Lane::Raw };
+    let lane_name = if priority { "priority" } else { "raw" };
+
+    if dry_run {
+        println!(
+            "ingest: --dry-run, {} row(s) would enqueue to {lane_name}",
+            rows.len()
+        );
+        emit_json(serde_json::json!({
+            "command": "daemon-ingest",
+            "dry_run": true,
+            "candidates": candidates,
+            "rows": rows.len(),
+            "status": "ok",
+        }));
+        return Ok(());
+    }
+
+    let queue = LivingQueue::from_config(cfg)?;
+    let n = queue.enqueue_many(lane, &rows)?;
+    let (prio, raw) = queue.pending();
+    println!(
+        "ingest: enqueued {n} row(s) to {lane_name} lane (pending: priority={prio} raw={raw})"
+    );
+    emit_json(serde_json::json!({
+        "command": "daemon-ingest",
+        "lane": lane_name,
+        "candidates": candidates,
+        "enqueued": n,
+        "pending_priority": prio,
+        "pending_raw": raw,
+        "status": "ok",
+    }));
+    Ok(())
+}
+
+/// Build the LLM relevance judge from the config's chat endpoint (`[generate.api]`)
+/// — the same endpoint generate/eval use. Errors if no API endpoint is configured.
+fn build_relevance_judge(
+    cfg: &EvolveConfig,
+) -> Result<scrt_evolve::LlmRelevanceJudge<impl scrt_evolve::generate::api::ChatTransport>> {
+    use scrt_evolve::generate::api::ApiEndpoint;
+    let gcfg = cfg
+        .generate
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("relevance judge needs a [generate.api] block"))?;
+    let endpoint = ApiEndpoint::from_config(&gcfg)?;
+    Ok(scrt_evolve::LlmRelevanceJudge::new(
+        endpoint.into_transport(),
+        15,
+    ))
+}
+
+/// Case-insensitive substring gate. Empty needles ⇒ always true (no filter).
+fn ingest_matches(needles: &[String], text: &str) -> bool {
+    needles.is_empty() || {
+        let lower = text.to_lowercase();
+        needles.iter().any(|n| lower.contains(n))
+    }
+}
+
+/// Add a candidate row if it passes the substring gate and isn't a duplicate.
+fn ingest_push(
+    rows: &mut Vec<scrt_evolve::GenExample>,
+    seen: &mut std::collections::HashSet<String>,
+    needles: &[String],
+    row: scrt_evolve::GenExample,
+) {
+    let blob = serde_json::to_string(&row).unwrap_or_default();
+    if ingest_matches(needles, &blob) && seen.insert(blob) {
+        rows.push(row);
+    }
+}
+
+/// The Claude Code projects dir (`~/.claude/projects`). Home is `$USERPROFILE`
+/// (Windows) or `$HOME`.
+fn claude_projects_dir() -> Result<PathBuf> {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .ok_or_else(|| {
+            anyhow::anyhow!("ingest: no USERPROFILE/HOME to locate ~/.claude/projects")
+        })?;
+    Ok(PathBuf::from(home).join(".claude").join("projects"))
+}
+
+/// Recursively collect files under `root` whose extension is in `exts` (lowercased
+/// compare). Symlinks are not followed; unreadable dirs are skipped.
+fn collect_files(root: &std::path::Path, exts: &[&str]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                stack.push(path);
+            } else if ft.is_file() {
+                let matches = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| exts.iter().any(|x| x.eq_ignore_ascii_case(e)))
+                    .unwrap_or(false);
+                if matches {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// `teach` — enqueue an explicit prompt→completion onto the PRIORITY lane.
@@ -3856,6 +4133,27 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn gpu_busy_ignores_desktop_graphics_apps() {
+        // Windows/WDDM lists desktop apps under compute-apps with `[N/A]` memory
+        // (or tiny) — those must NOT count as a GPU workload, else the daemon's
+        // gentle gate would see the GPU as perpetually busy and never train.
+        let desktop = "1060, [N/A]\n4956, [N/A]\n7720, 12\n";
+        assert!(
+            !gpu_busy_from_csv(desktop, 999),
+            "desktop noise is not busy"
+        );
+
+        // A real job (≥300 MiB) on another PID IS busy …
+        let job = "4956, [N/A]\n31000, 5400\n";
+        assert!(gpu_busy_from_csv(job, 999));
+
+        // … but our OWN training process doesn't count as "another" workload.
+        assert!(!gpu_busy_from_csv("999, 5400\n", 999));
+        // No processes at all → free.
+        assert!(!gpu_busy_from_csv("", 999));
     }
 
     /// Interpreter resolution precedence (track 28): flag > $SCRT_EVOLVE_PYTHON >

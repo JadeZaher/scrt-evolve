@@ -98,7 +98,13 @@ One JSON object per line. The trainer processes two kinds:
 - `prompt_text` = `instruction` (+ `"\n\n" + input` if `input` is non-empty)
 - `completion_text` = `output`
 
-All other kinds (`completion`, `contrastive`, `tool_call`, `cli`, etc.) are **skipped**; the count is logged to stderr.
+### `cli` / `tool_call` / `completion`
+
+- `cli`: `prompt_text` = `prompt`, `completion_text` = `command` (learn to emit the shell command).
+- `tool_call`: `prompt_text` = `prompt`, `completion_text` = `{"tool":…,"arguments":…}` JSON (learn the structured call).
+- `completion`: `prompt_text` = `""`, `completion_text` = `text` (plain LM text).
+
+`contrastive` (and rows missing required fields) are **skipped**; the count is logged to stderr.
 
 ---
 

@@ -5,6 +5,15 @@ narrative, see [README.md](README.md); for status see
 [conductor/tracks.md](conductor/tracks.md). This file is the *verbs and
 contracts*.
 
+## Code commentary & docs convention
+
+**Prefer directory-level docs over long inline comment blocks.** Code carries
+terse one-line doc-comments (the "what"); module/cross-cutting rationale (the
+"why") lives in an `AGENTS.md` in that source directory (e.g.
+[crates/scrt-evolve/src/AGENTS.md](crates/scrt-evolve/src/AGENTS.md)). When you'd
+reach for a multi-paragraph `//!`/`///` block, add or extend that file's section
+and point to it. Keep inline comments for the non-obvious local line only.
+
 ## Ground truth (do not over-claim)
 
 - **Real ML is Python.** Training/inference/scoring/export run as **subprocesses**
