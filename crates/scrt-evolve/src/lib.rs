@@ -30,6 +30,7 @@ pub mod generate;
 pub mod goals;
 pub mod harvest;
 pub mod ingest;
+pub mod ingest_ledger;
 pub mod interview;
 pub mod living_queue;
 pub mod model;
@@ -41,6 +42,7 @@ pub mod rounds;
 pub mod scaffold;
 pub mod toolspec;
 pub mod train;
+pub mod trend;
 pub mod workdir;
 
 // The PyO3 bridge module only exists under `--features pyo3` (it needs Python
@@ -72,12 +74,16 @@ pub use ingest::{
     doc_completion_rows, filter_relevant, interaction_log_rows, LlmRelevanceJudge, RelevanceJudge,
     INGEST_GEN_STAMP,
 };
+pub use ingest_ledger::{content_hash, FilterOutcome, IngestLedger};
 pub use living_queue::{Lane, LivingQueue, QueuedItem};
 pub use model_store::{ModelStore, ModelVersion, ResolvedVersion, StoreManifest};
-pub use regulate::{CheckpointStore, Quarantine, Regulator, TxnOutcome};
+pub use regulate::{
+    CheckpointStore, EvolutionLogEntry, Quarantine, Regulator, StepAction, TxnOutcome,
+};
 pub use rounds::{
     run_round, run_schedule, RoundHooks, RoundReport, SchedulePolicy, ScheduleReport,
 };
+pub use trend::{from_log as trend_from_log, TrendPoint, TrendSummary};
 
 use std::path::PathBuf;
 

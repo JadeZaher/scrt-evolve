@@ -151,6 +151,34 @@ Compare base vs evolved on the held-out probe / the demo benchmark:
 & $PY demo/benchmark.py demo/baseline-static/dataset.jsonl bench/work/goals/scrt-cli-fluency/dataset.jsonl
 ```
 
+## Step 7 — Track 32: tune `min_train_pairs` + the judge gate (empirical)
+
+The min-QA-pairs floor and the judge gate both have a knob whose right value is
+empirical, not assertable. Procedure to find the floor:
+
+```powershell
+# Sweep min_train_pairs over a fixed corpus; after each run read the trend.
+foreach ($n in 1,2,4,8) {
+  # edit bench/ambient.toml -> [daemon].min_train_pairs = $n  (or copy per-N configs)
+  & $EVOLVE --ambient --dir bench            # let it run a bounded while, then stop
+  & $EVOLVE daemon stop   --config bench/ambient.toml
+  & $EVOLVE daemon trend  --config bench/ambient.toml   # record Δtotal / arrow
+  & $EVOLVE daemon health --config bench/ambient.toml   # record committed / last error
+}
+```
+
+Pick the **smallest** `N` whose `daemon trend` slope is non-negative and whose
+degradation-judge regress rate is bounded — that's "enough signal per step to not
+overfit" without starving the loop. Default is 4 (half a `batch=8`).
+
+For the **judge gate** (`[regulate].gate = "judge"`): turn it on, run the same
+loop, and compare the commit rate + `daemon trend` against the correctness gate.
+The judge gate should commit MORE steps (it accepts "no worse" instead of
+requiring "measurably better") while `trend` stays flat-or-up — that's the gate
+doing its job (progress without regression). If the judge endpoint is down, the
+gate degrades to accept-all (catastrophe floor still applies) — `doctor` flags a
+missing judge model first.
+
 ## Honest caveats
 - **CPU training is slow.** Granite-4.0-h-tiny on CPU + QAT fake-quant overhead
   means each round's train step is the bottleneck. Budget steps accordingly

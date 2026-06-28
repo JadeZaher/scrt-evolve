@@ -38,7 +38,10 @@ metrics        = ["correctness"]
 backend = "api"
   [generate.api]
   base_url = "http://localhost:1234/v1"
-  model    = "meta-llama-3-8b-instruct"
+  # Small, fast judge that leaves VRAM free for training coexistence. Must be a
+  # model LM Studio actually has loaded — `scrt-evolve doctor` preflights this
+  # (queries /v1/models). See track 31 Q1.
+  model    = "ibm/granite-4-h-tiny"
   turns    = 1
 
 [regulate]
@@ -49,6 +52,16 @@ backend = "api"
 catastrophe_floor = 0.0
 accept_tolerance  = 0.05
 keep_checkpoints  = 2     # bound disk: keep only current + one rollback target
+# --- track 32: the JUDGE gate (opt-in) ---
+# Flip to "judge" to accept a step UNLESS an LLM judge sees DEGRADATION (samples
+# base BEFORE vs base+adapter AFTER on the probe), instead of requiring the noisy
+# absolute correctness to rise. This is what lets a weak model make progress on
+# tiny QA-pair counts. The judge reuses [generate.api] unless degrade_judge is set.
+# gate              = "judge"
+# max_regressed_frac = 0.0    # 0 = ANY degraded probe item rolls the step back
+#   [regulate.degrade_judge]   # optional: a separate judge endpoint
+#   base_url = "http://localhost:1234/v1"
+#   model    = "ibm/granite-4-h-tiny"
 
 [hardware]
 device = "cuda"
@@ -66,6 +79,12 @@ cooldown_secs        = 10     # idle gap after each step so foreground apps brea
 seed_adapter = "C:/Users/atooz/Programming/ai-utils-memory/scrt-evolve/bench/work/scrt-cli-branch/branches/scrt-cli/store/v1/adapter"
 auto_ingest  = true           # when the queue runs low, mine fresh activity via [ingest]
 refill_below = 8              # refill when < one batch remains
+# --- track 32: min-QA-pairs floor ---
+# Don't train a step on fewer than this many pending rows — accumulate instead
+# (composes with the dedup ledger's idle-on-empty), so we never overfit on 1-2
+# rows. Default 4. Tune empirically: vary across {1,2,4,8}, watch `daemon trend`
+# slope + the judge regress rate, pick the smallest N whose trend isn't negative.
+min_train_pairs = 4
 
 # What the self-feed mines (LLM-judged). One command, no flags:
 #   scrt-evolve --ambient --dir bench    (if this file is bench/ambient.toml)

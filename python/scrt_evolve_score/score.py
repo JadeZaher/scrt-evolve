@@ -284,3 +284,56 @@ def score_probe(
         report["mean_exit_depth"] = sum(depth_vals) / len(depth_vals)
 
     return report
+
+
+def sample_ab(
+    model_path: str,
+    probe_path: str,
+    adapter_dir: str,
+    max_new_tokens: int = 64,
+) -> list[dict[str, str]]:
+    """True A/B sampling for the track-32 regression gate.
+
+    Generate, for every scorable probe prompt, the completion from the BASE model
+    (BEFORE) and from the BASE+ADAPTER model (AFTER). Returns a list of
+    ``{"prompt", "before", "after"}`` triples that the Rust degradation judge
+    scores ("did AFTER get worse than BEFORE?"). Greedy (temperature 0) so the
+    only difference between BEFORE and AFTER is the adapter, not sampling noise.
+
+    The model is loaded ONCE for the BEFORE pass and ONCE more for the AFTER pass
+    (a fresh load is the simplest way to guarantee a clean base for BEFORE; the
+    cost is two forward sweeps over a small probe — acceptable for a gate).
+    """
+    items = _load_probe(probe_path)
+    prompts = [p for it in items if (p := _probe_prompt(it)) is not None]
+    if not prompts:
+        return []
+
+    # BEFORE: base model only.
+    base, tok = load_base_model(model_path)
+    before = [
+        _safe_generate(base, tok, p, max_new_tokens) for p in prompts
+    ]
+    del base  # free before loading the adapter copy
+
+    # AFTER: base + the candidate adapter.
+    after_model, tok2 = load_base_model(model_path)
+    print(f"INFO: applying adapter from {adapter_dir}", file=sys.stderr)
+    apply_adapter(after_model, adapter_dir)
+    after = [
+        _safe_generate(after_model, tok2, p, max_new_tokens) for p in prompts
+    ]
+
+    return [
+        {"prompt": p, "before": b, "after": a}
+        for p, b, a in zip(prompts, before, after)
+    ]
+
+
+def _safe_generate(model, tokenizer, prompt: str, max_new_tokens: int) -> str:
+    """generate() that never aborts the A/B run; a failed item yields ""."""
+    try:
+        return generate(model, tokenizer, prompt, max_new_tokens=max_new_tokens, temperature=0.0)
+    except Exception as e:  # one bad item must not abort the sweep
+        print(f"WARN: A/B generation failed (empty completion): {e}", file=sys.stderr)
+        return ""

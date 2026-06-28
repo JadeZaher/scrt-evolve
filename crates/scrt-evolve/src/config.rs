@@ -358,6 +358,23 @@ pub struct RegulateConfig {
     /// values are accepted but treated as the default with a log.
     #[serde(default = "default_on_catastrophe")]
     pub on_catastrophe: String,
+    /// Track 32 — which accept/reject GATE policy drives a step:
+    /// - `"correctness"` (default, back-compat): accept unless the absolute probe
+    ///   correctness dropped beyond `accept_tolerance` ([`crate::eval::classify`]).
+    /// - `"judge"`: accept UNLESS an LLM judge detects DEGRADATION (sample BEFORE
+    ///   base vs AFTER base+adapter on the probe prompts), with correctness demoted
+    ///   to the catastrophe floor only ([`crate::eval::judge_verdict`]). Unblocks
+    ///   progression on tiny QA-pair counts where the absolute score is too noisy.
+    #[serde(default = "default_gate")]
+    pub gate: String,
+    /// `gate="judge"`: the LLM degradation-judge endpoint (OpenAI-compatible chat,
+    /// same shape as `[generate.api]`). Absent ⇒ reuse `[generate.api]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degrade_judge: Option<GenerateApiConfig>,
+    /// `gate="judge"`: the fraction of probe items that may regress and still
+    /// `accept`. `0.0` (default) ⇒ ANY degraded item rolls the step back.
+    #[serde(default = "default_max_regressed_frac")]
+    pub max_regressed_frac: f64,
 }
 
 fn default_true() -> bool {
@@ -375,6 +392,12 @@ fn default_keep_checkpoints() -> usize {
 fn default_on_catastrophe() -> String {
     "rollback_quarantine_halt".to_string()
 }
+fn default_gate() -> String {
+    "correctness".to_string()
+}
+fn default_max_regressed_frac() -> f64 {
+    0.0
+}
 
 impl Default for RegulateConfig {
     fn default() -> Self {
@@ -384,6 +407,9 @@ impl Default for RegulateConfig {
             catastrophe_floor: default_catastrophe_floor(),
             keep_checkpoints: default_keep_checkpoints(),
             on_catastrophe: default_on_catastrophe(),
+            gate: default_gate(),
+            degrade_judge: None,
+            max_regressed_frac: default_max_regressed_frac(),
         }
     }
 }
@@ -457,6 +483,31 @@ pub struct DaemonConfig {
     /// Refill threshold for `auto_ingest` (pending rows below which to re-ingest).
     #[serde(default = "default_daemon_refill_below")]
     pub refill_below: u64,
+    /// Track 31 Q2 — resilience. Retry a TRANSIENT step failure (subprocess
+    /// non-zero, OOM, endpoint blip — NOT a track-15 catastrophe) this many times
+    /// with exponential backoff before recording it as a failed-but-non-halting
+    /// step. `0` ⇒ no retry (fail the step immediately, old behavior).
+    #[serde(default = "default_daemon_max_retries")]
+    pub max_retries: u32,
+    /// Base backoff seconds between transient retries (doubles each attempt).
+    #[serde(default = "default_daemon_backoff")]
+    pub backoff_base_secs: u64,
+    /// Supervisor cap: stop the loop after this many CONSECUTIVE step failures
+    /// (each already exhausted its retries). `0` ⇒ never give up on this count.
+    #[serde(default = "default_daemon_max_consecutive_failures")]
+    pub max_consecutive_failures: u32,
+    /// Track 31 Q3 — wall-clock budget. Cap training to this many minutes per
+    /// rolling hour (the daemon `Wait`s once spent, like the VRAM gate). `0` ⇒
+    /// unlimited (old behavior).
+    #[serde(default)]
+    pub max_minutes_per_hour: u64,
+    /// Track 32 — minimum genuinely-new QA pairs to train on in one step. A popped
+    /// batch with fewer than this many rows is NOT trained — the rows stay queued
+    /// and the loop idles (composes with the Q5 ledger's idle-on-empty), so we
+    /// never overfit on 1–2 rows. `0` ⇒ no floor (train any non-empty batch). The
+    /// default is conservative; tune via the bench sweep (see track 32 spec).
+    #[serde(default = "default_daemon_min_train_pairs")]
+    pub min_train_pairs: usize,
 }
 
 fn default_daemon_max_vram() -> f64 {
@@ -483,6 +534,20 @@ fn default_daemon_cooldown() -> u64 {
 fn default_daemon_refill_below() -> u64 {
     1
 }
+fn default_daemon_max_retries() -> u32 {
+    3
+}
+fn default_daemon_backoff() -> u64 {
+    5
+}
+fn default_daemon_max_consecutive_failures() -> u32 {
+    5
+}
+fn default_daemon_min_train_pairs() -> usize {
+    // Conservative default: at least half a default micro-batch (batch=8) of
+    // genuinely-new signal before a step trains. Tune via the track-32 sweep.
+    4
+}
 
 impl Default for DaemonConfig {
     fn default() -> Self {
@@ -499,6 +564,11 @@ impl Default for DaemonConfig {
             seed_adapter: None,
             auto_ingest: false,
             refill_below: default_daemon_refill_below(),
+            max_retries: default_daemon_max_retries(),
+            backoff_base_secs: default_daemon_backoff(),
+            max_consecutive_failures: default_daemon_max_consecutive_failures(),
+            max_minutes_per_hour: 0,
+            min_train_pairs: default_daemon_min_train_pairs(),
         }
     }
 }

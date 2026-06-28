@@ -70,6 +70,13 @@ impl Regulator {
         &self.store
     }
 
+    /// The verdict tolerances this regulator enforces (the catastrophe floor +
+    /// correctness tolerance). Exposed so the track-32 judge gate can build a
+    /// `judge_verdict` closure that shares the same floor.
+    pub fn tolerances(&self) -> crate::eval::VerdictTolerances {
+        self.rcfg.tolerances()
+    }
+
     /// Load the current quarantine.
     pub fn quarantine(&self) -> anyhow::Result<Quarantine> {
         Quarantine::load(&self.quarantine_path)
@@ -108,6 +115,102 @@ impl Regulator {
         StepFn: FnOnce() -> anyhow::Result<Vec<String>>,
         ScoreFn: Fn() -> anyhow::Result<ScoreReport>,
     {
+        // Lenient: a step (train) error becomes a logged rollback (Ok), the
+        // historical contract the scheduler / branch-create rely on. Verdict =
+        // the correctness gate (`classify`).
+        let tol = self.rcfg.tolerances();
+        self.run_step_inner(
+            id,
+            step_kind,
+            ordinal,
+            step,
+            score,
+            |candidate| Ok(classify(baseline, candidate, &tol)?),
+            false,
+        )
+    }
+
+    /// Like [`run_step`](Self::run_step) but a STEP (train) error is restored +
+    /// logged and then **propagated as `Err`** instead of swallowed into a
+    /// rollback. The ambient daemon (track 31 Q2) uses this so a train-subprocess
+    /// failure flows through the same retry/supervisor path as a score failure.
+    /// The transactional guarantee is unchanged — the adapter is restored to the
+    /// pre-step snapshot before the error is returned.
+    pub fn run_step_strict<StepFn, ScoreFn>(
+        &self,
+        id: &str,
+        step_kind: &str,
+        ordinal: u64,
+        baseline: &ScoreReport,
+        step: StepFn,
+        score: ScoreFn,
+    ) -> anyhow::Result<TxnOutcome>
+    where
+        StepFn: FnOnce() -> anyhow::Result<Vec<String>>,
+        ScoreFn: Fn() -> anyhow::Result<ScoreReport>,
+    {
+        let tol = self.rcfg.tolerances();
+        self.run_step_inner(
+            id,
+            step_kind,
+            ordinal,
+            step,
+            score,
+            |candidate| Ok(classify(baseline, candidate, &tol)?),
+            true,
+        )
+    }
+
+    /// The track-32 JUDGE gate: like [`run_step_strict`](Self::run_step_strict)
+    /// (a step error propagates as `Err`), but the accept/reject decision comes
+    /// from `decide` — an injected closure that, given the candidate's
+    /// `ScoreReport`, returns the verdict. The daemon passes a closure that runs
+    /// the A/B degradation sampler + [`crate::eval::LlmDegradationJudge`] and maps
+    /// the result via [`crate::eval::judge_verdict`]. The transactional
+    /// snapshot/commit/rollback/quarantine/log/halt machinery is identical to the
+    /// correctness path — only the verdict source differs.
+    #[allow(clippy::too_many_arguments)] // mirrors the run_step family's public shape
+    pub fn run_step_judged<StepFn, ScoreFn, DecideFn>(
+        &self,
+        id: &str,
+        step_kind: &str,
+        ordinal: u64,
+        baseline: &ScoreReport,
+        step: StepFn,
+        score: ScoreFn,
+        decide: DecideFn,
+    ) -> anyhow::Result<TxnOutcome>
+    where
+        StepFn: FnOnce() -> anyhow::Result<Vec<String>>,
+        ScoreFn: Fn() -> anyhow::Result<ScoreReport>,
+        DecideFn: Fn(&ScoreReport) -> anyhow::Result<StepVerdict>,
+    {
+        let _ = baseline; // the verdict comes from `decide`, which captures it
+        self.run_step_inner(id, step_kind, ordinal, step, score, decide, true)
+    }
+
+    /// Shared transactional body. `propagate_step_error` selects whether a step
+    /// (train) error is swallowed into a rollback (`false`, lenient) or returned
+    /// as `Err` after restore+log (`true`, strict). Either way the adapter is
+    /// restored to the pre-step state — the transaction is never violated.
+    /// `decide` computes the verdict from the candidate's score (the correctness
+    /// gate or the track-32 judge gate).
+    #[allow(clippy::too_many_arguments)]
+    fn run_step_inner<StepFn, ScoreFn, DecideFn>(
+        &self,
+        id: &str,
+        step_kind: &str,
+        ordinal: u64,
+        step: StepFn,
+        score: ScoreFn,
+        decide: DecideFn,
+        propagate_step_error: bool,
+    ) -> anyhow::Result<TxnOutcome>
+    where
+        StepFn: FnOnce() -> anyhow::Result<Vec<String>>,
+        ScoreFn: Fn() -> anyhow::Result<ScoreReport>,
+        DecideFn: Fn(&ScoreReport) -> anyhow::Result<StepVerdict>,
+    {
         let parent_id = self.store.last_good();
         let adapter = self.adapter_dir();
 
@@ -126,7 +229,9 @@ impl Regulator {
         let provenance = match step() {
             Ok(p) => p,
             Err(e) => {
-                // Step itself failed: restore the pre-snapshot, log, no verdict.
+                // Step itself failed: restore the pre-snapshot + log (no verdict).
+                // The transaction guarantee holds in BOTH modes — the only
+                // difference is whether we then return Ok(Rollback) or Err.
                 self.store.restore_adapter(&pre_snapshot_id, &adapter)?;
                 let entry = EvolutionLogEntry {
                     step: ordinal,
@@ -138,6 +243,9 @@ impl Regulator {
                     cause: Some(format!("step error: {e}")),
                 };
                 log::append(&self.log_path, &entry)?;
+                if propagate_step_error {
+                    return Err(e);
+                }
                 return Ok(TxnOutcome {
                     checkpoint_id: id.to_string(),
                     verdict: None,
@@ -158,9 +266,14 @@ impl Regulator {
             provenance.clone(),
         )?;
 
-        // (4) Score the candidate + classify.
+        // (4) Score the candidate + decide the verdict. The verdict policy is
+        // injected (`decide`): the correctness gate uses `classify`; the track-32
+        // JUDGE gate uses `judge_verdict` over an A/B degradation report. Either
+        // way `score()` still runs so the ScoreReport (correctness/trend) is
+        // recorded — under the judge gate it's the catastrophe backstop, not the
+        // accept driver.
         let candidate = score()?;
-        let verdict = classify(baseline, &candidate, &self.rcfg.tolerances())?;
+        let verdict = decide(&candidate)?;
 
         // (5) Act on the verdict.
         let (action, halt) = match verdict {

@@ -105,6 +105,41 @@ pub fn classify(
     Ok(StepVerdict::Accept)
 }
 
+/// The track-32 JUDGE gate verdict: degradation is primary, correctness is
+/// demoted to catastrophe-only. Pure.
+///
+/// Rules (in order):
+/// 1. `candidate_correctness` is NaN (training blew up) ⇒ `Catastrophic`.
+/// 2. correctness is a hard COLLAPSE below `catastrophe_floor` (only when the
+///    baseline was actually covered — an uncovered first version has no floor to
+///    collapse against, mirroring [`classify`] rule 0) ⇒ `Catastrophic`.
+/// 3. the judge's regressed fraction > `max_regressed_frac` ⇒ `Regress`.
+/// 4. otherwise ⇒ `Accept` — "no degradation detected", the permissive default
+///    that lets a weak model make progress on tiny data.
+///
+/// `regressed_fraction` comes from [`super::DegradationReport::regressed_fraction`]
+/// (0.0 ⇒ nothing judged / nothing worse ⇒ accept). The correctness check exists
+/// ONLY as the collapse backstop; it never drives accept/reject on its own here.
+pub fn judge_verdict(
+    baseline: &ScoreReport,
+    candidate_correctness: f64,
+    regressed_fraction: f64,
+    tol: &VerdictTolerances,
+    max_regressed_frac: f64,
+) -> StepVerdict {
+    if candidate_correctness.is_nan() {
+        return StepVerdict::Catastrophic;
+    }
+    // Collapse is only meaningful against a covered baseline (rule 0 parity).
+    if baseline.n > 0 && candidate_correctness < tol.catastrophe_floor {
+        return StepVerdict::Catastrophic;
+    }
+    if regressed_fraction > max_regressed_frac {
+        return StepVerdict::Regress;
+    }
+    StepVerdict::Accept
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,6 +226,68 @@ mod tests {
         nan.correctness = f64::NAN;
         assert_eq!(
             classify(&baseline, &nan, &tol).unwrap(),
+            StepVerdict::Catastrophic
+        );
+    }
+
+    // ───────────────── Track 32: judge_verdict (degradation gate) ─────────────────
+
+    #[test]
+    fn judge_accepts_when_no_degradation_even_if_correctness_low() {
+        // The whole point: a low absolute correctness (0.30) does NOT block the
+        // step under the judge gate — only degradation does.
+        let tol = VerdictTolerances::default();
+        let baseline = report(0.40, "probe-vA");
+        assert_eq!(
+            judge_verdict(&baseline, 0.30, 0.0, &tol, 0.0),
+            StepVerdict::Accept
+        );
+    }
+
+    #[test]
+    fn judge_regresses_when_degradation_exceeds_threshold() {
+        let tol = VerdictTolerances::default();
+        let baseline = report(0.40, "probe-vA");
+        // 20% of items got worse, threshold 0.0 ⇒ regress.
+        assert_eq!(
+            judge_verdict(&baseline, 0.40, 0.2, &tol, 0.0),
+            StepVerdict::Regress
+        );
+        // Same degradation tolerated when the threshold allows it.
+        assert_eq!(
+            judge_verdict(&baseline, 0.40, 0.2, &tol, 0.25),
+            StepVerdict::Accept
+        );
+    }
+
+    #[test]
+    fn judge_catastrophe_on_nan_and_collapse() {
+        let tol = VerdictTolerances::default();
+        let baseline = report(0.40, "probe-vA");
+        // NaN always catastrophic, regardless of the judge.
+        assert_eq!(
+            judge_verdict(&baseline, f64::NAN, 0.0, &tol, 0.0),
+            StepVerdict::Catastrophic
+        );
+        // Hard collapse below the floor is still catastrophic under the judge gate.
+        assert_eq!(
+            judge_verdict(&baseline, 0.05, 0.0, &tol, 0.0),
+            StepVerdict::Catastrophic
+        );
+    }
+
+    #[test]
+    fn judge_uncovered_baseline_has_no_collapse_floor() {
+        // First version (uncovered baseline): a low score is NOT a collapse (no
+        // reference), so only NaN or actual degradation can block it.
+        let tol = VerdictTolerances::default();
+        let baseline = ScoreReport::uncovered("probe-none", "baseline");
+        assert_eq!(
+            judge_verdict(&baseline, 0.05, 0.0, &tol, 0.0),
+            StepVerdict::Accept
+        );
+        assert_eq!(
+            judge_verdict(&baseline, f64::NAN, 0.0, &tol, 0.0),
             StepVerdict::Catastrophic
         );
     }

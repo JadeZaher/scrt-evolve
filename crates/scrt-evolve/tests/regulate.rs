@@ -248,6 +248,35 @@ fn step_error_rolls_back_without_verdict() {
 }
 
 #[test]
+fn strict_step_error_propagates_but_still_rolls_back() {
+    // run_step_strict (track 31 Q2): a train crash is restored to the pre-step
+    // state (the txn guarantee is unchanged) AND returned as Err so the daemon's
+    // retry/supervisor path can handle it — unlike the lenient run_step above.
+    let (work, cfg) = temp_cfg("steperr-strict");
+    write_adapter(&work, "BASE");
+    let reg = Regulator::new(&cfg).unwrap();
+
+    let result = reg.run_step_strict(
+        "step-1",
+        "train",
+        1,
+        &report(0.80, "v1"),
+        || {
+            write_adapter(&work, "PARTIAL");
+            anyhow::bail!("simulated trainer crash")
+        },
+        || Ok(report(0.9, "v1")),
+    );
+
+    assert!(result.is_err(), "strict mode propagates the step error");
+    assert_eq!(
+        adapter_marker(&work),
+        "BASE",
+        "the adapter is still rolled back to the pre-step state"
+    );
+}
+
+#[test]
 fn evolution_log_records_actions() {
     let (work, cfg) = temp_cfg("log");
     write_adapter(&work, "BASE");

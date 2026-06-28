@@ -15,7 +15,7 @@ import argparse
 import json
 import sys
 
-from scrt_evolve_score.score import score_probe
+from scrt_evolve_score.score import sample_ab, score_probe
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -32,11 +32,36 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Max tokens to generate per correctness probe (default 64).")
     p.add_argument("--metrics", default="correctness,perplexity,mean_exit_depth",
                    help="Comma-separated metrics to compute.")
+    # Track 32: A/B sampling mode for the LLM-judge regression gate. Emits
+    # [{prompt, before, after}] (base vs base+adapter) instead of a ScoreReport.
+    p.add_argument("--ab", action="store_true",
+                   help="A/B mode: emit (prompt, before, after) triples for the "
+                        "regression gate (requires --adapter).")
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    if args.ab:
+        if not args.adapter:
+            print("ERROR: --ab requires --adapter (the candidate to compare vs base)",
+                  file=sys.stderr)
+            return 1
+        try:
+            triples = sample_ab(
+                model_path=args.model,
+                probe_path=args.probe,
+                adapter_dir=args.adapter,
+                max_new_tokens=args.max_new_tokens,
+            )
+        except Exception as e:
+            print(f"ERROR: A/B sampling failed: {e}", file=sys.stderr)
+            return 1
+        # Final stdout line: the JSON triples array (parsed by the Rust gate).
+        print(json.dumps(triples))
+        return 0
+
     metrics = [m.strip() for m in args.metrics.split(",") if m.strip()]
     try:
         report = score_probe(

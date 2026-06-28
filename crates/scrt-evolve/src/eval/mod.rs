@@ -17,6 +17,7 @@
 //! probe + verdict all compile with no candle and no Python; the heavy forward
 //! pass is an external subprocess.
 
+pub mod degrade;
 pub mod gate;
 pub mod probe;
 pub mod score;
@@ -27,10 +28,11 @@ use std::path::{Path, PathBuf};
 use crate::config::{EvalConfig, EvolveConfig};
 use crate::generate::api::ApiEndpoint;
 
+pub use degrade::{DegradationJudge, DegradationReport, DegradationTriple, LlmDegradationJudge};
 pub use gate::{ExecutableGate, GateFailure, GateVerdict};
 pub use probe::ProbeSet;
 pub use score::{ApiScorer, ScoreReport, Scorer};
-pub use verdict::{classify, StepVerdict, VerdictError, VerdictTolerances};
+pub use verdict::{classify, judge_verdict, StepVerdict, VerdictError, VerdictTolerances};
 
 /// Resolve the probe path for a config: explicit `[evolve.eval].probe_path`, or
 /// `work_dir/probe.jsonl` by default.
