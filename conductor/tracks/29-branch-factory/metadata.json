@@ -1,0 +1,8 @@
+{
+  "id": "29-branch-factory",
+  "type": "feature",
+  "status": "completed",
+  "description": "First-class branch op: turn a base model + corpus into a standalone domain branch, routed per-request.",
+  "created_at": "2026-06-26T07:20:14-06:00",
+  "updated_at": "2026-06-26T22:41:16-06:00"
+}

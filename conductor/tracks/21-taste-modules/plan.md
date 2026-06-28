@@ -1,3 +1,12 @@
+---
+type: Implementation Plan
+title: Taste — Cross-Goal Metacognitive Style Distillation
+description: Implementation plan for the Taste — Cross-Goal Metacognitive Style Distillation track.
+tags: [track-21, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Taste — Cross-Goal Metacognitive Style Distillation — Plan
 
 Build in slices. Slices 1–5 are buildable NOW on shipped tracks (01 discover +

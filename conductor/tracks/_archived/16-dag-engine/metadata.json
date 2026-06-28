@@ -1,0 +1,8 @@
+{
+  "id": "16-dag-engine",
+  "type": "feature",
+  "status": "pending",
+  "description": "Re-express the pipeline as a typed DAG with a node registry and executor.",
+  "created_at": "2026-06-19T05:10:41-06:00",
+  "updated_at": "2026-06-19T05:10:41-06:00"
+}

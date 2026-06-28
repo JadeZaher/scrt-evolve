@@ -50,6 +50,63 @@ scrt does the retrieval; scrt-evolve does the generation + training.
 
 ---
 
+## Amendment 2026-06-28 — Scope lock: daemon + branch factory; self-evolve/architecture lanes archived
+
+**Status:** Direction-of-record. This amendment narrows the design's scope to
+what shipped and *archives* the speculative top of the original spine. The body
+of this document below is retained as the historical design record; where it
+describes the self-evolve lane (tracks 11–14), the architecture/SDK lane (tracks
+16–18), or non-LoRA training presets (05/06/07), read it through this amendment.
+
+### What the product actually is
+
+The shipped, goal-meeting product is a **config-driven self-evolving daemon +
+standalone Branch-Train-Merge branch factory**:
+- a single `evolve.toml` substrate (`[discover]`/`[generate]`/`[train]`/`[eval]`/
+  `[regulate]`/`[daemon]`/`[ingest]`/`[branch]`/… — every block `Option`,
+  partial-config friendly) drives the whole pipeline;
+- the ambient daemon trains a LoRA adapter over an immutable base on a project's
+  living corpus, eval-gated every step through the track-15 transaction;
+- `branch create` composes the shipped stages into standalone BTM expert LMs
+  with per-request routing; the decentralized Merge fabric is a cross-repo
+  contract to hivemind, not in this repo.
+
+### Archived (moved to `conductor/tracks/_archived/`, 2026-06-28)
+
+A source-level audit confirmed these tracks **never shipped a module**; they are
+archived as superseded or speculative, not roadmap:
+- **In-model self-evolve lane (11–14)** — regen-antagonist, constitutional
+  dialectic, attribution-mask, MoLE expert-router. The product grows capability
+  via *standalone* BTM branches (29), not in-model adapter-experts + a router.
+- **Architecture / SDK lane (16–18)** — typed-DAG engine, self-distill artifact
+  library, typestate SDK builder. The config-driven daemon already *is* the
+  substrate; a self-architecting DAG/SDK framework is the **lexame** vision the
+  project did not pursue.
+- **Non-LoRA / distributed presets (05/06/07)** — contrastive/full/pretrain/
+  distributed-shard. Orthogonal to the LoRA-adapter product; the VRAM goal of
+  `shard` is met by shipped fractional/microshard training (track 25).
+- **Meta-objects (22)** — superseded by the shipped constitution/taste steering.
+
+### The steering substrate the archived lanes wanted — already ships
+
+Constitution + taste as prompt-constants that drive generation, regeneration,
+and judging are **live**: `[evolve].constitution`/`taste` (+ per-`[[goals]]`
+overrides) are composed by `EvolveConfig::compose_steering()` into the
+generation `custom_prompt` seam. No DAG/SDK lane is needed to host them.
+
+### What remains
+
+The product is shipped and meets its goal. Open items, in priority order:
+(1) the **live ambient GPU run** (track 26) — a validation gap, not code;
+(2) **publish + release** (track 08) — a `scrt-core` git-dep → crates.io swap,
+externally blocked; (3) **new generation modalities** (track 09, optional) —
+skill-ingestion + reasoning-edit rows, the one kept dynamic-pipeline improvement.
+Posture: **harden, don't expand.** The candle `train`/`local` feature is now
+vestigial (fixture-only, LoRA-only). See `conductor/tracks.md` §What actually
+remains and `conductor/RETRO.md`.
+
+---
+
 ## Amendment 2026-06-20 — Python-first training (validated)
 
 **Status:** End-to-end validation complete. The direction-of-record reflects this amendment.

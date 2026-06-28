@@ -1,3 +1,10 @@
+---
+type: Track Index
+title: scrt-evolve — Tracks
+description: "The spine: index and build status of all scrt-evolve tracks."
+timestamp: 2026-06-28T00:00:00Z
+---
+
 # scrt-evolve — Tracks (the spine)
 
 This is the comprehensive spine of `/new-track`s implementing
@@ -18,28 +25,58 @@ section wins.
 | **Shipped (code + tests)** | 00 config · 01 discover · 02 generate-api · 03 generate-local *(candle fixture)* · 04 train-lora *(candle fixture)* · 10 eval-harness · 15 self-regulation · 19 python-train/infer/score/gguf *(the REAL ML path)* · 20 learning-by-doing *(goals + `evolve --schedule`)* · 27 config-driven export · 29 branch-factory | The runnable core chain (discover→generate→train→eval→export), the transactional homeostasis layer, the multi-goal eval-gated scheduler, and the BTM **branch factory** — all green, all tested. |
 | **Shipped (bench/training lane)** | 21 taste · 23 quantized-base/QAT · 24 benchmarks · 25 fractional/microshard | Config + Python features used + verified by the bench (`bench/RUNBOOK.md`); GPU-validated on Granite/TinyLlama. Lighter test coverage than the core lane. |
 | **Shipped (ambient + packaging)** | 26 ambient-daemon *(machinery + tests; live GPU run deferred)* · 28 packaging *(pyproject + interpreter binding + doctor + PORTABILITY)* | 26: the two-lane living queue + VRAM-gated daemon loop, every step through the track-15 txn, `daemon start/stop/status` + `teach`, all tested ML-free (the live Granite/WSL run is the only deferred piece). 28: `scrt-evolve-ml` pyproject (cpu/cuda extras + console scripts), the `--python > $SCRT_EVOLVE_PYTHON > [hardware].python` resolver preferring the installed package, `doctor` (torch/cuda/mamba/deps), `PORTABILITY.md`. |
-| **Partial** | 22 meta-objects *(config field only, no module)* | Scaffolding present; not a finished feature. |
-| **Roadmap — NOT built (spec/stub only)** | 05 contrastive · 06 full/pretrain · 07 shard · 08 extract-publish · 09 modalities · 11 regen-antagonist · 12 constitutional · 13 attribution-mask · 14 expert-spawn-router · 16 dag-engine · 17 arch-self-distill · 18 sdk-builder | Designed (specs + plans exist) but no shipped modules. The advanced self-evolve lane (11–14), the architecture/SDK lane (16–18), and several train presets (05–07) are the remaining roadmap. |
+| **Shipped (ambient hardening)** | 31 ambient-daemon-hardening *(code + tests, 2026-06-28; live-verified)* | Production-robustness for the track-26 daemon: judge-model preflight (Q1 — `/v1/models` check in `doctor` + `--ambient`; `bench/ambient.toml` repointed to `ibm/granite-4-h-tiny`), content-hash **dedup ledger** + idle-on-empty (Q5), transient-vs-catastrophe **retries** + supervisor cap + `daemon health` + per-source gen stamps (Q2), wall-clock **training budget** (Q3), probe-correctness **trend** in `daemon status/health/trend` (Q4). All ML-free + tested; track-15 transaction untouched. Live `doctor`/`health`/`trend` verified against the running daemon (the running process must restart to pick up the new binary). |
+| **Shipped (regression gate)** | 32 regression-gate *(code + tests, 2026-06-28)* | Unblock progression on tiny QA-pair counts: an **LLM-judge no-degradation gate** (`[regulate].gate = "judge"`: sample base BEFORE vs base+adapter AFTER on the probe prompts via `scrt_evolve_score --ab` → accept UNLESS the judge sees degradation; correctness demoted to catastrophe-only) + a **min-QA-pairs floor** (`[daemon].min_train_pairs`, default 4: skip+accumulate below N, composes with track-31 Q5 idle). `eval/degrade.rs` judge mirrors `LlmRelevanceJudge` (`ChatTransport`-injected, errs toward accept); `regulate::run_step_judged` injects the verdict; true A/B forward pass in the Python subprocess. Track-15 catastrophe/quarantine/halt untouched; correctness still computed for the Q4 trend. Opt-in (default = correctness gate). Empirical min-N tuned via the bench sweep (RUNBOOK §7). | 31, 26, 15, 10, 19 |
+| **Roadmap — live (unbuilt but product-aligned)** | 08 extract-publish · 09 modalities | The only unbuilt tracks kept as roadmap. **09** (skill-ingestion + reasoning-edit generation modalities) is the one genuine *dynamic-pipeline* improvement — additive rows that flow through the shipped planner→generate→dataset→export self-routing, enriching the daemon's curriculum. **08** (swap the scrt-core git dep → published crate + cut a release) is trivial but externally blocked on scrt-core hitting crates.io. |
+| **Archived (unbuilt; superseded or speculative)** | 05 contrastive · 06 full/pretrain · 07 shard · 11 regen-antagonist · 12 constitutional · 13 attribution-mask · 14 expert-spawn-router · 16 dag-engine · 17 arch-self-distill · 18 sdk-builder · 22 meta-objects | **Moved to [`tracks/_archived/`](tracks/_archived/) 2026-06-28.** Three groups, all confirmed-unbuilt by source audit: (a) **non-LoRA / distributed presets** 05/06/07 — orthogonal to the LoRA-adapter product; 07 superseded by fractional training (25) + out-of-repo hivemind merge; (b) the **speculative lexame vision** — in-model self-evolve lane 11–14 + self-architecting DAG/SDK lane 16–18, which the standalone-BTM-branch-factory product does not need; (c) **22 meta-objects**, superseded by the shipped `compose_steering()` constitution/taste seam (21). Dir numbers preserved (no renumbering); gaps in the live spine point here. See `_archived/README.md`. |
 
 **The real ML path is Python/transformers** (track 19), NOT candle — candle `train`/`local` are
 fixtures (can't load real pretrained models; see the 2026-06-20 amendment below). Live proof: a
 TinyLlama→scrt-CLI **branch** was trained on the RTX 4060, exported to a 667 MB Q4_K_M GGUF, and
 served end-to-end (track 29 §Live validation).
 
+## What actually remains (audited 2026-06-28)
+
+After the 2026-06-28 archive sweep, the product (config-driven self-evolving
+daemon + standalone BTM branch factory) is **shipped and meets its goal**. A
+source-level audit of every unbuilt track found almost nothing left to *finish* —
+the remainder is one validation gap, one external-blocked release, and one
+optional capability:
+
+1. **Live ambient GPU run (26)** — the *only* genuine completion item. The
+   daemon's machinery is shipped + tested ML-free; what's deferred is the live
+   Granite/WSL end-to-end validation run on real hardware. This is verification,
+   not code.
+2. **Publish + release (08)** — swap `scrt-core` from the git dep to the
+   published crate and cut a tagged release. Trivial mechanically, but blocked
+   on scrt-core being published to crates.io (an external dependency).
+3. **New modalities (09)** — the one unbuilt *feature* worth keeping: skill-
+   ingestion + reasoning-edit generation rows that make the daemon's curriculum
+   more dynamic. Additive, flows through the shipped self-routing pipeline.
+
+Everything else unbuilt was **archived** (see the status table) as superseded or
+speculative. The recommended posture now is **harden, don't expand**: the
+candle `train` feature is vestigial (fixture-only, LoRA-only — a cleanup
+candidate), and no further training presets or self-architecting machinery serve
+the product.
+
 ## Dependency graph
 
 ```
 00 ─► 01 ─► 02 ─► 03                 (discover → API gen → local gen)
         │     │
-        │     ├────► 04 ─► 06        (LoRA → full+pretrain)
-        │     │        │
-        │     │        └────► 07     (shard — reuses hivemind topology)
-        │     ├────► 05              (contrastive — port of in-tree seam; parallel to 04)
-        │     └────► 09              (new modalities — skill ingestion + reasoning edit)
-        └────────────────────► 08    (extract/publish — last)
+        │     ├────► 04              (LoRA — the shipped product preset)
+        │     │        ⋯  [04 ─► 06 full/pretrain, ─► 05 contrastive, ─► 07 shard: ARCHIVED]
+        │     └────► 09              (new modalities — skill ingestion + reasoning edit) [live roadmap]
+        └────────────────────► 08    (extract/publish — last) [live roadmap, ext-blocked]
 
 Self-evolve lane (the product goal — locally tune ONE model that evolves with a
 user's goals across ALL their projects, MERGED into one model, on-demand):
+[ARCHIVED 2026-06-28 — tracks 11–14 below are unbuilt + archived to
+`tracks/_archived/`. The shipped product is the standalone BTM branch factory
+(29) + config-driven daemon, NOT this in-model self-evolve lane. The diagram is
+kept as historical design intent; track 10 (eval) + 15 (regulate) DID ship and
+remain live above.]
 
   10  eval-harness  ── FOUNDATION: ProbeSet + Scorer + StepVerdict + the shared
       │                executable gate. Built FIRST; 11/12/15 consume it (the
@@ -76,6 +113,12 @@ auto-evolve THROUGH track 15's transactional wrapper.
 
 Architecture lane (turns the project into a generic, self-architecting
 training/model-building framework):
+[ARCHIVED 2026-06-28 — tracks 16–18 are unbuilt + archived to
+`tracks/_archived/`. The config-driven daemon + branch factory are the product;
+a self-architecting DAG/SDK framework is the speculative lexame vision the
+project did not pursue. The constitution/taste steering substrate it would have
+hosted already ships as `[evolve].constitution`/`taste` composed via
+`compose_steering()`. Diagram kept as historical design intent.]
   16  dag-engine : EVERY step above becomes a typed Node; a run is a validated
       │            (acyclic, typed-ports) `Dag` serialized to dag.json. The
       │            current linear run() becomes ONE generated canonical DAG.
@@ -133,22 +176,23 @@ self-evolve lane (10–15: transformers/peft/trl drive the heavy ML workflows).
 | **04** | [train-lora](tracks/04-train-lora/) | 5 | `TrainingPreset` trait, model loader (`model.rs` per-arch seam, ONE arch first), LoRA injection + training loop → `adapter.safetensors`. **PyO3 training-step seam** so `peft`/`trl` can drive it. | 02 (data), 03 (model loader shared) |
 | **19** | [python-train-infer](tracks/19-python-train-infer/) | — (core validation) | Standalone Python `scrt_evolve_train` (transformers LoRA) + `scrt_evolve_infer` (base+adapter A/B), driven from the Rust CLI via subprocess. The **PRIMARY real-model training/inference path** (candle = fixture). dataset.jsonl is the contract. | 02 (dataset), 03/04 (candle fixture it validates) |
 | **20** | [learning-by-doing](tracks/20-learning-by-doing/) | — (product capstone) | **Incremental multi-goal LEARNING-BY-DOING evolution**: `[[goals]]` (name/topic/tag) in `evolve.toml`; a paired **`scrt-evolve` SKILL** steers a frontier agent to stash goal-tagged findings as it works → the palace + transcripts become the curriculum. Per-goal eval-gated rounds (discover→generate→train→eval→keep\|rollback via track 15), generation-improves-itself (track 11 flywheel), and a bounded **scheduler** across goals. Orchestration over shipped tracks — no new ML. Makes the DESIGN daemon buildable + safe. | 01 (palace-search), 02, 19 (train), 10 (eval), 15 (txn), 11 (regen) |
-| **05** | [train-contrastive](tracks/05-train-contrastive/) | 6 | Port the in-tree InfoNCE embedding-adapter seam → `contrastive` preset (consumes palace structure directly). | 04 (trait), 01 (palace access) |
-| **06** | [train-full-pretrain](tracks/06-train-full-pretrain/) | 7 | `full` finetune + `pretrain` (continued causal-LM on raw corpus) presets. | 04 |
-| **07** | [train-shard](tracks/07-train-shard/) | 8 | Decentralized `shard` preset (coordinator + worker) reusing the **hivemind tensor wire format + coordinator/worker topology** via the PyO3 bridge. Small trusted cluster only. | 06, 04 |
+| **05** | [train-contrastive](tracks/_archived/05-train-contrastive/) | 6 | Port the in-tree InfoNCE embedding-adapter seam → `contrastive` preset (consumes palace structure directly). | 04 (trait), 01 (palace access) |
+| **06** | [train-full-pretrain](tracks/_archived/06-train-full-pretrain/) | 7 | `full` finetune + `pretrain` (continued causal-LM on raw corpus) presets. | 04 |
+| **07** | [train-shard](tracks/_archived/07-train-shard/) | 8 | Decentralized `shard` preset (coordinator + worker) reusing the **hivemind tensor wire format + coordinator/worker topology** via the PyO3 bridge. Small trusted cluster only. | 06, 04 |
 | **09** | [modalities-skill-reasoning](tracks/09-modalities-skill-reasoning/) | — (new) | New generation modalities: **skill ingestion** (`SkillIngestion` rows — absorb a SKILL.md into callable behavior) + **reasoning-step modification** (`ReasoningEdit` rows — insert/correct/prune/reorder CoT). Flows through the existing planner→generate→dataset→export pipeline. | 02 (gen/dataset) |
 | **10** | [eval-harness](tracks/10-eval-harness/) | — (lane foundation) | **Shared** `ProbeSet` + `Scorer` (`ScoreReport`) + `StepVerdict` + the executable `gate.rs`. Scoring backends: `api` (no ML), **`pyo3`→`transformers`** (perplexity/exit-depth), `candle` (optional). Built FIRST so 11/12/15 stop assuming an evaluator nobody built. | 02 (`ApiEndpoint`), 00 (`pyo3`) |
-| **11** | [regen-antagonist](tracks/11-regen-antagonist/) | — (new) | `RegenAntagonist` GenBackend (model's own refreshed checkpoint, hot-swapped via `refresh()`) + depth-first **early-exit cheapness** training (the "topology shift", a loss not a graph search) + self-distilled grounding nodes. Consumes track 10's gate + `Scorer`. Depth-cheapen via **PyO3→transformers**. Optional `larql` `TRACE` sidecar for measurement. CLI-first. | 10 (gate+scorer), 04, 03 |
-| **12** | [self-refine-constitutional](tracks/12-self-refine-constitutional/) | — (new) | Constitutional **sequential dialectic** (thesis → metacognition → Jungian shadow antithesis → synthesis) vs authored-base + mined-overlay `constitution.toml`. Emits `refined` (SFT) + `preference` (DPO) rows; DPO via **PyO3→`trl`**. `max_revisions`=1 default. No human labeling. The cross-project outcome signal. | 10 (gate+scorer), 11 (thesis), 04, 01 (merged corpus) |
-| **13** | [attribution-training-mask](tracks/13-attribution-training-mask/) | — (new) | **Tier-1, all-paths** `TrainingMask` (which layers/modules to update → faster training) + the single reusable `AttributionReport`. Selectors: `full` (default), `grad` (no-LARQL fallback), `attribution` (`larql`), `manual`. Mask honored via **PyO3→`peft`** target-module freezing. NOT distributed sharding (that's 07). `full()` = current behavior. | 04 (composes with 06/11/12/14) |
-| **14** | [expert-spawn-router](tracks/14-expert-spawn-router/) | — (new) | **Grow-on-demand adapter-experts**: path-detector clusters recurring paths; **consumes track 13's `AttributionReport`** as an `ExpertBlueprint` (no duplicate attribution pass); each path → a **PyO3→`peft`** LoRA expert + registry; a native-Rust **router** dispatches top-k. Base stays dense; router → no-op when off. ≈MoLE, NOT FFN-MoE/carve. | 13 (attribution), 04 (LoRA), 01 (clustering) |
+| **11** | [regen-antagonist](tracks/_archived/11-regen-antagonist/) | — (new) | `RegenAntagonist` GenBackend (model's own refreshed checkpoint, hot-swapped via `refresh()`) + depth-first **early-exit cheapness** training (the "topology shift", a loss not a graph search) + self-distilled grounding nodes. Consumes track 10's gate + `Scorer`. Depth-cheapen via **PyO3→transformers**. Optional `larql` `TRACE` sidecar for measurement. CLI-first. | 10 (gate+scorer), 04, 03 |
+| **12** | [self-refine-constitutional](tracks/_archived/12-self-refine-constitutional/) | — (new) | Constitutional **sequential dialectic** (thesis → metacognition → Jungian shadow antithesis → synthesis) vs authored-base + mined-overlay `constitution.toml`. Emits `refined` (SFT) + `preference` (DPO) rows; DPO via **PyO3→`trl`**. `max_revisions`=1 default. No human labeling. The cross-project outcome signal. | 10 (gate+scorer), 11 (thesis), 04, 01 (merged corpus) |
+| **13** | [attribution-training-mask](tracks/_archived/13-attribution-training-mask/) | — (new) | **Tier-1, all-paths** `TrainingMask` (which layers/modules to update → faster training) + the single reusable `AttributionReport`. Selectors: `full` (default), `grad` (no-LARQL fallback), `attribution` (`larql`), `manual`. Mask honored via **PyO3→`peft`** target-module freezing. NOT distributed sharding (that's 07). `full()` = current behavior. | 04 (composes with 06/11/12/14) |
+| **14** | [expert-spawn-router](tracks/_archived/14-expert-spawn-router/) | — (new) | **Grow-on-demand adapter-experts**: path-detector clusters recurring paths; **consumes track 13's `AttributionReport`** as an `ExpertBlueprint` (no duplicate attribution pass); each path → a **PyO3→`peft`** LoRA expert + registry; a native-Rust **router** dispatches top-k. Base stays dense; router → no-op when off. ≈MoLE, NOT FFN-MoE/carve. | 13 (attribution), 04 (LoRA), 01 (clustering) |
 | **15** | [self-regulation](tracks/15-self-regulation/) | — (capstone) | **Homeostasis**: transactional evolution (checkpoint → evaluate via **track 10** → keep\|rollback); **self-pruning** (auto expert eviction/merge native-Rust + gated base sparsity via **PyO3→torch**); catastrophe → **auto-rollback + quarantine by `gen`-provenance + halt**. Makes the daemon safe. | 10 (eval), 11, 12, 13, 14 |
-| **16** | [dag-engine](tracks/16-dag-engine/) | — (arch) | **Typed DAG substrate**: every step becomes a registered `Node` with typed input/output ports; a run is a build-time-validated (acyclic, types match) `Dag` serialized to `dag.json`, executed by a topo scheduler with content-addressed artifact caching. Existing `run()` becomes one canonical generated DAG (wrap, don't rewrite). No ML. | 01, plan/, 02, 10 (+ wraps 11–15 as they land) |
-| **18** | [sdk-builder-interface](tracks/18-sdk-builder-interface/) | — (SDK surface) | **THE primary SDK interface**: a trait-powered builder, designed-then-`.execute()`d. **Capability traits** select exposed step sets / tag types / formats / training tooling (`CoreEvolve`/`SelfEvolve`/`Distill`/`Peft`/`Trl`/`Gemma`…); unavailable steps are COMPILE errors (typestate). Steps are **two-phase callbacks** (`resolve_args`→`execute`) — the phase boundary is the **sandbox seam** (`Args: Serialize`; OS isolation later). Lowers to the track-16 serializable DAG (persists). CLI = thin shim. | 16 (lowers to), 15 (wraps exec), re-exposes 01/02/04/10–17 |
-| **17** | [architecture-self-distill](tracks/17-architecture-self-distill/) | — (arch capstone) | **QA→planner→DAG factory** (intent.json → validated `DagSpec` + reproducible `evolve.toml`) + **artifact distillation** (ARTIFACT-FIRST: generate `DagSpec` FILES, run them, keep winners in a reusable `arch/library/`; **selection-first** — reuse a proven artifact when one fits, generate only on a miss). Weight-touching trials go THROUGH track 15 (pass→keep+library, regress→rollback+discard). No live mutation, no model-arch synthesis. Rails: typed-DAG-only, transactional, bounded. | 16, 15, 10, interview/plan |
+| **16** | [dag-engine](tracks/_archived/16-dag-engine/) | — (arch) | **Typed DAG substrate**: every step becomes a registered `Node` with typed input/output ports; a run is a build-time-validated (acyclic, types match) `Dag` serialized to `dag.json`, executed by a topo scheduler with content-addressed artifact caching. Existing `run()` becomes one canonical generated DAG (wrap, don't rewrite). No ML. | 01, plan/, 02, 10 (+ wraps 11–15 as they land) |
+| **18** | [sdk-builder-interface](tracks/_archived/18-sdk-builder-interface/) | — (SDK surface) | **THE primary SDK interface**: a trait-powered builder, designed-then-`.execute()`d. **Capability traits** select exposed step sets / tag types / formats / training tooling (`CoreEvolve`/`SelfEvolve`/`Distill`/`Peft`/`Trl`/`Gemma`…); unavailable steps are COMPILE errors (typestate). Steps are **two-phase callbacks** (`resolve_args`→`execute`) — the phase boundary is the **sandbox seam** (`Args: Serialize`; OS isolation later). Lowers to the track-16 serializable DAG (persists). CLI = thin shim. | 16 (lowers to), 15 (wraps exec), re-exposes 01/02/04/10–17 |
+| **17** | [architecture-self-distill](tracks/_archived/17-architecture-self-distill/) | — (arch capstone) | **QA→planner→DAG factory** (intent.json → validated `DagSpec` + reproducible `evolve.toml`) + **artifact distillation** (ARTIFACT-FIRST: generate `DagSpec` FILES, run them, keep winners in a reusable `arch/library/`; **selection-first** — reuse a proven artifact when one fits, generate only on a miss). Weight-touching trials go THROUGH track 15 (pass→keep+library, regress→rollback+discard). No live mutation, no model-arch synthesis. Rails: typed-DAG-only, transactional, bounded. | 16, 15, 10, interview/plan |
 | **29** | [branch-factory](tracks/29-branch-factory/) | — (product / BTM lane) | **Branch-Train-Merge factory**: `branch create` turns a (small) base [+ selected corpus] into a standalone domain-specialized **smaller** model (a BTM Expert LM, arXiv 2208.03306) via shipped discover→teacher-QA→train(`end_task`)→eval→export, gated by **track 15**; writes **manifest + `branches/registry.json`**; a native-Rust **`BranchRouter`** resolves requests **per-request** to branches (`branch create`/`list`/`register`/`route`/`serve`, `serve --branches`; `register` admits an externally-built GGUF). **Live-validated 2026-06-26**: TinyLlama-1.1B→scrt-CLI branch trained on the RTX 4060 (decomposed native+WSL run; see track plan). Sibling to 14 (standalone branches vs MoLE adapter-experts; reuses its clustering/registry/router/merge patterns). Manifest/registry/`BranchRouter` are the **cross-repo contract** feeding the **hivemind** P2P **Merge** fabric (`SCRT-EVOLVE-INTEGRATION.md`). Compose-first (no new ML); smaller-by-base in v1 (teacher→smaller-student later, precursor `bench/seam_distill`). | 01,02,19,10,15,27 (+14 patterns) |
 | **08** | [extract-publish](tracks/08-extract-publish/) | 9 | Swap scrt git dep → published crate; retire/re-export in-tree crate; cut first release. | all |
 | **30** | [closeout](tracks/30-closeout/) | — (capstone) | **Closeout & polish**: finish the live branch (functional proof), prune `tracks.md` to an authoritative status map, per-lane **retros** (`RETRO.md`), test+architecture audit (readability pass), a strong **README** + **AGENTS.md** + completed-work doc, and a **DevUX/AIUX** critical review (`UX-REVIEW.md`) with the high-value fixes applied. No new product ML; consolidate/audit/document/refine the shipped lane to a finished, legible state. The only open build work (26 ambient, 28 packaging) is the named roadmap. | 00–25, 27, 29 |
+| **31** | [ambient-daemon-hardening](tracks/31-ambient-daemon-hardening/) | — (hardening) | **Production-robustness for the track-26 daemon** (surfaced by a real living-corpus run; findings folded into this track's spec + `RETRO.md`, the originating handoff retired). Five additive seams: **Q1** judge-model preflight (`/v1/models` check; warn in `--ambient`, fail in `doctor`); **Q5** content-hash **dedup ledger** so re-mined-but-identical rows don't re-train, idle-on-nothing-new (TOP correctness risk); **Q2** transient-vs-catastrophe **retries** + `daemon health` + supervisor cap + per-source gen stamps; **Q3** wall-clock **training budget**; **Q4** **probe-correctness trend**. Track-15 keep\|rollback semantics untouched; ML-free per styleguide §1. | 26, 15, 10 |
 
 ## Phase gates (from DESIGN.md)
 - After **00**: compiles, `config` tested, PyO3 stub builds with `--features pyo3`.
@@ -158,6 +202,7 @@ self-evolve lane (10–15: transformers/peft/trl drive the heavy ML workflows).
 - After **07**: shard run produces merged weights across ≥2 local worker processes.
 - After **09**: `SkillIngestion` + `ReasoningEdit` rows generate, round-trip, and export (Gemma-native); planner can target both modalities.
 - After **10**: `probe build` carves a zero-overlap held-out set; `api`-backend `Scorer` produces correctness + constitution_adherence with no ML deps; `StepVerdict` classifies accept/regress/catastrophic; `--features pyo3` computes perplexity/exit-depth via `transformers`; probe-version mismatch refused.
+- _Gates for **11–14** and **16–18** below are **ARCHIVED** (unbuilt; `tracks/_archived/`). Kept as the original acceptance criteria should any be revived._
 - After **11**: regen loop runs ≥2 swaps; mean exit depth decreases while held-out correctness (via track 10 `Scorer`) holds; gate-failing antagonist samples never enter the dataset; rows stamp `gen=regen:swap<N>`; `--features larql` builds and is removable.
 - After **12**: dialectic emits all four stages; `refined`/`preference` rows round-trip without breaking existing rows; overlay cannot override base constitution; gate-failing synthesis never becomes a `refined` row; `max_revisions` defaults to 1; DPO margin increases on a fixture (PyO3→`trl`).
 - After **13**: a `grad`/`manual` mask freezes a measurable param fraction with NO LARQL; masked training touches only in-mask modules (via PyO3→`peft`); `full()` reproduces current behavior; a reusable `AttributionReport` is emitted; `training-mask.json` reports frozen_fraction.

@@ -1,3 +1,12 @@
+---
+type: Implementation Plan
+title: Evaluation Harness — Probe Set + Scorer
+description: Implementation plan for the Evaluation Harness — Probe Set + Scorer track.
+tags: [track-10, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Evaluation Harness — Probe Set + Scorer (shared) — Plan
 
 ## Tasks

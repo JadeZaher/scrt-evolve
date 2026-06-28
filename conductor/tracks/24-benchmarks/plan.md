@@ -1,3 +1,12 @@
+---
+type: Implementation Plan
+title: Benchmark (Granite eval-gated evolution)
+description: Implementation plan for the Benchmark (Granite eval-gated evolution) track.
+tags: [track-24, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Track 24 — Benchmark (Granite eval-gated evolution) — Plan
 
 ## Tasks

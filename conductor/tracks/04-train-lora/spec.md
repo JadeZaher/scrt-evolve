@@ -1,3 +1,12 @@
+---
+type: Track Spec
+title: Train / LoRA
+description: The TrainingPreset trait and the LoRA preset — the primary training path (DESIGN.md phase 5).
+tags: [track-04, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Train / LoRA — Specification
 
 ## Goal

@@ -1,3 +1,12 @@
+---
+type: Implementation Plan
+title: Python train/infer (transformers LoRA + inference)
+description: Implementation plan for the Python train/infer (transformers LoRA + inference) track.
+tags: [track-19, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Track 19 — Python train/infer — Plan
 
 ## Overview

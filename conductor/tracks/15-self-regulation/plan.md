@@ -1,3 +1,12 @@
+---
+type: Implementation Plan
+title: Self-Regulation — Prune, Evaluate, Rollback, Quarantine
+description: Implementation plan for the Self-Regulation — Prune, Evaluate, Rollback, Quarantine track.
+tags: [track-15, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Self-Regulation — Prune, Evaluate, Rollback, Quarantine — Plan
 
 ## Tasks

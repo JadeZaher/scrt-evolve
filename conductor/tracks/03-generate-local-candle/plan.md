@@ -1,3 +1,12 @@
+---
+type: Implementation Plan
+title: Generate / Local Candle Backend
+description: Implementation plan for the Generate / Local Candle Backend track.
+tags: [track-03, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Generate / Local Candle Backend — Plan
 
 ## Tasks

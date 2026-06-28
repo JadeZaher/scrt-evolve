@@ -1,3 +1,12 @@
+---
+type: Track Spec
+title: Repo Skeleton + Config
+description: Stand up the workspace and the EvolveConfig (toml) schema — DESIGN.md phase 1.
+tags: [track-00, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Repo Skeleton + Config — Specification
 
 ## Goal

@@ -1,3 +1,12 @@
+---
+type: Implementation Plan
+title: Ambient Continuous Evolution
+description: Implementation plan for the Ambient Continuous Evolution track.
+tags: [track-26, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Track 26 — Ambient Continuous Evolution — Plan
 
 ## Tasks

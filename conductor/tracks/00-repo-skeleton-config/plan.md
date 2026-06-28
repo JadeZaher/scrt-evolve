@@ -1,3 +1,12 @@
+---
+type: Implementation Plan
+title: Repo Skeleton + Config
+description: Implementation plan for the Repo Skeleton + Config track.
+tags: [track-00, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Repo Skeleton + Config — Plan
 
 ## Tasks

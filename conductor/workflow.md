@@ -1,3 +1,10 @@
+---
+type: Workflow
+title: scrt-evolve — Workflow
+description: Development methodology and track workflow for scrt-evolve.
+timestamp: 2026-06-28T00:00:00Z
+---
+
 # scrt-evolve — Workflow
 
 ## Methodology

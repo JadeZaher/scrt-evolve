@@ -1,3 +1,12 @@
+---
+type: Track Spec
+title: "Packaging & Portability"
+description: Ship scrt-evolve as a portable LLM-training + local-inference package.
+tags: [track-28, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Track 28 — Packaging & Portability — Spec
 
 ## Goal

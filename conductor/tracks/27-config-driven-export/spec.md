@@ -1,3 +1,12 @@
+---
+type: Track Spec
+title: Config-Driven Export Pipeline
+description: "The post-training export chain: merge sharded adapter -> convert -> GGUF."
+tags: [track-27, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Track 27 — Config-Driven Export Pipeline — Spec
 
 ## Goal

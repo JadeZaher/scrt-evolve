@@ -1,3 +1,10 @@
+---
+type: Tech Stack
+title: scrt-evolve — Tech Stack
+description: Languages, build, and dependencies for scrt-evolve.
+timestamp: 2026-06-28T00:00:00Z
+---
+
 # scrt-evolve — Tech Stack
 
 ## Language / build

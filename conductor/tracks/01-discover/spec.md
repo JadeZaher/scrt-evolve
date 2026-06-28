@@ -1,3 +1,12 @@
+---
+type: Track Spec
+title: Discover
+description: discover.rs consumes scrt-core in-process to surface candidate context — DESIGN.md phase 2.
+tags: [track-01, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Discover — Specification
 
 ## Goal

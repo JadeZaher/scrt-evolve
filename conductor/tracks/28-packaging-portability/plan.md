@@ -1,3 +1,12 @@
+---
+type: Implementation Plan
+title: "Packaging & Portability"
+description: "Implementation plan for the Packaging & Portability track."
+tags: [track-28, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Track 28 — Packaging & Portability — Plan
 
 ## Tasks

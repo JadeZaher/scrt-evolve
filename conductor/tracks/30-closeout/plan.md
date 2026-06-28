@@ -1,3 +1,12 @@
+---
+type: Implementation Plan
+title: "Closeout & Polish"
+description: "Implementation plan for the Closeout & Polish track."
+tags: [track-30, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Track 30 — Closeout & Polish — Plan
 
 The capstone "make it finished + legible" track. Doc/audit/ergonomics heavy; no new product ML.

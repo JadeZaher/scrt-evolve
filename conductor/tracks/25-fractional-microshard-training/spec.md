@@ -1,3 +1,12 @@
+---
+type: Track Spec
+title: Fractional / Microshard Training
+description: Make a large model LoRA-trainable on a small GPU by bounding peak VRAM.
+tags: [track-25, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Track 25 — Fractional / Microshard Training — Spec
 
 ## Goal

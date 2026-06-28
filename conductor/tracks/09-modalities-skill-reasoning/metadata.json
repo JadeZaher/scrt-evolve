@@ -1,0 +1,8 @@
+{
+  "id": "09-modalities-skill-reasoning",
+  "type": "feature",
+  "status": "pending",
+  "description": "Extend the generation modality set with skill ingestion and reasoning-step edits.",
+  "created_at": "2026-06-19T05:10:41-06:00",
+  "updated_at": "2026-06-19T05:10:41-06:00"
+}

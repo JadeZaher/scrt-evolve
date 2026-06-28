@@ -1,3 +1,12 @@
+---
+type: Track Spec
+title: Benchmark (Granite eval-gated evolution)
+description: Assemble the lane into a runnable Granite eval-gated evolution benchmark.
+tags: [track-24, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Track 24 — Benchmark (Granite eval-gated evolution) — Spec
 
 ## Goal

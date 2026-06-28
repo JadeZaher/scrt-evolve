@@ -1,3 +1,12 @@
+---
+type: Track Spec
+title: Learning-by-Doing — Incremental Multi-Goal Evolution
+description: Per-goal eval-gated evolution rounds with a bounded multi-goal scheduler.
+tags: [track-20, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Learning-by-Doing — Incremental Multi-Goal Evolution — Specification
 
 ## Goal

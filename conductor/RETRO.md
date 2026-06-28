@@ -4,7 +4,8 @@ A decision-focused retro, not a changelog. For each lane: what actually
 shipped, how it diverged from `DESIGN.md` intent, the call(s) that mattered,
 and one honest lesson. Grounded in the source tree
 (`crates/scrt-evolve/src/lib.rs`), `conductor/tracks.md`, and the per-track
-`plan.md`/`SIGN-OFF.md` files — not from memory.
+`plan.md`/`SIGN-OFF.md` files — not from memory. Roadmap-vs-shipped claims
+re-verified against the source tree on 2026-06-28 (see §Standing roadmap).
 
 The single most honest finding up front: **the shipped reality is the
 discover→generate→train→eval→regulate→export→branch chain, driven by a Python
@@ -65,9 +66,10 @@ trait, `dataset.rs` (the jsonl contract), and the `train/` preset family
 candle presets" (`DESIGN.md:317-330`). Reality: candle is a fixture, the
 *primary* path is `--backend transformers` (track 19, `python/scrt_evolve_train`).
 Tracks 05/06/07 (contrastive, full+pretrain, shard) have source modules but
-their sign-offs are still **Pending** — the preset *shells* exist; the
-real-model versions of full/pretrain/shard were never validated. Decentralized
-`shard` (the design's phase-8 hard problem) is the least-finished core preset.
+they are 1–3-line *shells* — the real-model versions were never built. **All
+three are now ARCHIVED** (2026-06-28): they are orthogonal to the LoRA-adapter
+product, and `shard`'s VRAM goal is already met by shipped fractional training
+(track 25) with decentralization contracted out to hivemind.
 
 **Load-bearing decision(s).** (1) Making `dataset.jsonl` the durable
 generate↔train boundary — it's what let the Python backend slot in as a
@@ -75,9 +77,10 @@ subprocess without rewriting the Rust pipeline. (2) API-first generation
 (track 02 before 03) to sidestep local-model echo-chamber collapse.
 
 **Do differently.** Don't ship five `TrainingPreset` modules when only one
-(`lora` via Python) is real. The `full`/`pretrain`/`shard` modules are
-scaffolding that reads as "done" in the tree but is "Pending" in sign-off —
-that gap is exactly the kind of thing this retro exists to flag.
+(`lora` via Python) is real. The `full`/`pretrain`/`contrastive`/`shard` modules
+were scaffolding that read as "done" in the tree but was "Pending" in sign-off —
+that gap is exactly the kind of thing this retro exists to flag, and the
+2026-06-28 sweep resolved it by archiving them (the stub headers now say so).
 
 ---
 
@@ -212,12 +215,97 @@ backlog, not gated tracks.
 
 ---
 
-## Standing roadmap (named, not built)
+## Ambient hardening lane (31) — production-robustness for the daemon
 
-Per `tracks.md` and track sign-offs, the only *intentionally* open build work is
-track 26 (ambient continuous-evolution daemon — design locked, prereq 25 done)
-and track 28 (pip/uv packaging + venv-interpreter binding — design locked,
-prereq 27 done). Track 08 (extract/publish against a published scrt-core) and
-track 30 (closeout) remain the terminal tracks. Everything else above that says
-"Pending" with no module is not roadmap — it is design that outran build, and
-this retro names it as such.
+**Shipped.** The five-question hardening pass surfaced by the first real
+living-corpus daemon run (the now-retired `HANDOFF.md`, 2026-06-28). All five
+addressed with code + tests, ML-free, the track-15 transaction untouched:
+**Q1** judge-model preflight (`generate::api::{list_models, preflight}` over GET
+`/v1/models`, wired into `doctor` as a FAIL + `--ambient` as a warn;
+`bench/ambient.toml` repointed off the vanished `meta-llama-3-8b-instruct` to
+`ibm/granite-4-h-tiny`); **Q5** content-hash **dedup ledger**
+(`ingest_ledger.rs` + `queue/ingested.ledger`) so re-mined-but-identical rows
+don't retrain, with idle-on-nothing-new (the top correctness risk — stale-data
+recycling); **Q2** transient-vs-catastrophe **retries** + supervisor cap +
+`daemon health` + per-source `gen` stamps; **Q3** wall-clock training budget
+(`[daemon].max_minutes_per_hour`); **Q4** probe-correctness **trend**
+(`trend.rs`) in `daemon status/health/trend`. Live-verified against the running
+work dir.
+
+**Diverged.** Nothing of substance — this lane was scoped *from* the live run's
+real failures, so design and build matched. The one honest finding is empirical,
+not architectural: the Q4 trend showed correctness bouncing 0.4–0.6 with
+Δtotal≈0 over ~10 committed checkpoints — the predicted noisy/overfit pattern of
+a ~400-row recycled corpus, which is *why* Q5's dedup ledger is the load-bearing
+fix.
+
+**Load-bearing decision(s).** Hardening was driven by observed failure modes
+(missing judge model, stale-data recycling, subprocess-exit-on-blip), not
+imagined ones — the opposite of the architecture lane. The single train-vs-score
+error asymmetry is the subtle one: only a *score/eval* `Err` is retried; a
+*train* failure is caught by the txn → a (non-fatal) rollback, so only
+transactional steps reach the evolution log.
+
+**Do differently.** This is the model the *whole* project should have followed:
+spec the hardening track *after* the live run exposed what actually breaks. Q1–Q5
+are all real because a real daemon hit them.
+
+---
+
+## Closeout lane (30) — UX review applied
+
+The track-30 DevUX/AIUX critique (`UX-REVIEW.md`) is not just a document — its
+top fixes **shipped into the CLI** and that is the closeout's most concrete
+output. Verified in `crates/scrt-evolve-cli/src/main.rs`: the **candle-fixture
+warning** ("the candle backend is a mechanical FIXTURE — it cannot load real
+[checkpoints]") now fires on every `cmd_train` run (D1/A3); a **`doctor`
+preflight** subcommand (`cmd_doctor`) validates config/model/python/llama.cpp
+before a long run (D3); a **process-global `--json`** flag (`emit_json`) emits
+machine-readable summary lines across the artifact-producing commands, with
+`is_fixture`/resolved-value echo for agents (A1/A2/A3). The remaining UX-REVIEW
+findings (overridable-flag `Option`s, `dataset-reference`, the SKILL "Driving the
+CLI" section) are tracked as polish, not blockers.
+
+---
+
+## Standing roadmap (named, not built) — re-verified 2026-06-28
+
+Audited against the source tree (not sign-off prose). The roadmap tracks are
+**genuinely pending, not merely missing status updates**:
+
+- **05/06/07** (contrastive / full+pretrain / shard): the preset files exist but
+  are **1–3-line doc-comment stubs** (`contrastive.rs` 3 lines, `full.rs` 1,
+  `pretrain.rs` 2, `shard.rs` 3) — shells, not implementations.
+- **11/12/13/14** (regen-antagonist / constitutional / attribution-mask /
+  expert-router): **zero modules**. The only `regen` hits in `src/` are
+  doc-comments and the `gen=regen` provenance enum value — no `RegenAntagonist`,
+  `AttributionReport`, `TrainingMask`, or router type exists. **→ ARCHIVED.**
+- **16/17/18** (dag-engine / arch-self-distill / sdk-builder): **zero modules**
+  (`grep` for `struct Dag`/`DagSpec`/`trait …Builder` is empty). **→ ARCHIVED.**
+- **05/06/07** (non-LoRA / distributed presets — stubs only), **22**
+  (meta-objects — config field only): unbuilt **and superseded**. **→ ARCHIVED.**
+- **08** (extract/publish — still on the git dep `scrt-core = { git = …, rev =
+  b22139d }`) and **09** (modalities — no `SkillIngestion`/`ReasoningEdit`):
+  unbuilt but **live roadmap** — 09 is the one dynamic-pipeline improvement worth
+  keeping; 08 is a release swap blocked on scrt-core hitting crates.io.
+
+**Archived 2026-06-28 (`tracks/_archived/`).** Three groups left the active
+spine: (a) the speculative **lexame** vision — in-model self-evolve lane 11–14 +
+self-architecting DAG/SDK lane 16–18, which the standalone-BTM-branch-factory
+product does not need; (b) **non-LoRA / distributed presets** 05/06/07 —
+orthogonal to the LoRA-adapter-over-immutable-base product (07 also superseded by
+fractional training, track 25, + the out-of-repo hivemind merge); (c) **22
+meta-objects**, superseded by the shipped `compose_steering()` constitution/taste
+seam (21). The one piece of those lanes the product genuinely wanted —
+constitution + taste as prompt-constants steering generation/judging — already
+ships as `[evolve].constitution`/`taste` (+ per-`[[goals]]` overrides) composed
+via `EvolveConfig::compose_steering()` into the `custom_prompt` seam, so
+archiving all of this costs the product nothing. Dir numbers are preserved (the
+gaps in the live spine point to `_archived/`). See `tracks/_archived/README.md`.
+
+**What actually remains.** After the sweep, the product is shipped and meets its
+goal. The only genuine completion item is the **live ambient GPU run (track
+26)** — a *validation* gap (the daemon machinery is shipped + tested ML-free), not
+code. Beyond that: **08** (external-blocked release) and **09** (optional new
+modalities). The posture is harden, not expand — the candle `train` feature is
+now vestigial (fixture-only, LoRA-only).

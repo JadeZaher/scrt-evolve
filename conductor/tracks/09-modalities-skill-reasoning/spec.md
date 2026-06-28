@@ -1,3 +1,12 @@
+---
+type: Track Spec
+title: New Modalities — Skill Ingestion + Reasoning-Step Modification
+description: Extend the generation modality set with skill ingestion and reasoning-step edits.
+tags: [track-09, pending]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # New Modalities — Skill Ingestion + Reasoning-Step Modification — Specification
 
 ## Goal

@@ -1,3 +1,12 @@
+---
+type: Track Spec
+title: Generate / Local Candle Backend
+description: LocalCandle, a GenBackend that loads the model locally via candle — DESIGN.md phase 4.
+tags: [track-03, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Generate / Local Candle Backend — Specification
 
 ## Goal

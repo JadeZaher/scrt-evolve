@@ -1,0 +1,8 @@
+{
+  "id": "11-regen-antagonist",
+  "type": "feature",
+  "status": "pending",
+  "description": "A self-distillation loop driven by the model's own training-refreshed generations.",
+  "created_at": "2026-06-19T05:10:41-06:00",
+  "updated_at": "2026-06-19T05:10:41-06:00"
+}

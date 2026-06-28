@@ -1,3 +1,12 @@
+---
+type: Track Spec
+title: Evaluation Harness — Probe Set + Scorer
+description: The shared evaluation substrate (probe set + scorer) the self-evolve lane depends on.
+tags: [track-10, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Evaluation Harness — Probe Set + Scorer (shared) — Specification
 
 ## Goal

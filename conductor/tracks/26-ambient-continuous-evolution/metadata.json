@@ -1,0 +1,8 @@
+{
+  "id": "26-ambient-continuous-evolution",
+  "type": "feature",
+  "status": "completed",
+  "description": "Turn evolution into an always-on, VRAM-bounded daemon fed by a living queue.",
+  "created_at": "2026-06-21T09:57:57-06:00",
+  "updated_at": "2026-06-26T22:41:16-06:00"
+}

@@ -1,3 +1,12 @@
+---
+type: Track Spec
+title: Taste — Cross-Goal Metacognitive Style Distillation
+description: An orthogonal style axis (taste) layered over goals to steer generation.
+tags: [track-21, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Taste — Cross-Goal Metacognitive Style Distillation — Specification
 
 ## Goal

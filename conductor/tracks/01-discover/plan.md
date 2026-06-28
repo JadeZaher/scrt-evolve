@@ -1,3 +1,12 @@
+---
+type: Implementation Plan
+title: Discover
+description: Implementation plan for the Discover track.
+tags: [track-01, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Discover — Plan
 
 ## Tasks

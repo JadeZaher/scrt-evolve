@@ -1,3 +1,10 @@
+---
+type: Code Styleguide
+title: scrt-evolve — Code Styleguides
+description: Enforceable code style rules for the scrt-evolve codebase.
+timestamp: 2026-06-28T00:00:00Z
+---
+
 # scrt-evolve — Code Styleguides
 
 Enforceable rules for this codebase. Sections marked **[MECH]** are mechanizable

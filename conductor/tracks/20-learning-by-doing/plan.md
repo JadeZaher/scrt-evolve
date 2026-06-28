@@ -1,3 +1,12 @@
+---
+type: Implementation Plan
+title: Learning-by-Doing — Incremental Multi-Goal Evolution
+description: Implementation plan for the Learning-by-Doing — Incremental Multi-Goal Evolution track.
+tags: [track-20, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Learning-by-Doing — Incremental Multi-Goal Evolution — Plan
 
 Build in slices; each slice is independently runnable and leans on what already

@@ -1,0 +1,8 @@
+{
+  "id": "13-attribution-training-mask",
+  "type": "feature",
+  "status": "pending",
+  "description": "A cross-cutting pre-step deciding which slices of the model to train.",
+  "created_at": "2026-06-19T05:10:41-06:00",
+  "updated_at": "2026-06-19T05:10:41-06:00"
+}

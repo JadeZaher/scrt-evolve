@@ -1,0 +1,8 @@
+{
+  "id": "17-architecture-self-distill",
+  "type": "feature",
+  "status": "pending",
+  "description": "Architecture factory and a self-distill meta-loop on top of the DAG engine.",
+  "created_at": "2026-06-19T05:10:41-06:00",
+  "updated_at": "2026-06-19T05:10:41-06:00"
+}

@@ -1,3 +1,12 @@
+---
+type: Implementation Plan
+title: Config-Driven Export Pipeline
+description: Implementation plan for the Config-Driven Export Pipeline track.
+tags: [track-27, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Track 27 — Config-Driven Export Pipeline — Plan
 
 ## Tasks

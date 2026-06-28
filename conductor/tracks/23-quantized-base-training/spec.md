@@ -1,3 +1,12 @@
+---
+type: Track Spec
+title: Quantized-Base Training (GGUF dequant + QAT)
+description: Train a model that lives on disk only as a quantized GGUF (dequant + QAT).
+tags: [track-23, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Track 23 — Quantized-Base Training (GGUF→HF dequant + QAT) — Spec
 
 ## Goal

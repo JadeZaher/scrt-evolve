@@ -1,3 +1,12 @@
+---
+type: Track Spec
+title: Generate / API Backend
+description: The GenBackend trait and the ApiEndpoint backend — DESIGN.md phase 3.
+tags: [track-02, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Generate / API Backend — Specification
 
 ## Goal

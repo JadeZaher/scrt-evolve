@@ -1,3 +1,12 @@
+---
+type: Track Spec
+title: Branch Factory — standalone domain branches (BTM Expert LMs)
+description: "First-class branch op: turn a base model + corpus into a standalone domain branch, routed per-request."
+tags: [track-29, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Branch Factory — create, serve & route standalone domain branches (BTM Expert LMs) — Specification
 
 ## Goal

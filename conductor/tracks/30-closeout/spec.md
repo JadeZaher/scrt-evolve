@@ -1,3 +1,12 @@
+---
+type: Track Spec
+title: "Closeout & Polish"
+description: Bring scrt-evolve to a finished, functional, well-documented state (audit/retro/docs).
+tags: [track-30, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Track 30 — Closeout & Polish — bring scrt-evolve to a finished, functional, well-documented state — Specification
 
 ## Goal

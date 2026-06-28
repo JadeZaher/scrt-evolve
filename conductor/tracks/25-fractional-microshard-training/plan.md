@@ -1,3 +1,12 @@
+---
+type: Implementation Plan
+title: Fractional / Microshard Training
+description: Implementation plan for the Fractional / Microshard Training track.
+tags: [track-25, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Track 25 — Fractional / Microshard Training — Plan
 
 ## Tasks

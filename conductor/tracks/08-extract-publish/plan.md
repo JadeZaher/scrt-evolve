@@ -1,3 +1,12 @@
+---
+type: Implementation Plan
+title: Extract / Publish
+description: Implementation plan for the Extract / Publish track.
+tags: [track-08, pending]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Extract / Publish — Plan
 
 ## Tasks

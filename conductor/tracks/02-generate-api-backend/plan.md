@@ -1,3 +1,12 @@
+---
+type: Implementation Plan
+title: Generate / API Backend
+description: Implementation plan for the Generate / API Backend track.
+tags: [track-02, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Generate / API Backend — Plan
 
 ## Tasks

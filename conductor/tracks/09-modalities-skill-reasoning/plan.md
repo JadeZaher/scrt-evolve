@@ -1,3 +1,12 @@
+---
+type: Implementation Plan
+title: New Modalities — Skill Ingestion + Reasoning-Step Modification
+description: Implementation plan for the New Modalities — Skill Ingestion + Reasoning-Step Modification track.
+tags: [track-09, pending]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # New Modalities — Skill Ingestion + Reasoning-Step Modification — Plan
 
 ## Tasks

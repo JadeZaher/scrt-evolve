@@ -1,3 +1,12 @@
+---
+type: Implementation Plan
+title: Branch Factory — standalone domain branches (BTM Expert LMs)
+description: Implementation plan for the Branch Factory — standalone domain branches (BTM Expert LMs) track.
+tags: [track-29, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Track 29 — Branch Factory — Plan
 
 Build order is **composition-first**: reuse shipped stages (01/02/19/10/15/27) and add only

@@ -1,3 +1,12 @@
+---
+type: Track Spec
+title: Extract / Publish
+description: "Finalization: swap the scrt-core git dep and publish artifacts — DESIGN.md phase 9."
+tags: [track-08, pending]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Extract / Publish — Specification
 
 ## Goal

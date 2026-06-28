@@ -1,3 +1,12 @@
+---
+type: Track Spec
+title: Python train/infer (transformers LoRA + inference)
+description: The primary real-model train+infer path via Python/transformers, subprocess-driven from Rust.
+tags: [track-19, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Track 19 — Python train/infer (transformers LoRA + inference) — Spec
 
 ## Goal

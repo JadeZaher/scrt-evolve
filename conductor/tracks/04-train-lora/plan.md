@@ -1,3 +1,12 @@
+---
+type: Implementation Plan
+title: Train / LoRA
+description: Implementation plan for the Train / LoRA track.
+tags: [track-04, completed]
+timestamp: 2026-06-28T00:00:00Z
+resource: ./metadata.json
+---
+
 # Train / LoRA — Plan
 
 ## Tasks
