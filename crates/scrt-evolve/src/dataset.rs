@@ -74,6 +74,53 @@ pub enum GenExample {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         gen: Option<String>,
     },
+    /// A skill-ingestion example (track 09, opt-in): teach the model to absorb a
+    /// skill/capability (a `SKILL.md`-style description) and turn it into callable
+    /// behavior — *when* to invoke it, *with what* inputs, *what* it produces. The
+    /// completion trains the model to recognize the trigger and emit the
+    /// invocation. See `crates/scrt-evolve/src/generate/AGENTS.md` §modalities.
+    #[serde(rename = "skill")]
+    Skill {
+        /// The skill/capability name (must reference a real skill/tool).
+        skill_name: String,
+        /// The natural-language request that should trigger the skill.
+        prompt: String,
+        /// The invocation that uses the skill — a structured call or a runnable
+        /// command line (validated like `cli`/`tool_call` where applicable).
+        invocation: String,
+        /// What success looks like (the outcome the invocation produces).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_outcome: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gen: Option<String>,
+    },
+    /// A reasoning-edit example (track 09, opt-in): teach the model to *evolve a
+    /// reasoning trace* — given a task and a flawed chain-of-thought, produce a
+    /// corrected chain that leads to a better `final_action`. Rendered so the
+    /// completion carries the corrected reasoning BEFORE the action, training the
+    /// model to reason internally at inference (not just emit an answer). See
+    /// `crates/scrt-evolve/src/generate/AGENTS.md` §modalities.
+    #[serde(rename = "reasoning_edit")]
+    ReasoningEdit {
+        /// The task / question the reasoning is about.
+        prompt: String,
+        /// The original (flawed) reasoning steps.
+        #[serde(default)]
+        original_steps: Vec<String>,
+        /// The edit operation applied: `insert | correct | prune | reorder`.
+        edit_op: String,
+        /// The corrected reasoning steps (the target chain).
+        #[serde(default)]
+        edited_steps: Vec<String>,
+        /// The final action/answer the corrected reasoning leads to.
+        final_action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gen: Option<String>,
+    },
 }
 
 /// An in-memory handle over the on-disk JSONL dataset.

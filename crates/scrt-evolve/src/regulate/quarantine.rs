@@ -87,7 +87,9 @@ fn row_gen(row: &GenExample) -> Option<&str> {
         GenExample::Qa { gen, .. }
         | GenExample::Instruction { gen, .. }
         | GenExample::ToolCall { gen, .. }
-        | GenExample::Cli { gen, .. } => gen.as_deref(),
+        | GenExample::Cli { gen, .. }
+        | GenExample::Skill { gen, .. }
+        | GenExample::ReasoningEdit { gen, .. } => gen.as_deref(),
         GenExample::Completion { .. } | GenExample::Contrastive { .. } => None,
     }
 }

@@ -33,6 +33,10 @@ pub enum GenMode {
     ToolCall,
     /// `cli` runnable command lines.
     Cli,
+    /// `skill` skill-ingestion rows (track 09, opt-in).
+    Skill,
+    /// `reasoning_edit` reasoning-trace evolution rows (track 09, opt-in).
+    ReasoningEdit,
 }
 
 /// Context handed to a backend to synthesize examples from one passage in one
@@ -75,6 +79,14 @@ pub fn plan_modes(kinds: &[String]) -> Vec<GenMode> {
     }
     if kinds.iter().any(|k| k == "cli") {
         modes.push(GenMode::Cli);
+    }
+    // Opt-in modalities (track 09): absent from `kinds` ⇒ never planned, so the
+    // pipeline is byte-identical to today unless the user asks for them.
+    if kinds.iter().any(|k| k == "skill") {
+        modes.push(GenMode::Skill);
+    }
+    if kinds.iter().any(|k| k == "reasoning_edit") {
+        modes.push(GenMode::ReasoningEdit);
     }
     modes
 }
@@ -176,6 +188,8 @@ fn mode_for_modality(modality: &str) -> GenMode {
     match modality {
         "tool_call" => GenMode::ToolCall,
         "cli" => GenMode::Cli,
+        "skill" => GenMode::Skill,
+        "reasoning_edit" => GenMode::ReasoningEdit,
         _ => GenMode::Prose,
     }
 }

@@ -92,6 +92,14 @@ impl LocalCandle {
                 prompts::tool_call_user_prompt(ctx),
             ),
             GenMode::Cli => (prompts::cli_system_prompt(), prompts::cli_user_prompt(ctx)),
+            GenMode::Skill => (
+                prompts::skill_system_prompt(),
+                prompts::skill_user_prompt(ctx),
+            ),
+            GenMode::ReasoningEdit => (
+                prompts::reasoning_edit_system_prompt(),
+                prompts::reasoning_edit_user_prompt(ctx),
+            ),
         };
         let system = match ctx.custom_prompt {
             Some(guidance) => format!(

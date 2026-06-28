@@ -706,6 +706,22 @@ enum DaemonCommand {
         #[arg(long, default_value = "evolve.toml")]
         config: PathBuf,
     },
+    /// Health view (track 31 Q2): run-state, last step + verdict, last error,
+    /// consecutive failures, committed count — read from the evolution log.
+    Health {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+    },
+    /// Probe-correctness TREND (track 31 Q4): the committed-checkpoint correctness
+    /// series + a slope/delta summary, so "is behavior actually changing?" is
+    /// visible (loss ≠ behavior).
+    Trend {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// Summarize the trend over the last N committed checkpoints (0 = all).
+        #[arg(long, default_value_t = 0)]
+        last: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1067,6 +1083,14 @@ fn run() -> Result<()> {
             DaemonCommand::Status { config } => {
                 let cfg = EvolveConfig::load(&config)?;
                 cmd_daemon_status(&cfg)
+            }
+            DaemonCommand::Health { config } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_daemon_health(&cfg)
+            }
+            DaemonCommand::Trend { config, last } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_daemon_trend(&cfg, last)
             }
         },
         Command::Teach {
@@ -1666,9 +1690,12 @@ fn provenance_of(ds: &scrt_evolve::Dataset) -> Vec<String> {
     let mut set = std::collections::BTreeSet::new();
     for row in &ds.rows {
         let g = match row {
-            Qa { gen, .. } | Instruction { gen, .. } | ToolCall { gen, .. } | Cli { gen, .. } => {
-                gen.clone()
-            }
+            Qa { gen, .. }
+            | Instruction { gen, .. }
+            | ToolCall { gen, .. }
+            | Cli { gen, .. }
+            | Skill { gen, .. }
+            | ReasoningEdit { gen, .. } => gen.clone(),
             // Variants without a `gen` field carry no provenance. Listed
             // explicitly so a new variant forces a compile-time decision here.
             Completion { .. } | Contrastive { .. } => None,
@@ -2840,6 +2867,45 @@ fn cmd_doctor(config: &std::path::Path, python: Option<String>) -> Result<()> {
         }
     }
 
+    // 7. Judge model loadable (track 31 Q1) — only meaningful when relevance
+    //    filtering is configured. A missing model is a hard FAIL (silent keep-all
+    //    is exactly the failure mode this preflight exists to catch); an
+    //    unreachable endpoint is a soft PASS (the daemon degrades gracefully).
+    if let Some(c) = cfg.as_ref() {
+        let uses_judge = c
+            .ingest
+            .as_ref()
+            .map(|i| i.relevance.is_some())
+            .unwrap_or(false);
+        if let (true, Some(gcfg)) = (uses_judge, c.generate.as_ref()) {
+            use scrt_evolve::generate::api::{preflight, JudgePreflight};
+            match preflight(gcfg) {
+                JudgePreflight::Available { model } => {
+                    check("judge_model", true, format!("`{model}` is loaded"))
+                }
+                JudgePreflight::Missing { model, available } => check(
+                    "judge_model",
+                    false,
+                    format!(
+                        "`{model}` is NOT loaded — set [generate.api].model to an available \
+                         one: {}",
+                        if available.is_empty() {
+                            "(none served)".to_string()
+                        } else {
+                            available.join(", ")
+                        }
+                    ),
+                ),
+                JudgePreflight::EndpointDown { detail } => check(
+                    "judge_model",
+                    true,
+                    format!("endpoint unreachable ({detail}) — judge degrades to keep-all"),
+                ),
+                JudgePreflight::NotApi => {}
+            }
+        }
+    }
+
     let failed = checks.iter().filter(|(_, ok, _)| !ok).count();
 
     if JSON_OUTPUT.load(std::sync::atomic::Ordering::Relaxed) {
@@ -3058,11 +3124,39 @@ fn daemon_serve(
     };
     let free_vram = probe_free_vram_gb;
     let gpu_busy = probe_gpu_busy;
+    // Production clock: monotonic seconds since the daemon process started (Q3
+    // budget + Q2 backoff). A process-start `Instant` keeps it cheap + monotonic.
+    let started = std::time::Instant::now();
+    let now_secs = move || started.elapsed().as_secs();
+    let sleep = |d: std::time::Duration| std::thread::sleep(d);
+
+    // Track 32: the JUDGE gate. When [regulate].gate = "judge", build a degrade
+    // hook that samples BEFORE (base) vs AFTER (base+candidate-adapter) on the
+    // probe and runs the LLM degradation judge. `None` ⇒ the correctness gate.
+    let gate_is_judge = cfg
+        .regulate
+        .as_ref()
+        .map(|r| r.gate == "judge")
+        .unwrap_or(false);
+    let py_degrade = py.clone();
+    let degrade = move |c: &EvolveConfig| -> Result<scrt_evolve::eval::DegradationReport> {
+        run_ab_degrade(c, &py_degrade)
+    };
+    let degrade_ref: Option<scrt_evolve::daemon::DegradeHook> = if gate_is_judge {
+        println!("daemon: gate=judge (accept unless degradation detected)");
+        Some(&degrade)
+    } else {
+        None
+    };
+
     let hooks = DaemonHooks {
         free_vram_gb: &free_vram,
         gpu_busy: &gpu_busy,
         train: &train,
         score: &score,
+        now_secs: &now_secs,
+        sleep: &sleep,
+        degrade: degrade_ref,
     };
     let opts = DaemonOptions {
         max_vram_gb,
@@ -3075,11 +3169,96 @@ fn daemon_serve(
         cpu_fallback: dcfg.cpu_fallback,
         rotation_blocks: dcfg.rotation_blocks,
         cooldown: std::time::Duration::from_secs(dcfg.cooldown_secs),
+        max_retries: dcfg.max_retries,
+        backoff_base: std::time::Duration::from_secs(dcfg.backoff_base_secs.max(1)),
+        max_consecutive_failures: dcfg.max_consecutive_failures,
+        max_minutes_per_hour: dcfg.max_minutes_per_hour,
+        min_train_pairs: dcfg.min_train_pairs,
     };
     let stop_root = wd.root().to_path_buf();
     daemon::run_daemon(cfg, &opts, &baseline, &hooks, &|| {
         daemon::stop_requested(&stop_root)
     })
+}
+
+/// Track 32 — the A/B degradation gate's production hook. Sample the probe
+/// prompts on BASE (before) vs BASE+ADAPTER (after) via `python -m
+/// scrt_evolve_score --ab`, then run the LLM degradation judge over the triples.
+/// Returns the [`DegradationReport`] the daemon's `judge_verdict` consumes. A
+/// down judge errs toward not-worse (in the judge itself), so this never blocks
+/// progress on a flaky endpoint.
+fn run_ab_degrade(cfg: &EvolveConfig, py: &str) -> Result<scrt_evolve::eval::DegradationReport> {
+    use scrt_evolve::eval::{DegradationJudge, DegradationTriple, LlmDegradationJudge};
+
+    let model_path = cfg
+        .evolve
+        .model_path
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("gate=judge: set [evolve].model_path"))?;
+    let probe = scrt_evolve::eval::probe_path(cfg);
+    if !probe.exists() {
+        // No probe ⇒ nothing to sample ⇒ no evidence of degradation (accept).
+        return Ok(scrt_evolve::eval::DegradationReport::default());
+    }
+    let adapter_dir = WorkDir::from_config(cfg).root().join("adapter");
+    if !adapter_dir.exists() {
+        // No candidate adapter to compare ⇒ no degradation evidence.
+        return Ok(scrt_evolve::eval::DegradationReport::default());
+    }
+    let pkg_parent = scrt_evolve::python_pkg_dir()
+        .ok_or_else(|| anyhow::anyhow!("gate=judge: could not locate python/ dir"))?;
+
+    let mut cmd = std::process::Command::new(py);
+    cmd.arg("-m")
+        .arg("scrt_evolve_score")
+        .arg("--ab")
+        .arg("--model")
+        .arg(&model_path)
+        .arg("--probe")
+        .arg(&probe)
+        .arg("--adapter")
+        .arg(&adapter_dir)
+        .env("PYTHONPATH", &pkg_parent);
+    let output = cmd.output().map_err(|e| {
+        anyhow::anyhow!("gate=judge: launching `{py} -m scrt_evolve_score --ab`: {e}")
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "gate=judge: A/B sampler exited with {}\n{}",
+            output.status,
+            stderr
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let last = stdout
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("gate=judge: A/B sampler produced no output"))?;
+    let triples: Vec<DegradationTriple> = serde_json::from_str(last.trim()).map_err(|e| {
+        anyhow::anyhow!(
+            "gate=judge: A/B output was not [{{prompt,before,after}}]: {e}\nline: {last}"
+        )
+    })?;
+
+    // The judge endpoint: [regulate].degrade_judge if set, else [generate.api].
+    let gcfg = cfg
+        .regulate
+        .as_ref()
+        .and_then(|r| r.degrade_judge.clone())
+        .map(|api| scrt_evolve::config::GenerateConfig {
+            backend: "api".to_string(),
+            api: Some(api),
+            ..Default::default()
+        })
+        .or_else(|| cfg.generate.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!("gate=judge: needs [regulate.degrade_judge] or [generate.api]")
+        })?;
+    let endpoint = scrt_evolve::generate::api::ApiEndpoint::from_config(&gcfg)?;
+    let judge = LlmDegradationJudge::new(endpoint.into_transport(), 10);
+    judge.judge(&triples)
 }
 
 /// Set memory-friendly defaults for the ML subprocesses (inherited via env) if the
@@ -3188,7 +3367,17 @@ fn cmd_ambient(cfg: &EvolveConfig, once: bool) -> Result<()> {
                         false,
                         true,
                     )?;
-                    println!("ambient: refilled {n} row(s)");
+                    if n == 0 {
+                        // Q5: the ledger dropped everything as already-ingested —
+                        // nothing genuinely new to learn. Idle rather than
+                        // re-training stale data (overfitting risk).
+                        println!(
+                            "ambient: nothing new to ingest (all re-mined rows already \
+                             trained) — idling until fresh activity appears"
+                        );
+                    } else {
+                        println!("ambient: refilled {n} new row(s)");
+                    }
                 }
             }
             // If still nothing to train, idle (or exit on `once`).
@@ -3253,6 +3442,36 @@ fn validate_ambient(cfg: &EvolveConfig) {
             "ambient: note — [daemon].auto_ingest is on but no [ingest] block; nothing to refill"
         );
     }
+    // Q1: preflight the relevance judge model only if relevance filtering is
+    // actually in play (an [ingest].relevance criterion). Without it, the judge
+    // never runs, so a missing model is irrelevant.
+    let uses_judge = cfg
+        .ingest
+        .as_ref()
+        .map(|i| i.relevance.is_some())
+        .unwrap_or(false);
+    if uses_judge {
+        if let Some(gcfg) = cfg.generate.as_ref() {
+            use scrt_evolve::generate::api::{preflight, JudgePreflight};
+            match preflight(gcfg) {
+                JudgePreflight::Missing { model, available } => eprintln!(
+                    "ambient: WARNING — judge model `{model}` is NOT loaded in the endpoint \
+                     (relevance filtering will degrade to keep-all). Available: {}. \
+                     Set [generate.api].model to one of these.",
+                    if available.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        available.join(", ")
+                    }
+                ),
+                JudgePreflight::EndpointDown { detail } => eprintln!(
+                    "ambient: note — judge endpoint unreachable ({detail}); relevance \
+                     filtering will degrade to keep-all until it's back"
+                ),
+                JudgePreflight::Available { .. } | JudgePreflight::NotApi => {}
+            }
+        }
+    }
 }
 
 /// `daemon stop` — signal a running daemon to exit after its current step.
@@ -3283,13 +3502,150 @@ fn cmd_daemon_status(cfg: &EvolveConfig) -> Result<()> {
     } else {
         "stopped"
     };
+    // Q4: latest committed correctness + trend arrow, so `status` answers "is it
+    // actually getting better?" not just "is it running?".
+    let trend = read_trend(cfg, 0).unwrap_or_default();
+    let latest = trend.latest;
+    let arrow = trend.arrow();
     println!("daemon status: {state}");
     println!("  queue pending: priority={prio} raw={raw}");
+    match latest {
+        Some(c) => println!(
+            "  correctness: {c:.3} {arrow} ({} committed checkpoint(s))",
+            trend.series.len()
+        ),
+        None => println!("  correctness: (no committed checkpoints yet)"),
+    }
     emit_json(serde_json::json!({
         "command": "daemon-status",
         "state": state,
         "pending_priority": prio,
         "pending_raw": raw,
+        "latest_correctness": latest,
+        "trend": arrow,
+        "status": "ok",
+    }));
+    Ok(())
+}
+
+/// Path to the track-15 evolution log (`work_dir/evolution-log.jsonl`).
+fn evolution_log_path(cfg: &EvolveConfig) -> PathBuf {
+    WorkDir::from_config(cfg).root().join("evolution-log.jsonl")
+}
+
+/// Read the probe-correctness trend from the evolution log (Q4). `last`>0 keeps
+/// only the most recent N committed points.
+fn read_trend(cfg: &EvolveConfig, last: usize) -> Result<scrt_evolve::TrendSummary> {
+    let entries = scrt_evolve::regulate::log::read_all(&evolution_log_path(cfg))?;
+    Ok(scrt_evolve::trend_from_log(&entries, last))
+}
+
+/// `daemon health` — Q2 observability: run-state, last step + verdict, last
+/// error, consecutive failures (trailing run of error rows), committed count.
+/// Reads the evolution log; no process introspection needed.
+fn cmd_daemon_health(cfg: &EvolveConfig) -> Result<()> {
+    use scrt_evolve::daemon;
+    use scrt_evolve::{LivingQueue, StepAction};
+    let wd = WorkDir::from_config(cfg);
+    wd.ensure()?;
+    let running = daemon::run_file(wd.root()).exists();
+    let stopping = daemon::stop_requested(wd.root());
+    let state = if stopping {
+        "stopping"
+    } else if running {
+        "running"
+    } else {
+        "stopped"
+    };
+    let (prio, raw) = LivingQueue::from_config(cfg)?.pending();
+    let entries = scrt_evolve::regulate::log::read_all(&evolution_log_path(cfg))?;
+
+    let committed = entries
+        .iter()
+        .filter(|e| e.action == StepAction::Commit)
+        .count();
+    let last = entries.last();
+    let last_step = last.map(|e| e.step);
+    let last_action = last.map(|e| format!("{:?}", e.action));
+    let last_correctness = last.and_then(|e| e.metrics.as_ref()).map(|m| m.correctness);
+    // "Consecutive failures" = trailing run of rows whose cause looks like an
+    // error (the daemon records failed steps via the evolution log's `cause`).
+    let last_error = entries
+        .iter()
+        .rev()
+        .find_map(|e| e.cause.clone().filter(|c| !c.is_empty()));
+    let halted = entries
+        .last()
+        .map(|e| e.action == StepAction::Quarantine)
+        .unwrap_or(false);
+
+    println!("daemon health: {state}");
+    println!("  committed checkpoints: {committed}");
+    match last_step {
+        Some(s) => println!(
+            "  last step: {s} ({}) correctness={}",
+            last_action.as_deref().unwrap_or("?"),
+            last_correctness
+                .map(|c| format!("{c:.3}"))
+                .unwrap_or_else(|| "-".into())
+        ),
+        None => println!("  last step: (none yet)"),
+    }
+    println!("  queue pending: priority={prio} raw={raw}");
+    if halted {
+        println!("  ⚠ last step was a CATASTROPHE quarantine — `quarantine clear` to re-arm");
+    }
+    if let Some(err) = &last_error {
+        println!("  last note/error: {err}");
+    }
+
+    emit_json(serde_json::json!({
+        "command": "daemon-health",
+        "state": state,
+        "committed": committed,
+        "last_step": last_step,
+        "last_action": last_action,
+        "last_correctness": last_correctness,
+        "last_error": last_error,
+        "halted": halted,
+        "pending_priority": prio,
+        "pending_raw": raw,
+        "status": "ok",
+    }));
+    Ok(())
+}
+
+/// `daemon trend` — Q4: the committed-checkpoint correctness series + a
+/// slope/delta summary. Makes "is behavior changing?" (not just loss) visible.
+fn cmd_daemon_trend(cfg: &EvolveConfig, last: usize) -> Result<()> {
+    let trend = read_trend(cfg, last)?;
+    if trend.series.is_empty() {
+        println!("daemon trend: no committed checkpoints yet");
+        emit_json(serde_json::json!({
+            "command": "daemon-trend", "points": 0, "status": "ok",
+        }));
+        return Ok(());
+    }
+    println!(
+        "daemon trend: {} {} (Δtotal={:+.3}, Δmean/step={:+.4})",
+        trend.latest.map(|c| format!("{c:.3}")).unwrap_or_default(),
+        trend.arrow(),
+        trend.total_change,
+        trend.mean_delta
+    );
+    for p in &trend.series {
+        println!(
+            "  step {:>4}  {:.3}  {}",
+            p.step, p.correctness, p.checkpoint_id
+        );
+    }
+    emit_json(serde_json::json!({
+        "command": "daemon-trend",
+        "points": trend.series.len(),
+        "latest": trend.latest,
+        "total_change": trend.total_change,
+        "mean_delta": trend.mean_delta,
+        "arrow": trend.arrow(),
         "status": "ok",
     }));
     Ok(())
@@ -3440,16 +3796,37 @@ fn run_ingest(
         rows.truncate(max);
     }
 
+    // Q5 dedup: drop rows already ingested in a prior pass (the ledger). This is
+    // what stops the self-feed from re-training the same re-mined activity over a
+    // stale corpus. Provenance is ignored, so the same usage from a different
+    // transcript still counts as a duplicate. On --dry-run we DON'T touch the
+    // ledger (a dry-run must not "consume" rows), so we count against a read-only
+    // view instead.
+    let wd = WorkDir::from_config(cfg);
     if dry_run {
+        let led = scrt_evolve::IngestLedger::open(wd.root())?;
+        let would = rows.iter().filter(|r| !led.contains(r)).count();
         if verbose {
-            println!("ingest: --dry-run, {} row(s) would enqueue", rows.len());
+            println!(
+                "ingest: --dry-run, {would} new row(s) would enqueue \
+                 ({} already ingested)",
+                rows.len() - would
+            );
         }
         return Ok(0);
     }
 
-    let n = LivingQueue::from_config(cfg)?.enqueue_many(lane, &rows)?;
+    let mut led = scrt_evolve::IngestLedger::open(wd.root())?;
+    let outcome = led.filter_new(rows)?;
+    if verbose && outcome.skipped > 0 {
+        println!(
+            "ingest: {} row(s) already ingested (skipped via ledger)",
+            outcome.skipped
+        );
+    }
+    let n = LivingQueue::from_config(cfg)?.enqueue_many(lane, &outcome.new)?;
     if verbose {
-        println!("ingest: enqueued {n} row(s)");
+        println!("ingest: enqueued {n} new row(s)");
     }
     Ok(n)
 }
@@ -4240,6 +4617,17 @@ fn row_domain_text(row: &scrt_evolve::GenExample) -> String {
         Cli {
             prompt, command, ..
         } => format!("{prompt} {command}"),
+        Skill {
+            prompt,
+            skill_name,
+            invocation,
+            ..
+        } => format!("{prompt} {skill_name} {invocation}"),
+        ReasoningEdit {
+            prompt,
+            final_action,
+            ..
+        } => format!("{prompt} {final_action}"),
     }
 }
 

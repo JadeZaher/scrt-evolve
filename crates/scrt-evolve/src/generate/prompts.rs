@@ -116,3 +116,72 @@ Passage:\n```\n{passage}\n```",
         passage = ctx.passage.text,
     )
 }
+
+/// System prompt for **skill-ingestion** synthesis (track 09): teach the model
+/// to absorb a skill/capability and turn it into callable behavior.
+pub fn skill_system_prompt() -> String {
+    "You generate SKILL-INGESTION fine-tuning examples. The assistant being \
+trained must learn to absorb a skill or capability described in the passage and \
+invoke it correctly — knowing WHEN to use it, WITH WHAT inputs, and WHAT it \
+produces.\n\n\
+Rules:\n\
+- Output ONLY a JSON array. No prose, no markdown fences.\n\
+- Each element: {\"kind\":\"skill\", \"skill_name\": <the real skill/command/tool \
+name from the passage>, \"prompt\": <a natural user request that should trigger \
+the skill>, \"invocation\": <the structured call or runnable command that uses \
+the skill>, \"expected_outcome\": <what success looks like>}.\n\
+- `skill_name` and `invocation` MUST be grounded in the passage — do NOT invent \
+skills, commands, flags, or parameters that are not described there.\n\
+- Prefer realistic scenarios the passage actually supports. If the passage does \
+not describe a usable skill, return fewer examples (an empty array is fine)."
+        .to_string()
+}
+
+/// User prompt for skill-ingestion synthesis from a passage.
+pub fn skill_user_prompt(ctx: &GenContext) -> String {
+    format!(
+        "From the passage below, produce up to {n} skill-ingestion examples (JSON \
+array only) for the skill(s)/capability it documents.\n\n\
+Source: {source}\n\
+Passage:\n```\n{passage}\n```",
+        n = ctx.per_passage,
+        source = ctx.passage.source,
+        passage = ctx.passage.text,
+    )
+}
+
+/// System prompt for **reasoning-edit** synthesis (track 09): teach the model to
+/// evolve a reasoning trace — correct a flawed chain-of-thought toward a better
+/// final action, so the model learns to reason internally at inference.
+pub fn reasoning_edit_system_prompt() -> String {
+    "You generate REASONING-EDIT fine-tuning examples. The assistant being trained \
+must learn to IMPROVE a chain of reasoning: given a task and a flawed reasoning \
+trace, produce a corrected trace that leads to a better final action.\n\n\
+Rules:\n\
+- Output ONLY a JSON array. No prose, no markdown fences.\n\
+- Each element: {\"kind\":\"reasoning_edit\", \"prompt\": <the task or question>, \
+\"original_steps\": [<the flawed reasoning steps, as an array of strings>], \
+\"edit_op\": <one of \"insert\",\"correct\",\"prune\",\"reorder\">, \
+\"edited_steps\": [<the corrected reasoning steps>], \"final_action\": <the \
+action/answer the corrected reasoning leads to>}.\n\
+- The original_steps must contain a plausible but FLAWED reasoning path (a wrong \
+assumption, a skipped check, a redundant or mis-ordered step), and edited_steps \
+must FIX exactly that flaw via the named edit_op.\n\
+- Ground the task and the final_action in the passage — do NOT invent commands, \
+APIs, or facts the passage does not support. If the passage is not multi-step \
+enough to support a reasoning trace, return fewer examples (empty array is fine)."
+        .to_string()
+}
+
+/// User prompt for reasoning-edit synthesis from a passage.
+pub fn reasoning_edit_user_prompt(ctx: &GenContext) -> String {
+    format!(
+        "From the passage below, produce up to {n} reasoning-edit examples (JSON \
+array only) about multi-step workflows or chained tool use it describes.\n\n\
+Source: {source}\n\
+Passage:\n```\n{passage}\n```",
+        n = ctx.per_passage,
+        source = ctx.passage.source,
+        passage = ctx.passage.text,
+    )
+}

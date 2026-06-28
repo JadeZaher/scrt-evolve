@@ -152,6 +152,20 @@ fn content_key(row: &GenExample) -> String {
             "contr\u{1}{query}\u{1}{positive}\u{1}{}",
             negatives.join("\u{2}")
         ),
+        GenExample::Skill {
+            skill_name,
+            invocation,
+            ..
+        } => format!("skill\u{1}{skill_name}\u{1}{invocation}"),
+        GenExample::ReasoningEdit {
+            prompt,
+            final_action,
+            edited_steps,
+            ..
+        } => format!(
+            "reason\u{1}{prompt}\u{1}{final_action}\u{1}{}",
+            edited_steps.join("\u{2}")
+        ),
         GenExample::ToolCall {
             prompt,
             tool,

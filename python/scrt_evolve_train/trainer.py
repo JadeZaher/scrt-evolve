@@ -209,7 +209,7 @@ def auto_detect_targets(
 
 def load_dataset(path: str) -> list[tuple[str, str]]:
     """
-    Read dataset.jsonl. Render qa/instruction/cli/tool_call/completion rows to
+    Read dataset.jsonl. Render qa/instruction/cli/tool_call/skill/reasoning_edit/completion rows to
     (prompt, completion) pairs; loss is on the completion only. Skip and count
     unsupported kinds (contrastive). Exits on fatal errors.
     """
@@ -274,6 +274,39 @@ def load_dataset(path: str) -> list[tuple[str, str]]:
                     ensure_ascii=False,
                 )
                 pairs.append((prompt_text, call))
+            elif kind == "skill":
+                # Skill ingestion (track 09): request -> invocation (+outcome).
+                # Mirrors export.rs row_to_pair so Rust/Python render identically.
+                prompt_text = row.get("prompt", "")
+                invocation = row.get("invocation", "")
+                if not prompt_text or not invocation:
+                    skipped += 1
+                    continue
+                outcome = (row.get("expected_outcome") or "").strip()
+                model_turn = invocation if not outcome else f"{invocation}\n\n# expected: {outcome}"
+                pairs.append((prompt_text, model_turn))
+            elif kind == "reasoning_edit":
+                # Reasoning-trace evolution (track 09): the completion carries the
+                # CORRECTED chain BEFORE the final action, so the model learns to
+                # reason internally at inference. Must match export.rs exactly.
+                prompt_text = row.get("prompt", "")
+                final_action = row.get("final_action", "")
+                edited = row.get("edited_steps", []) or []
+                if not prompt_text or not final_action:
+                    skipped += 1
+                    continue
+                original = row.get("original_steps", []) or []
+                if original:
+                    orig = "\n".join(f"{i+1}. {s}" for i, s in enumerate(original))
+                    user = (
+                        f"{prompt_text}\n\nCurrent reasoning:\n{orig}\n\n"
+                        "Improve this reasoning, then give the final action."
+                    )
+                else:
+                    user = f"{prompt_text}\n\nReason step by step, then give the final action."
+                chain = "\n".join(f"{i+1}. {s}" for i, s in enumerate(edited))
+                model_turn = f"=> {final_action}" if not chain else f"{chain}\n=> {final_action}"
+                pairs.append((user, model_turn))
             elif kind == "completion":
                 # Plain language-modeling text (no instruction prompt).
                 text = row.get("text", "")

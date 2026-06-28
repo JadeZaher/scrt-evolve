@@ -219,5 +219,16 @@ fn row_text(row: &GenExample) -> String {
         GenExample::Cli {
             prompt, command, ..
         } => format!("{prompt} {command}"),
+        GenExample::Skill {
+            prompt,
+            skill_name,
+            invocation,
+            ..
+        } => format!("{prompt} {skill_name} {invocation}"),
+        GenExample::ReasoningEdit {
+            prompt,
+            final_action,
+            ..
+        } => format!("{prompt} {final_action}"),
     }
 }

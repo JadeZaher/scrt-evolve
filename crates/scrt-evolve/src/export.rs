@@ -125,10 +125,74 @@ fn row_to_pair(row: &GenExample, fmt: ToolFormat) -> Option<(String, String)> {
         GenExample::Cli {
             prompt, command, ..
         } => Some((prompt.clone(), command.clone())),
+        // Skill ingestion: the request → the invocation that uses the skill,
+        // followed by the expected outcome when present (teaches trigger→call).
+        GenExample::Skill {
+            prompt,
+            invocation,
+            expected_outcome,
+            ..
+        } => {
+            let model_turn = match expected_outcome {
+                Some(o) if !o.trim().is_empty() => format!("{invocation}\n\n# expected: {o}"),
+                _ => invocation.clone(),
+            };
+            Some((prompt.clone(), model_turn))
+        }
+        // Reasoning edit: render so the completion carries the CORRECTED chain
+        // BEFORE the final action — this is what trains the model to reason
+        // internally at inference, not just emit an answer. The user turn shows
+        // the task + the original (flawed) steps so the target is the *fix*.
+        GenExample::ReasoningEdit {
+            prompt,
+            original_steps,
+            edited_steps,
+            final_action,
+            ..
+        } => Some((
+            render_reasoning_user(prompt, original_steps),
+            render_reasoning_completion(edited_steps, final_action),
+        )),
         // Raw completions train as-is; pretrain-style, not chat. Skip for the
         // instruction-tuning export.
         GenExample::Completion { .. } => None,
         GenExample::Contrastive { .. } => None,
+    }
+}
+
+/// User turn for a reasoning-edit row: the task, plus the original (flawed)
+/// reasoning to improve. Empty `original_steps` ⇒ just the task (model produces
+/// a fresh chain). Kept in one place so the Rust export + Python trainer agree.
+fn render_reasoning_user(prompt: &str, original_steps: &[String]) -> String {
+    if original_steps.is_empty() {
+        format!("{prompt}\n\nReason step by step, then give the final action.")
+    } else {
+        let steps = original_steps
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("{}. {s}", i + 1))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "{prompt}\n\nCurrent reasoning:\n{steps}\n\nImprove this reasoning, \
+then give the final action."
+        )
+    }
+}
+
+/// Model turn for a reasoning-edit row: the corrected chain, then the action —
+/// the internal reasoning the model learns to emit at inference.
+fn render_reasoning_completion(edited_steps: &[String], final_action: &str) -> String {
+    let chain = edited_steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("{}. {s}", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if chain.is_empty() {
+        format!("=> {final_action}")
+    } else {
+        format!("{chain}\n=> {final_action}")
     }
 }
 

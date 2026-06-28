@@ -1,3 +1,3 @@
-//! Contrastive preset — InfoNCE embedding adapter from palace structure
-//! (improves scrt's own retrieval). The existing in-tree seam ports here in
-//! track 05.
+//! Contrastive (InfoNCE embedding-adapter) preset. ARCHIVED (track 05,
+//! `conductor/tracks/_archived/`): an orthogonal mode the product doesn't use;
+//! `train::run` bails on this preset. Kept as a trait seam.

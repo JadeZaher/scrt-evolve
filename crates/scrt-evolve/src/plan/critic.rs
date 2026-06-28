@@ -38,6 +38,8 @@ pub fn measure(dataset: &Dataset) -> Coverage {
                 "tool_call"
             }
             GenExample::Cli { .. } => "cli",
+            GenExample::Skill { .. } => "skill",
+            GenExample::ReasoningEdit { .. } => "reasoning_edit",
         };
         *by_modality.entry(modality.to_string()).or_default() += 1;
     }

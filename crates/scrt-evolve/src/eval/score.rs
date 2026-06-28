@@ -177,6 +177,8 @@ impl<T: ChatTransport> ApiScorer<T> {
             GenExample::Qa { completion, .. } => reference_match(answer, completion),
             GenExample::Instruction { output, .. } => reference_match(answer, output),
             GenExample::Completion { text, .. } => reference_match(answer, text),
+            GenExample::Skill { invocation, .. } => reference_match(answer, invocation),
+            GenExample::ReasoningEdit { final_action, .. } => reference_match(answer, final_action),
             GenExample::Contrastive { .. } => false,
         }
     }
@@ -195,6 +197,8 @@ fn probe_prompt(item: &GenExample) -> Option<String> {
         }),
         GenExample::ToolCall { prompt, .. } => Some(prompt.clone()),
         GenExample::Cli { prompt, .. } => Some(prompt.clone()),
+        GenExample::Skill { prompt, .. } => Some(prompt.clone()),
+        GenExample::ReasoningEdit { prompt, .. } => Some(prompt.clone()),
         GenExample::Completion { .. } | GenExample::Contrastive { .. } => None,
     }
 }

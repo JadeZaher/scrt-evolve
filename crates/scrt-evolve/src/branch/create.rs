@@ -315,7 +315,9 @@ fn stamp_gen(dataset: &mut Dataset, stamp: &str) {
             GenExample::Qa { gen, .. }
             | GenExample::Instruction { gen, .. }
             | GenExample::ToolCall { gen, .. }
-            | GenExample::Cli { gen, .. } => *gen = Some(stamp.to_string()),
+            | GenExample::Cli { gen, .. }
+            | GenExample::Skill { gen, .. }
+            | GenExample::ReasoningEdit { gen, .. } => *gen = Some(stamp.to_string()),
             GenExample::Completion { .. } | GenExample::Contrastive { .. } => {}
         }
     }
