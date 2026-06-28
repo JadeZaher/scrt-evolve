@@ -134,6 +134,14 @@ impl<T: ChatTransport> GenBackend for ApiEndpoint<T> {
                 prompts::tool_call_user_prompt(ctx),
             ),
             GenMode::Cli => (prompts::cli_system_prompt(), prompts::cli_user_prompt(ctx)),
+            GenMode::Skill => (
+                prompts::skill_system_prompt(),
+                prompts::skill_user_prompt(ctx),
+            ),
+            GenMode::ReasoningEdit => (
+                prompts::reasoning_edit_system_prompt(),
+                prompts::reasoning_edit_user_prompt(ctx),
+            ),
         };
         let system = match ctx.custom_prompt {
             Some(guidance) => format!(
@@ -204,7 +212,7 @@ pub fn parse_examples(raw: &str, ctx: &GenContext) -> anyhow::Result<Vec<GenExam
         obj.insert("kind".into(), serde_json::Value::String(kind.clone()));
 
         match kind.as_str() {
-            "qa" | "instruction" | "tool_call" | "cli" => {
+            "qa" | "instruction" | "tool_call" | "cli" | "skill" | "reasoning_edit" => {
                 obj.entry("source")
                     .or_insert_with(|| serde_json::Value::String(source.clone()));
                 obj.entry("gen")
@@ -232,6 +240,18 @@ pub fn parse_examples(raw: &str, ctx: &GenContext) -> anyhow::Result<Vec<GenExam
         {
             continue;
         }
+        // Skill rows must name a non-empty skill and carry a non-empty invocation
+        // (mechanical grounding — the skill must be referenceable, not invented).
+        if kind == "skill"
+            && !(non_empty_str(&obj, "skill_name") && non_empty_str(&obj, "invocation"))
+        {
+            continue;
+        }
+        // Reasoning-edit rows must have a non-empty final_action, a known edit_op,
+        // and at least one corrected step (the target chain must exist).
+        if kind == "reasoning_edit" && !valid_reasoning_edit(&obj) {
+            continue;
+        }
 
         match serde_json::from_value::<GenExample>(serde_json::Value::Object(obj)) {
             Ok(ex) => out.push(ex),
@@ -246,7 +266,40 @@ fn default_kind_for(mode: GenMode) -> String {
         GenMode::Prose => "qa".into(),
         GenMode::ToolCall => "tool_call".into(),
         GenMode::Cli => "cli".into(),
+        GenMode::Skill => "skill".into(),
+        GenMode::ReasoningEdit => "reasoning_edit".into(),
     }
+}
+
+/// True if `obj[key]` is a present, non-empty string.
+fn non_empty_str(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
+    obj.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Validate a candidate reasoning_edit object: a non-empty `final_action`, a
+/// known `edit_op`, and at least one `edited_steps` entry (the corrected chain).
+fn valid_reasoning_edit(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    if !non_empty_str(obj, "final_action") {
+        return false;
+    }
+    let op_ok = obj
+        .get("edit_op")
+        .and_then(|v| v.as_str())
+        .map(|s| matches!(s, "insert" | "correct" | "prune" | "reorder"))
+        .unwrap_or(false);
+    if !op_ok {
+        return false;
+    }
+    obj.get("edited_steps")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .any(|s| s.as_str().map(|x| !x.trim().is_empty()).unwrap_or(false))
+        })
+        .unwrap_or(false)
 }
 
 /// Validate a candidate tool_call object against the real tool schemas: the
@@ -364,6 +417,106 @@ pub struct HttpTransport {
     api_key: Option<String>,
 }
 
+/// Shape of `GET {base_url}/models` (OpenAI-compatible: `{ "data": [{ "id" }] }`).
+#[derive(Deserialize)]
+struct ModelsResponse {
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelEntry {
+    id: String,
+}
+
+/// Verdict of the judge [`preflight`]: is the configured judge model actually
+/// loadable on the endpoint right now? See track 31 Q1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JudgePreflight {
+    /// `backend != "api"` or no `[generate.api]` — nothing to preflight.
+    NotApi,
+    /// The configured `model` is in the endpoint's `/models` list.
+    Available { model: String },
+    /// The endpoint answered but the configured `model` is NOT served. Carries
+    /// the available ids so the operator can pick one.
+    Missing {
+        model: String,
+        available: Vec<String>,
+    },
+    /// The endpoint could not be reached (down / timeout / bad response). The
+    /// daemon already degrades to keep-all, so this is a soft note, not a fail.
+    EndpointDown { detail: String },
+}
+
+/// Preflight the relevance-judge model against the live endpoint (track 31 Q1).
+/// Resolves `base_url` / `model` / api-key the SAME way [`ApiEndpoint::from_config`]
+/// does, then queries [`list_models`]. Pure of side effects beyond the HTTP GET;
+/// callers (`--ambient` warn, `doctor` check) decide how loud to be.
+pub fn preflight(gcfg: &GenerateConfig) -> JudgePreflight {
+    if gcfg.backend != "api" {
+        return JudgePreflight::NotApi;
+    }
+    let Some(api) = gcfg.api.as_ref() else {
+        return JudgePreflight::NotApi;
+    };
+    let (Some(base_url), Some(model)) = (api.base_url.as_ref(), api.model.as_ref()) else {
+        return JudgePreflight::NotApi;
+    };
+    // An unset api_key_env ⇒ no auth (local endpoint); a set-but-missing var is
+    // treated as "no key" here (the preflight shouldn't hard-error on env).
+    let api_key = api.api_key_env.as_ref().and_then(|v| std::env::var(v).ok());
+    classify_models(
+        model,
+        list_models(base_url, api_key.as_deref()).map_err(|e| e.to_string()),
+    )
+}
+
+/// Pure classification of a `/models` result against the configured model — the
+/// testable core of [`preflight`] (the HTTP call is the only impure part).
+fn classify_models(model: &str, result: Result<Vec<String>, String>) -> JudgePreflight {
+    match result {
+        Ok(available) => {
+            if available.iter().any(|m| m == model) {
+                JudgePreflight::Available {
+                    model: model.to_string(),
+                }
+            } else {
+                JudgePreflight::Missing {
+                    model: model.to_string(),
+                    available,
+                }
+            }
+        }
+        Err(detail) => JudgePreflight::EndpointDown { detail },
+    }
+}
+
+/// List the model ids an OpenAI-compatible endpoint currently serves (`GET
+/// /models`). The **judge preflight** (track 31 Q1): "configured in toml" ≠
+/// "loaded in LM Studio". Endpoint down / non-200 ⇒ `Err` (the caller decides
+/// whether that's a warn or a hard fail). Short timeout — this gates a long run,
+/// it must not hang it.
+pub fn list_models(base_url: &str, api_key: Option<&str>) -> anyhow::Result<Vec<String>> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    let mut req = client.get(&url);
+    if let Some(key) = api_key {
+        if !key.is_empty() {
+            req = req.bearer_auth(key);
+        }
+    }
+    let resp = req.send()?;
+    let status = resp.status();
+    let text = resp.text()?;
+    if !status.is_success() {
+        anyhow::bail!("generate.api: {status} from {url}: {text}");
+    }
+    let parsed: ModelsResponse = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("generate.api: bad /models JSON: {e}\nbody: {text}"))?;
+    Ok(parsed.data.into_iter().map(|m| m.id).collect())
+}
+
 #[derive(Serialize)]
 struct ChatRequest<'a> {
     model: &'a str,
@@ -413,5 +566,72 @@ impl ChatTransport for HttpTransport {
             .map(|c| c.message.content)
             .ok_or_else(|| anyhow::anyhow!("generate.api: response had no choices"))?;
         Ok(content)
+    }
+}
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::*;
+    use crate::config::{GenerateApiConfig, GenerateConfig};
+
+    #[test]
+    fn classify_available_when_model_served() {
+        let v = classify_models("granite", Ok(vec!["granite".into(), "qwen".into()]));
+        assert_eq!(
+            v,
+            JudgePreflight::Available {
+                model: "granite".into()
+            }
+        );
+    }
+
+    #[test]
+    fn classify_missing_carries_available_list() {
+        let v = classify_models("gone-model", Ok(vec!["a".into(), "b".into()]));
+        match v {
+            JudgePreflight::Missing { model, available } => {
+                assert_eq!(model, "gone-model");
+                assert_eq!(available, vec!["a".to_string(), "b".to_string()]);
+            }
+            other => panic!("expected Missing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_endpoint_down_on_err() {
+        let v = classify_models("m", Err("connection refused".into()));
+        assert!(matches!(v, JudgePreflight::EndpointDown { .. }));
+    }
+
+    #[test]
+    fn preflight_not_api_for_local_backend() {
+        let gcfg = GenerateConfig {
+            backend: "local".into(),
+            ..Default::default()
+        };
+        assert_eq!(preflight(&gcfg), JudgePreflight::NotApi);
+    }
+
+    #[test]
+    fn preflight_not_api_when_block_incomplete() {
+        // backend=api but no model set => nothing to preflight (no HTTP attempted).
+        let gcfg = GenerateConfig {
+            backend: "api".into(),
+            api: Some(GenerateApiConfig {
+                base_url: Some("http://localhost:1234/v1".into()),
+                model: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(preflight(&gcfg), JudgePreflight::NotApi);
+    }
+
+    #[test]
+    fn models_response_parses_openai_shape() {
+        let body = r#"{"data":[{"id":"granite-4-h-tiny"},{"id":"qwen3.5"}],"object":"list"}"#;
+        let parsed: ModelsResponse = serde_json::from_str(body).unwrap();
+        let ids: Vec<String> = parsed.data.into_iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec!["granite-4-h-tiny", "qwen3.5"]);
     }
 }

@@ -8,8 +8,15 @@ use serde_json::Value;
 use crate::dataset::GenExample;
 use crate::generate::api::{ChatMessage, ChatTransport};
 
-/// Provenance stamp for rows mined from interaction logs (the quarantine key).
+/// Provenance stamp prefix for ingested rows (the quarantine key root). Kept for
+/// back-compat; new rows use the per-source stamps below so a catastrophe in one
+/// source doesn't quarantine all ingested data (track 31 Q2).
 pub const INGEST_GEN_STAMP: &str = "ingest";
+
+/// Per-source provenance stamp for rows mined from interaction transcripts.
+pub const INGEST_GEN_TRANSCRIPT: &str = "ingest:transcript";
+/// Per-source provenance stamp for rows chunked from docs.
+pub const INGEST_GEN_DOC: &str = "ingest:doc";
 
 /// Cap on a fallback intent prompt taken from a (possibly huge) user message.
 const MAX_FALLBACK_PROMPT: usize = 400;
@@ -81,7 +88,7 @@ pub fn interaction_log_rows(jsonl: &str) -> Vec<GenExample> {
                                     prompt: user.to_string(),
                                     completion: prose.to_string(),
                                     source: Some("transcript".to_string()),
-                                    gen: Some(INGEST_GEN_STAMP.to_string()),
+                                    gen: Some(INGEST_GEN_TRANSCRIPT.to_string()),
                                 },
                             );
                         }
@@ -114,7 +121,7 @@ fn tool_use_row(blk: &Value, last_user: Option<&str>) -> Option<GenExample> {
             prompt,
             command: command.to_string(),
             source: Some("transcript".to_string()),
-            gen: Some(INGEST_GEN_STAMP.to_string()),
+            gen: Some(INGEST_GEN_TRANSCRIPT.to_string()),
         });
     }
 
@@ -131,7 +138,7 @@ fn tool_use_row(blk: &Value, last_user: Option<&str>) -> Option<GenExample> {
         tool: name.to_string(),
         arguments: args,
         source: Some("transcript".to_string()),
-        gen: Some(INGEST_GEN_STAMP.to_string()),
+        gen: Some(INGEST_GEN_TRANSCRIPT.to_string()),
     })
 }
 
@@ -271,6 +278,20 @@ fn render_candidate(row: &GenExample) -> String {
         ),
         GenExample::Completion { text, .. } => format!("text: {}", truncate(text, 200)),
         GenExample::Contrastive { query, .. } => format!("contrastive: {}", truncate(query, 160)),
+        GenExample::Skill {
+            skill_name,
+            invocation,
+            ..
+        } => format!("skill {skill_name}: {}", truncate(invocation, 200)),
+        GenExample::ReasoningEdit {
+            prompt,
+            final_action,
+            ..
+        } => format!(
+            "reasoning: {} -> {}",
+            truncate(prompt, 120),
+            truncate(final_action, 160)
+        ),
     }
 }
 
@@ -423,7 +444,9 @@ mod tests {
             } => {
                 assert_eq!(prompt, "Show working tree status");
                 assert_eq!(command, "git status");
-                assert_eq!(gen.as_deref(), Some(INGEST_GEN_STAMP));
+                // Per-source stamp now (track 31 Q2): transcript rows are tagged
+                // `ingest:transcript` so a catastrophe quarantines only that source.
+                assert_eq!(gen.as_deref(), Some(INGEST_GEN_TRANSCRIPT));
             }
             other => panic!("expected Cli, got {other:?}"),
         }

@@ -37,6 +37,12 @@ use crate::living_queue::{Lane, LivingQueue};
 use crate::regulate::{Regulator, StepAction};
 use crate::workdir::WorkDir;
 
+/// The track-32 degradation-gate hook: given the per-step config, sample the
+/// probe BEFORE/AFTER and return the degradation report. Boxed-fn alias to keep
+/// the [`DaemonHooks`] field legible.
+pub type DegradeHook<'a> =
+    &'a dyn Fn(&EvolveConfig) -> anyhow::Result<crate::eval::DegradationReport>;
+
 /// The injected effects the daemon needs. Kept closure-based so production
 /// (subprocess + GPU probe) and tests (deterministic) share one loop.
 pub struct DaemonHooks<'a> {
@@ -54,6 +60,21 @@ pub struct DaemonHooks<'a> {
     pub train: &'a dyn Fn(&EvolveConfig, &Dataset) -> anyhow::Result<Vec<String>>,
     /// Score the current model against the probe. Production: `eval::run_eval`.
     pub score: &'a dyn Fn(&EvolveConfig) -> anyhow::Result<ScoreReport>,
+    /// Monotonic wall-clock in seconds (Q3 budget + retry backoff timing).
+    /// Production: seconds since the daemon started. Tests inject a controllable
+    /// clock so the budget window is deterministic.
+    pub now_secs: &'a dyn Fn() -> u64,
+    /// Sleep for a duration (Q2 retry backoff). Production: `thread::sleep`; tests
+    /// inject a no-op so retries don't actually wait.
+    pub sleep: &'a dyn Fn(Duration),
+    /// Track 32 — the OPTIONAL degradation gate. `Some` ⇒ after training, sample
+    /// the probe BEFORE (base) vs AFTER (base+candidate-adapter) and judge whether
+    /// AFTER degraded; the step is accepted UNLESS degradation exceeds the
+    /// threshold (`crate::eval::judge_verdict`). `None` ⇒ the correctness gate
+    /// (today's behavior). Production wires this to the A/B subprocess + LLM judge;
+    /// tests inject a deterministic report. Runs AFTER `train`, on the mutated
+    /// adapter (so the candidate is what gets sampled).
+    pub degrade: Option<DegradeHook<'a>>,
 }
 
 /// Tunables for a daemon run. `[daemon]` config + CLI flags populate these.
@@ -84,6 +105,20 @@ pub struct DaemonOptions {
     pub rotation_blocks: usize,
     /// Sleep after each executed step to cap GPU duty cycle (production only).
     pub cooldown: Duration,
+    /// Q2: retry a TRANSIENT step error (train/score subprocess failure) this many
+    /// times before recording a failed-but-non-halting step. `0` ⇒ no retry.
+    pub max_retries: u32,
+    /// Q2: base backoff between transient retries (doubled each attempt).
+    pub backoff_base: Duration,
+    /// Q2: stop the loop after this many CONSECUTIVE step failures. `0` ⇒ never.
+    pub max_consecutive_failures: u32,
+    /// Q3: wall-clock training budget — max minutes of training per rolling hour.
+    /// `0` ⇒ unlimited. Enforced via the injected clock + a sliding window.
+    pub max_minutes_per_hour: u64,
+    /// Track 32: minimum genuinely-new rows to train in one step. A batch below
+    /// this is skipped (rows stay queued) so we don't overfit on 1–2 rows. `0` ⇒
+    /// no floor.
+    pub min_train_pairs: usize,
 }
 
 impl Default for DaemonOptions {
@@ -99,6 +134,11 @@ impl Default for DaemonOptions {
             cpu_fallback: true,
             rotation_blocks: 0,
             cooldown: Duration::from_secs(0),
+            max_retries: 0,
+            backoff_base: Duration::from_secs(5),
+            max_consecutive_failures: 0,
+            max_minutes_per_hour: 0,
+            min_train_pairs: 0,
         }
     }
 }
@@ -156,6 +196,50 @@ pub fn decide_step(
     }
 }
 
+/// Q3 — wall-clock training budget. Pure: given the rolling window of recent
+/// (timestamp, train_secs) entries, `now`, and the per-hour cap (minutes), decide
+/// whether another training step is within budget. A `0` cap is unlimited. Only
+/// entries within the last hour count (the window is a sliding 3600 s).
+pub fn within_budget(window: &[(u64, u64)], now: u64, max_minutes_per_hour: u64) -> bool {
+    if max_minutes_per_hour == 0 {
+        return true;
+    }
+    let horizon = now.saturating_sub(3600);
+    let spent_secs: u64 = window
+        .iter()
+        .filter(|(ts, _)| *ts >= horizon)
+        .map(|(_, secs)| *secs)
+        .sum();
+    spent_secs < max_minutes_per_hour * 60
+}
+
+/// Drop window entries older than one hour relative to `now` (keep the slide
+/// bounded). Returns the retained entries.
+fn prune_window(mut window: Vec<(u64, u64)>, now: u64) -> Vec<(u64, u64)> {
+    let horizon = now.saturating_sub(3600);
+    window.retain(|(ts, _)| *ts >= horizon);
+    window
+}
+
+/// Track 32 — the min-QA-pairs floor. Pure: may a batch of `n` trainable rows
+/// train this step? `min == 0` ⇒ no floor (any non-empty batch trains). Below the
+/// floor ⇒ skip + accumulate (the rows stay queued; the loop idles).
+pub fn enough_to_train(n: usize, min: usize) -> bool {
+    n > 0 && n >= min
+}
+
+/// Classify whether a step error is TRANSIENT (worth a retry) vs a hard problem.
+/// Conservative: anything that isn't an obvious permanent misconfiguration is
+/// treated as transient (OOM, subprocess blip, endpoint hiccup all recover on a
+/// retry). A genuine track-15 CATASTROPHE never reaches here — it comes back as
+/// `outcome.halt` from a SUCCESSFUL `run_step`, not as an `Err`.
+fn is_transient(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_lowercase();
+    // Permanent-looking misconfig: don't spin on these.
+    let permanent = ["no such file", "not found", "is unset", "required", "parse"];
+    !permanent.iter().any(|p| msg.contains(p))
+}
+
 /// Build a per-step config carrying the placement plan: set `[hardware].device`
 /// and, when rotating, the `[train.fractional]` block index. Clone-and-mutate so
 /// the daemon's shared config is untouched.
@@ -194,6 +278,9 @@ pub struct DaemonStep {
     pub action: Option<StepAction>,
     pub metrics: Option<ScoreReport>,
     pub halt: bool,
+    /// Q2: this step exhausted its retries on a TRANSIENT error (not a
+    /// catastrophe-halt). The error text is in `note`.
+    pub failed: bool,
     pub note: String,
 }
 
@@ -207,6 +294,9 @@ pub struct DaemonReport {
     pub stopped: bool,
     /// The queue drained and `exit_when_empty` was set.
     pub drained: bool,
+    /// Q2: the supervisor gave up after `max_consecutive_failures` consecutive
+    /// transient step failures (re-arm/restart required).
+    pub gave_up: bool,
 }
 
 impl DaemonReport {
@@ -260,6 +350,9 @@ pub fn run_daemon(
     let mut report = DaemonReport::default();
     let mut ordinal = opts.start_ordinal;
     let mut taken = 0u64;
+    let mut consecutive_failures = 0u32;
+    // Q3: sliding (timestamp, train_secs) window for the per-hour wall-clock cap.
+    let mut budget_window: Vec<(u64, u64)> = Vec::new();
 
     loop {
         if let Some(max) = opts.max_steps {
@@ -270,6 +363,27 @@ pub fn run_daemon(
         if should_stop() {
             report.stopped = true;
             break;
+        }
+
+        // (1b) Q3 wall-clock budget gate: if we've trained our per-hour minutes,
+        // WAIT (same as the VRAM gate) — yield real time, not just VRAM.
+        let now = (hooks.now_secs)();
+        budget_window = prune_window(budget_window, now);
+        if !within_budget(&budget_window, now, opts.max_minutes_per_hour) {
+            if opts.exit_when_empty {
+                report.steps.push(DaemonStep {
+                    ordinal,
+                    items: 0,
+                    action: None,
+                    metrics: None,
+                    halt: false,
+                    failed: false,
+                    note: "paused: per-hour training budget spent".to_string(),
+                });
+                break;
+            }
+            (hooks.sleep)(opts.poll_interval);
+            continue;
         }
 
         // (2) Adaptive gate: GPU when free, CPU when the GPU is busy/starved (if
@@ -286,14 +400,47 @@ pub fn run_daemon(
                         action: None,
                         metrics: None,
                         halt: false,
+                        failed: false,
                         note: reason.clone(),
                     });
                     break;
                 }
-                std::thread::sleep(opts.poll_interval);
+                (hooks.sleep)(opts.poll_interval);
                 continue;
             }
         };
+
+        // (2c) Track 32 min-QA-pairs floor: if there aren't yet enough pending
+        // rows to train on, DON'T pop — leave them queued and accumulate (idle, or
+        // stop in drain mode). Checked BEFORE popping so the cursor isn't advanced
+        // (the rows wait for more to arrive). Composes with the Q5 ledger: a stale
+        // corpus that yields too few new rows simply idles.
+        if opts.min_train_pairs > 0 {
+            let (p, r) = queue.pending();
+            let pending = (p + r) as usize;
+            if !enough_to_train(pending, opts.min_train_pairs) {
+                if pending == 0 {
+                    report.drained = true;
+                }
+                if opts.exit_when_empty {
+                    report.steps.push(DaemonStep {
+                        ordinal,
+                        items: pending,
+                        action: None,
+                        metrics: None,
+                        halt: false,
+                        failed: false,
+                        note: format!(
+                            "{pending} pending < min_train_pairs={} — accumulating",
+                            opts.min_train_pairs
+                        ),
+                    });
+                    break;
+                }
+                (hooks.sleep)(opts.poll_interval);
+                continue;
+            }
+        }
 
         // (3) Pop a batch (priority-first); drop quarantined provenance.
         let items = queue.pop_batch(opts.batch)?;
@@ -302,7 +449,7 @@ pub fn run_daemon(
             if opts.exit_when_empty {
                 break;
             }
-            std::thread::sleep(opts.poll_interval);
+            (hooks.sleep)(opts.poll_interval);
             continue;
         }
         let lane_note = if items.iter().any(|i| i.lane == Lane::Priority) {
@@ -320,6 +467,7 @@ pub fn run_daemon(
                 action: None,
                 metrics: None,
                 halt: false,
+                failed: false,
                 note: format!("all {} row(s) quarantined — skipped", items.len()),
             });
             ordinal += 1;
@@ -336,20 +484,120 @@ pub fn run_daemon(
             .unwrap_or("module");
         let step_cfg = apply_plan(cfg, device, shard, opts.rotation_blocks, granularity);
         let id = format!("daemon-{ordinal}");
-        let outcome = reg.run_step(
-            &id,
-            "daemon:microshard",
-            ordinal,
-            baseline,
-            || (hooks.train)(&step_cfg, &dataset),
-            || (hooks.score)(&step_cfg),
-        )?;
+
+        // (4) The transaction WITH Q2 retry: a TRANSIENT failure of EITHER
+        // train OR score (subprocess non-zero, OOM, endpoint blip) makes
+        // `run_step_strict` return `Err` — retry with exponential backoff.
+        // (`run_step_strict`, unlike the lenient `run_step`, propagates a train
+        // error instead of swallowing it into a silent rollback — track 31 Q2.)
+        // A track-15 CATASTROPHE is NOT an `Err`; it comes back as a successful
+        // outcome with `halt=true`, so it bypasses retry and halts as before. A
+        // permanent-looking error (missing file, misconfig) is not retried.
+        let train_start = (hooks.now_secs)();
+        let mut attempt = 0u32;
+        // Track 32: the verdict source. `degrade` present ⇒ the JUDGE gate
+        // (accept unless degradation); else the correctness gate (run_step_strict).
+        let tol = reg.tolerances();
+        let max_regressed_frac = cfg
+            .regulate
+            .as_ref()
+            .map(|r| r.max_regressed_frac)
+            .unwrap_or(0.0);
+        let outcome = loop {
+            let txn = if let Some(degrade) = hooks.degrade {
+                reg.run_step_judged(
+                    &id,
+                    "daemon:microshard",
+                    ordinal,
+                    baseline,
+                    || (hooks.train)(&step_cfg, &dataset),
+                    || (hooks.score)(&step_cfg),
+                    |candidate| {
+                        // Sample BEFORE/AFTER + judge on the just-trained adapter.
+                        let report = degrade(&step_cfg)?;
+                        Ok(crate::eval::judge_verdict(
+                            baseline,
+                            candidate.correctness,
+                            report.regressed_fraction(),
+                            &tol,
+                            max_regressed_frac,
+                        ))
+                    },
+                )
+            } else {
+                reg.run_step_strict(
+                    &id,
+                    "daemon:microshard",
+                    ordinal,
+                    baseline,
+                    || (hooks.train)(&step_cfg, &dataset),
+                    || (hooks.score)(&step_cfg),
+                )
+            };
+            match txn {
+                Ok(o) => break Ok(o),
+                Err(e) => {
+                    if attempt >= opts.max_retries || !is_transient(&e) {
+                        break Err(e);
+                    }
+                    let backoff = opts.backoff_base * 2u32.pow(attempt);
+                    attempt += 1;
+                    eprintln!(
+                        "daemon: step {ordinal} transient failure (attempt {attempt}/{}): {e} \
+                         — retrying in {}s",
+                        opts.max_retries,
+                        backoff.as_secs()
+                    );
+                    (hooks.sleep)(backoff);
+                }
+            }
+        };
 
         let place = match (device, shard) {
             ("cpu", _) => " on cpu".to_string(),
             (_, Some(b)) => format!(" block {b}"),
             _ => String::new(),
         };
+
+        let outcome = match outcome {
+            Ok(o) => o,
+            Err(e) => {
+                // Retries exhausted (or permanent error): record a failed,
+                // NON-halting step and let the supervisor decide whether to give
+                // up. The model is untouched — `run_step` is transactional.
+                consecutive_failures += 1;
+                report.steps.push(DaemonStep {
+                    ordinal,
+                    items: items.len() - dropped,
+                    action: None,
+                    metrics: None,
+                    halt: false,
+                    failed: true,
+                    note: format!("[{lane_note}]{place} step FAILED after retries: {e}"),
+                });
+                ordinal += 1;
+                taken += 1;
+                if opts.max_consecutive_failures > 0
+                    && consecutive_failures >= opts.max_consecutive_failures
+                {
+                    report.gave_up = true;
+                    break;
+                }
+                if opts.exit_when_empty {
+                    // Bounded mode: don't spin — surface the failure and stop.
+                    break;
+                }
+                (hooks.sleep)(opts.poll_interval);
+                continue;
+            }
+        };
+
+        // A successful step (committed/rolled-back/catastrophe) resets the streak.
+        consecutive_failures = 0;
+        // Q3: account this step's training time in the sliding budget window.
+        let train_secs = (hooks.now_secs)().saturating_sub(train_start);
+        budget_window.push((train_start, train_secs));
+
         let note = match outcome.action {
             StepAction::Commit => format!("[{lane_note}]{place} kept (eval passed)"),
             StepAction::Rollback => format!("[{lane_note}]{place} rolled back (regress)"),
@@ -364,6 +612,7 @@ pub fn run_daemon(
             action: Some(outcome.action),
             metrics: outcome.metrics,
             halt,
+            failed: false,
             note,
         });
 
@@ -377,7 +626,7 @@ pub fn run_daemon(
         // (6) Cooldown — leave the GPU idle between steps so foreground apps get
         // gaps (production only; tests use the 0 default and never sleep).
         if !opts.cooldown.is_zero() {
-            std::thread::sleep(opts.cooldown);
+            (hooks.sleep)(opts.cooldown);
         }
     }
 
@@ -429,6 +678,13 @@ mod tests {
         r
     }
 
+    // A fixed clock + no-op sleep for deterministic tests (no real waiting, no
+    // wall-clock dependence). Budget tests override `now` via a Cell-backed clock.
+    fn zero_now() -> u64 {
+        0
+    }
+    fn noop_sleep(_: Duration) {}
+
     #[test]
     fn drains_queue_and_commits_each_step() {
         let dir = tmp("drain");
@@ -454,6 +710,9 @@ mod tests {
             gpu_busy: &gpu_idle,
             train: &train,
             score: &score,
+            now_secs: &zero_now,
+            sleep: &noop_sleep,
+            degrade: None,
         };
         let opts = DaemonOptions {
             max_vram_gb: Some(4.0),
@@ -483,6 +742,9 @@ mod tests {
             gpu_busy: &gpu_idle,
             train: &train,
             score: &score,
+            now_secs: &zero_now,
+            sleep: &noop_sleep,
+            degrade: None,
         };
         let opts = DaemonOptions {
             max_vram_gb: Some(4.0),
@@ -595,6 +857,9 @@ mod tests {
             gpu_busy: &gpu_busy,
             train: &train,
             score: &score,
+            now_secs: &zero_now,
+            sleep: &noop_sleep,
+            degrade: None,
         };
         let opts = DaemonOptions {
             max_vram_gb: Some(4.0),
@@ -627,6 +892,9 @@ mod tests {
             gpu_busy: &gpu_idle,
             train: &train,
             score: &score,
+            now_secs: &zero_now,
+            sleep: &noop_sleep,
+            degrade: None,
         };
         let opts = DaemonOptions {
             max_vram_gb: Some(4.0),
@@ -636,5 +904,372 @@ mod tests {
         };
         let report = run_daemon(&cfg, &opts, &good_score(), &hooks, &|| false).unwrap();
         assert_eq!(report.steps.len(), 3);
+    }
+
+    // ───────────────────── Track 31 Q2/Q3 hardening ─────────────────────
+
+    #[test]
+    fn within_budget_unlimited_when_zero() {
+        assert!(within_budget(&[(0, 9999)], 100, 0), "0 cap ⇒ unlimited");
+    }
+
+    #[test]
+    fn within_budget_blocks_when_spent() {
+        // Cap 1 min/hr = 60s. 50s spent within the last hour ⇒ still ok; 70s ⇒ over.
+        assert!(within_budget(&[(100, 50)], 120, 1));
+        assert!(!within_budget(&[(100, 70)], 120, 1));
+    }
+
+    #[test]
+    fn within_budget_forgets_old_window() {
+        // 100s of training, but it was > 1h ago ⇒ doesn't count against now.
+        assert!(within_budget(&[(0, 100)], 4000, 1));
+    }
+
+    #[test]
+    fn is_transient_classifies_errors() {
+        assert!(is_transient(&anyhow::anyhow!("CUDA out of memory")));
+        assert!(is_transient(&anyhow::anyhow!(
+            "subprocess exited with code 1"
+        )));
+        // Permanent-looking misconfig is NOT retried.
+        assert!(!is_transient(&anyhow::anyhow!(
+            "model.safetensors: not found"
+        )));
+        assert!(!is_transient(&anyhow::anyhow!(
+            "generate.api: `model` is required"
+        )));
+    }
+
+    #[test]
+    fn transient_score_failure_is_retried_then_survives() {
+        // A flaky SCORE hook (eval subprocess blip) fails twice, then succeeds.
+        // run_step surfaces a score error as Err → the daemon retries it.
+        let dir = tmp("retry");
+        let cfg = cfg_for(&dir);
+        let q = LivingQueue::from_config(&cfg).unwrap();
+        q.enqueue(Lane::Raw, &qa("a")).unwrap();
+        let free_vram = || Some(40.0);
+        let train = |_: &EvolveConfig, _: &Dataset| Ok(vec!["teach".to_string()]);
+        let attempts = Cell::new(0u32);
+        let score = |_: &EvolveConfig| {
+            let n = attempts.get();
+            attempts.set(n + 1);
+            if n < 2 {
+                anyhow::bail!("eval subprocess timed out (transient)")
+            }
+            Ok(good_score())
+        };
+        let gpu_idle = || Some(false);
+        let hooks = DaemonHooks {
+            free_vram_gb: &free_vram,
+            gpu_busy: &gpu_idle,
+            train: &train,
+            score: &score,
+            now_secs: &zero_now,
+            sleep: &noop_sleep,
+            degrade: None,
+        };
+        let opts = DaemonOptions {
+            max_vram_gb: Some(4.0),
+            max_retries: 3,
+            exit_when_empty: true,
+            ..Default::default()
+        };
+        let report = run_daemon(&cfg, &opts, &good_score(), &hooks, &|| false).unwrap();
+        assert_eq!(attempts.get(), 3, "two failures + one success");
+        assert_eq!(report.committed(), 1, "the step eventually committed");
+        assert!(!report.gave_up);
+    }
+
+    #[test]
+    fn transient_train_failure_is_retried_then_survives() {
+        // A flaky TRAIN hook (train subprocess blip). Because the daemon uses
+        // run_step_strict, a train error now ALSO propagates as Err and is
+        // retried — it is no longer swallowed into a silent rollback (Q2 follow-up).
+        let dir = tmp("retry-train");
+        let cfg = cfg_for(&dir);
+        let q = LivingQueue::from_config(&cfg).unwrap();
+        q.enqueue(Lane::Raw, &qa("a")).unwrap();
+        let free_vram = || Some(40.0);
+        let attempts = Cell::new(0u32);
+        let train = |_: &EvolveConfig, _: &Dataset| {
+            let n = attempts.get();
+            attempts.set(n + 1);
+            if n < 2 {
+                anyhow::bail!("train subprocess exited with code 1 (transient)")
+            }
+            Ok(vec!["teach".to_string()])
+        };
+        let score = |_: &EvolveConfig| Ok(good_score());
+        let gpu_idle = || Some(false);
+        let hooks = DaemonHooks {
+            free_vram_gb: &free_vram,
+            gpu_busy: &gpu_idle,
+            train: &train,
+            score: &score,
+            now_secs: &zero_now,
+            sleep: &noop_sleep,
+            degrade: None,
+        };
+        let opts = DaemonOptions {
+            max_vram_gb: Some(4.0),
+            max_retries: 3,
+            exit_when_empty: true,
+            ..Default::default()
+        };
+        let report = run_daemon(&cfg, &opts, &good_score(), &hooks, &|| false).unwrap();
+        assert_eq!(attempts.get(), 3, "two train failures + one success");
+        assert_eq!(report.committed(), 1, "the step eventually committed");
+        assert!(!report.gave_up);
+    }
+
+    #[test]
+    fn exhausted_retries_record_failed_step_and_supervisor_gives_up() {
+        // A persistently-failing transient hook: each step exhausts retries and
+        // is recorded as failed; the supervisor stops after the cap.
+        let dir = tmp("giveup");
+        let cfg = cfg_for(&dir);
+        let q = LivingQueue::from_config(&cfg).unwrap();
+        q.enqueue_many(Lane::Raw, &[qa("a"), qa("b"), qa("c")])
+            .unwrap();
+        let free_vram = || Some(40.0);
+        let train = |_: &EvolveConfig, _: &Dataset| Ok(vec!["teach".to_string()]);
+        let score = |_: &EvolveConfig| anyhow::bail!("eval keeps timing out");
+        let gpu_idle = || Some(false);
+        let hooks = DaemonHooks {
+            free_vram_gb: &free_vram,
+            gpu_busy: &gpu_idle,
+            train: &train,
+            score: &score,
+            now_secs: &zero_now,
+            sleep: &noop_sleep,
+            degrade: None,
+        };
+        let opts = DaemonOptions {
+            max_vram_gb: Some(4.0),
+            max_retries: 1,
+            max_consecutive_failures: 2,
+            // NOT drain mode: the supervisor cap is what stops it.
+            exit_when_empty: false,
+            ..Default::default()
+        };
+        let report = run_daemon(&cfg, &opts, &good_score(), &hooks, &|| false).unwrap();
+        assert!(report.gave_up, "supervisor gave up after the failure cap");
+        assert_eq!(report.committed(), 0);
+        assert_eq!(
+            report.steps.iter().filter(|s| s.failed).count(),
+            2,
+            "two failed steps recorded before giving up"
+        );
+    }
+
+    #[test]
+    fn budget_gate_pauses_in_drain_mode() {
+        // A clock that jumps so the budget window shows minutes already spent.
+        let dir = tmp("budget");
+        let cfg = cfg_for(&dir);
+        let q = LivingQueue::from_config(&cfg).unwrap();
+        q.enqueue(Lane::Raw, &qa("a")).unwrap();
+        let free_vram = || Some(40.0);
+        let train = |_: &EvolveConfig, _: &Dataset| Ok(vec!["teach".to_string()]);
+        let score = |_: &EvolveConfig| Ok(good_score());
+        let gpu_idle = || Some(false);
+        // First step trains for 120s (clock advances), exceeding a 1 min/hr cap on
+        // the SECOND iteration's budget check.
+        let clock = Cell::new(0u64);
+        let now = || {
+            let t = clock.get();
+            clock.set(t + 120);
+            t
+        };
+        let hooks = DaemonHooks {
+            free_vram_gb: &free_vram,
+            gpu_busy: &gpu_idle,
+            train: &train,
+            score: &score,
+            now_secs: &now,
+            sleep: &noop_sleep,
+            degrade: None,
+        };
+        let opts = DaemonOptions {
+            max_vram_gb: Some(4.0),
+            max_minutes_per_hour: 1, // 60s/hr; one 120s step blows it
+            exit_when_empty: true,
+            ..Default::default()
+        };
+        let report = run_daemon(&cfg, &opts, &good_score(), &hooks, &|| false).unwrap();
+        // The one queued step trains; the next budget check is over and (drain
+        // mode) records a "budget spent" wait step and stops.
+        assert!(report
+            .steps
+            .iter()
+            .any(|s| s.note.contains("training budget")));
+    }
+
+    // ───────────────────── Track 32: min-pairs floor + judge gate ─────────────────────
+
+    #[test]
+    fn enough_to_train_floor() {
+        assert!(!enough_to_train(0, 0), "empty never trains");
+        assert!(enough_to_train(1, 0), "no floor ⇒ any non-empty trains");
+        assert!(!enough_to_train(3, 4), "below floor");
+        assert!(enough_to_train(4, 4), "at floor");
+        assert!(enough_to_train(9, 4), "above floor");
+    }
+
+    #[test]
+    fn below_min_pairs_does_not_train_and_accumulates() {
+        // 3 rows pending, floor 4 ⇒ skip without popping (rows stay queued).
+        let dir = tmp("minpairs");
+        let cfg = cfg_for(&dir);
+        let q = LivingQueue::from_config(&cfg).unwrap();
+        q.enqueue_many(Lane::Raw, &[qa("a"), qa("b"), qa("c")])
+            .unwrap();
+        let free_vram = || Some(40.0);
+        let train = |_: &EvolveConfig, _: &Dataset| Ok(vec!["teach".to_string()]);
+        let score = |_: &EvolveConfig| Ok(good_score());
+        let gpu_idle = || Some(false);
+        let hooks = DaemonHooks {
+            free_vram_gb: &free_vram,
+            gpu_busy: &gpu_idle,
+            train: &train,
+            score: &score,
+            now_secs: &zero_now,
+            sleep: &noop_sleep,
+            degrade: None,
+        };
+        let opts = DaemonOptions {
+            max_vram_gb: Some(4.0),
+            min_train_pairs: 4,
+            exit_when_empty: true,
+            ..Default::default()
+        };
+        let report = run_daemon(&cfg, &opts, &good_score(), &hooks, &|| false).unwrap();
+        assert_eq!(report.committed(), 0, "nothing trained below the floor");
+        // The rows are NOT consumed — still pending for a later step.
+        let q2 = LivingQueue::from_config(&cfg).unwrap();
+        assert_eq!(q2.pending(), (0, 3), "rows accumulate, cursor not advanced");
+        assert!(report.steps.iter().any(|s| s.note.contains("accumulating")));
+    }
+
+    #[test]
+    fn at_min_pairs_trains_normally() {
+        let dir = tmp("minpairs-ok");
+        let cfg = cfg_for(&dir);
+        let q = LivingQueue::from_config(&cfg).unwrap();
+        q.enqueue_many(Lane::Raw, &[qa("a"), qa("b"), qa("c"), qa("d")])
+            .unwrap();
+        let free_vram = || Some(40.0);
+        let train = |_: &EvolveConfig, _: &Dataset| Ok(vec!["teach".to_string()]);
+        let score = |_: &EvolveConfig| Ok(good_score());
+        let gpu_idle = || Some(false);
+        let hooks = DaemonHooks {
+            free_vram_gb: &free_vram,
+            gpu_busy: &gpu_idle,
+            train: &train,
+            score: &score,
+            now_secs: &zero_now,
+            sleep: &noop_sleep,
+            degrade: None,
+        };
+        let opts = DaemonOptions {
+            max_vram_gb: Some(4.0),
+            min_train_pairs: 4,
+            batch: 4,
+            exit_when_empty: true,
+            ..Default::default()
+        };
+        let report = run_daemon(&cfg, &opts, &good_score(), &hooks, &|| false).unwrap();
+        assert_eq!(report.committed(), 1, "4 pending ≥ floor 4 ⇒ trains");
+    }
+
+    #[test]
+    fn judge_gate_rolls_back_on_degradation() {
+        // The degrade hook reports a regression ⇒ judge_verdict ⇒ Regress, even
+        // though the correctness score is good. Proves the judge is the driver.
+        let dir = tmp("judge-regress");
+        let cfg = cfg_for(&dir);
+        let q = LivingQueue::from_config(&cfg).unwrap();
+        q.enqueue(Lane::Raw, &qa("a")).unwrap();
+        let free_vram = || Some(40.0);
+        let train = |_: &EvolveConfig, _: &Dataset| Ok(vec!["teach".to_string()]);
+        let score = |_: &EvolveConfig| Ok(good_score()); // correctness fine…
+        let gpu_idle = || Some(false);
+        // …but the judge says half the items degraded.
+        let degrade = |_: &EvolveConfig| {
+            Ok(crate::eval::DegradationReport {
+                n: 2,
+                regressed: 1,
+                worse: vec![false, true],
+            })
+        };
+        let hooks = DaemonHooks {
+            free_vram_gb: &free_vram,
+            gpu_busy: &gpu_idle,
+            train: &train,
+            score: &score,
+            now_secs: &zero_now,
+            sleep: &noop_sleep,
+            degrade: Some(&degrade),
+        };
+        let opts = DaemonOptions {
+            max_vram_gb: Some(4.0),
+            exit_when_empty: true,
+            ..Default::default()
+        };
+        let report = run_daemon(&cfg, &opts, &good_score(), &hooks, &|| false).unwrap();
+        assert_eq!(report.committed(), 0, "degradation ⇒ rolled back");
+        assert!(report
+            .steps
+            .iter()
+            .any(|s| s.action == Some(StepAction::Rollback)));
+    }
+
+    #[test]
+    fn judge_gate_accepts_when_no_degradation() {
+        // No degradation + a LOW correctness score (0.30, below the old gate's
+        // comfort) ⇒ the judge gate still ACCEPTS. This is the whole point.
+        let dir = tmp("judge-accept");
+        let cfg = cfg_for(&dir);
+        let q = LivingQueue::from_config(&cfg).unwrap();
+        q.enqueue(Lane::Raw, &qa("a")).unwrap();
+        let free_vram = || Some(40.0);
+        let train = |_: &EvolveConfig, _: &Dataset| Ok(vec!["teach".to_string()]);
+        let mut low = good_score();
+        low.correctness = 0.30;
+        let score = move |_: &EvolveConfig| Ok(low.clone());
+        let gpu_idle = || Some(false);
+        let degrade = |_: &EvolveConfig| {
+            Ok(crate::eval::DegradationReport {
+                n: 2,
+                regressed: 0,
+                worse: vec![false, false],
+            })
+        };
+        let hooks = DaemonHooks {
+            free_vram_gb: &free_vram,
+            gpu_busy: &gpu_idle,
+            train: &train,
+            score: &score,
+            now_secs: &zero_now,
+            sleep: &noop_sleep,
+            degrade: Some(&degrade),
+        };
+        // Baseline at 0.40 — under the OLD gate a drop to 0.30 would Regress; the
+        // judge gate accepts because no degradation was detected.
+        let mut baseline = good_score();
+        baseline.correctness = 0.40;
+        let opts = DaemonOptions {
+            max_vram_gb: Some(4.0),
+            exit_when_empty: true,
+            ..Default::default()
+        };
+        let report = run_daemon(&cfg, &opts, &baseline, &hooks, &|| false).unwrap();
+        assert_eq!(
+            report.committed(),
+            1,
+            "no degradation ⇒ accept despite low/dropped correctness"
+        );
     }
 }
