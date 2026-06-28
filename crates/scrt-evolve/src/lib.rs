@@ -57,7 +57,9 @@ pub use config::{
     FractionalConfig, HardwareConfig, MergeShardsConfig, RegulateConfig, RuntimeConfig,
     SamplingConfig,
 };
-pub use config::{ConfigError, DaemonConfig, EvalConfig, EvolveConfig, GoalConfig, StoreConfig};
+pub use config::{
+    ConfigError, DaemonConfig, EvalConfig, EvolveConfig, GoalConfig, IngestConfig, StoreConfig,
+};
 pub use daemon::{run_daemon, DaemonHooks, DaemonOptions, DaemonReport, DaemonStep};
 pub use dataset::{Dataset, GenExample};
 pub use directive::TrainingDirective;

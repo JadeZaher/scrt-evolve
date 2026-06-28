@@ -62,3 +62,15 @@ pause_on_gpu_process = true   # yield the GPU the moment another process compute
 cpu_fallback         = true   # GPU busy/starved => light CPU step (keep going)
 rotation_blocks      = 0      # train the whole (tiny) LoRA adapter each step
 cooldown_secs        = 10     # idle gap after each step so foreground apps breathe
+# --- self-feed: `scrt-evolve --ambient` seeds + refills + trains, hands-off ---
+seed_adapter = "C:/Users/atooz/Programming/ai-utils-memory/scrt-evolve/bench/work/scrt-cli-branch/branches/scrt-cli/store/v1/adapter"
+auto_ingest  = true           # when the queue runs low, mine fresh activity via [ingest]
+refill_below = 8              # refill when < one batch remains
+
+# What the self-feed mines (LLM-judged). One command, no flags:
+#   scrt-evolve --ambient --dir bench    (if this file is bench/ambient.toml)
+[ingest]
+docs      = ["C:/Users/atooz/Programming/ai-utils-memory/scrt-evolve/conductor"]
+match     = ["--mp-", "--effort", "scrt_search", "scrt_stash", "scrt_similar", "--in ."]
+relevance = "Keep only interactions that actually invoke the scrt CLI or its mind-palace (scrt search with --in/--effort, --mp-stash/compose/intersect/graph/link/similar/prune, or scrt_* tools) as a real, reusable usage example. Drop incidental mentions, failed/garbled commands, and unrelated tooling."
+max       = 600

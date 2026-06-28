@@ -22,13 +22,20 @@ use config_reference::{CONFIG_REFERENCE, CONFIG_TEMPLATE};
     version,
     about = "Make a model better at its own corpus — discover → generate → train → export → run.",
     long_about = "scrt-evolve — opinionated local LLM training + model tooling.\n\n\
-        Everything is driven by an `evolve.toml` config. Run `scrt-evolve config-reference`\n\
-        for the FULL annotated schema of every config block (the recommended starting\n\
-        point for coding agents configuring this for a user), or `scrt-evolve init` to\n\
-        scaffold a commented evolve.toml.\n\n\
-        Pipeline: discover → generate → train (dense | fractional/sharded GPU) → export\n\
-        (merge → GGUF → quantize → place) → run-model (llama.cpp / transformers). The\n\
-        `evolve --schedule` umbrella runs the eval-gated multi-goal loop."
+        Everything is driven by a TOML config. Run `scrt-evolve config-reference` for the\n\
+        FULL annotated schema of every block, or `scrt-evolve init` to scaffold one (run\n\
+        `init` again in a configured dir to VALIDATE it).\n\n\
+        AMBIENT (one command, hands-off): put an `ambient.toml` in a folder, then\n\
+        `scrt-evolve --ambient --dir <folder>` runs the self-feeding evolution loop —\n\
+        seed adapter → auto-ingest real activity (your agent logs, LLM-judged for\n\
+        relevance) → eval-gated train → repeat, until `scrt-evolve daemon stop`. This is\n\
+        the surface a desktop app drives (one project per folder).\n\n\
+        PIPELINE (granular): discover → generate → train (dense | fractional/sharded GPU)\n\
+        → export (merge → GGUF → quantize → place) → run-model. `evolve --schedule` is the\n\
+        eval-gated multi-goal loop; `branch *` builds standalone domain-expert branches;\n\
+        `daemon {ingest,start,status,stop}` + `teach` drive the ambient queue directly.\n\n\
+        Global flags: `--dir <folder>` scopes config+state to a project folder; `--json`\n\
+        adds a machine-readable summary line for agents."
 )]
 struct Cli {
     /// Emit a machine-readable JSON summary line for artifact-producing
@@ -39,8 +46,20 @@ struct Cli {
     /// position (`scrt-evolve --json generate` or `scrt-evolve generate --json`).
     #[arg(long, global = true)]
     json: bool,
+    /// Working directory for an ambient evolution PROJECT: its config
+    /// (`ambient.toml`, else `evolve.toml`) and all state resolve here. Most
+    /// useful with `--ambient` (and `init`); a desktop app manages one such
+    /// folder per project.
+    #[arg(long, global = true)]
+    dir: Option<PathBuf>,
+    /// Kick off the ambient evolution pipeline immediately and run until
+    /// `daemon stop`: validate config → seed adapter → self-feeding loop
+    /// (auto-ingest fresh activity → eval-gated train). Uses `--dir`'s config
+    /// (or the cwd's). Equivalent to a one-shot orchestrated `daemon` run.
+    #[arg(long)]
+    ambient: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 /// Process-global `--json` flag. Set once from the parsed CLI in `run()`; read
@@ -741,8 +760,22 @@ fn run_main() -> ExitCode {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     JSON_OUTPUT.store(cli.json, std::sync::atomic::Ordering::Relaxed);
-    match cli.command {
-        Command::Init { path } => cmd_init(&path),
+
+    // `--ambient` (with or without a subcommand) → the one-command pipeline,
+    // config resolved from `--dir` (or cwd: ambient.toml, else evolve.toml).
+    if cli.ambient {
+        let cfg = load_dir_config(cli.dir.as_deref())?;
+        return cmd_ambient(&cfg, false);
+    }
+    let Some(command) = cli.command else {
+        // No subcommand and no `--ambient`: print the help (CLI docs).
+        use clap::CommandFactory;
+        Cli::command().print_help().ok();
+        println!();
+        return Ok(());
+    };
+    match command {
+        Command::Init { path } => cmd_init(&resolve_in_dir(cli.dir.as_deref(), &path)),
         Command::Discover { config } => {
             let cfg = EvolveConfig::load(&config)?;
             cmd_discover(&cfg)
@@ -1086,19 +1119,77 @@ fn run() -> Result<()> {
 }
 
 fn cmd_init(path: &PathBuf) -> Result<()> {
+    // If a config already exists, VALIDATE + summarize it (idempotent init) rather
+    // than overwrite — so `init` in a configured dir is a safe "is this OK?".
+    if path.exists() {
+        let cfg = EvolveConfig::load(path)
+            .with_context(|| format!("validating existing {}", path.display()))?;
+        println!("validated {} — config is well-formed", path.display());
+        let model = cfg
+            .evolve
+            .model_path
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(unset!)".into());
+        println!(
+            "  model={model}  work_dir={}  ambient={}",
+            cfg.work_dir().display(),
+            if cfg.daemon.is_some() && cfg.ingest.is_some() {
+                "ready (run `scrt-evolve --ambient`)"
+            } else {
+                "not configured ([daemon]+[ingest] needed)"
+            }
+        );
+        emit_json(serde_json::json!({
+            "command": "init", "action": "validated", "path": path.display().to_string(),
+            "model_path_set": cfg.evolve.model_path.is_some(), "status": "ok",
+        }));
+        return Ok(());
+    }
+
     let report = scrt_evolve::scaffold::init(path)?;
     println!("wrote scaffold to {}", path.display());
     if report.model_path_missing {
         // Instruct rather than warn: on a fresh scaffold the placeholder path is
-        // EXPECTED to be absent — the user has done nothing wrong yet. Frame it
-        // as the next step, not an error (D7). `doctor` validates it for real.
+        // EXPECTED to be absent. Frame it as the next step. `doctor` validates it.
         println!(
             "next: edit [evolve].model_path in {} to point at your HF model dir, \
              then run `scrt-evolve doctor` to preflight your environment.",
             path.display()
         );
     }
+    emit_json(serde_json::json!({
+        "command": "init", "action": "scaffolded", "path": path.display().to_string(),
+        "status": "ok",
+    }));
     Ok(())
+}
+
+/// Resolve a path against `--dir` (join if the path is relative and a dir is set).
+fn resolve_in_dir(dir: Option<&std::path::Path>, path: &std::path::Path) -> PathBuf {
+    match dir {
+        Some(d) if path.is_relative() => d.join(path),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Load an ambient project's config from `--dir` (or cwd): `ambient.toml`, else
+/// `evolve.toml`. Sets the process cwd to the dir so relative paths + the default
+/// work-dir resolve inside the project folder (the desktop-app project model).
+fn load_dir_config(dir: Option<&std::path::Path>) -> Result<EvolveConfig> {
+    if let Some(d) = dir {
+        std::env::set_current_dir(d).with_context(|| format!("--dir {}", d.display()))?;
+    }
+    for name in ["ambient.toml", "evolve.toml"] {
+        if std::path::Path::new(name).exists() {
+            return Ok(EvolveConfig::load(name)?);
+        }
+    }
+    anyhow::bail!(
+        "no ambient.toml or evolve.toml in {} — run `scrt-evolve init` first",
+        dir.map(|d| d.display().to_string())
+            .unwrap_or_else(|| ".".to_string())
+    )
 }
 
 fn cmd_discover(cfg: &EvolveConfig) -> Result<()> {
@@ -2849,113 +2940,35 @@ fn cmd_daemon_start(
     max_steps: Option<u64>,
     drain: bool,
 ) -> Result<()> {
-    use scrt_evolve::daemon::{self, DaemonHooks, DaemonOptions};
+    use scrt_evolve::daemon;
 
     let wd = WorkDir::from_config(cfg);
     wd.ensure()?;
-
-    let dcfg = cfg.daemon.clone().unwrap_or_default();
-    // Budget: --max-vram > [daemon].max_vram_gb; 0 ⇒ ungated.
-    let max_vram_gb = max_vram.or(if dcfg.max_vram_gb > 0.0 {
-        Some(dcfg.max_vram_gb)
-    } else {
-        None
-    });
-
-    // Resume the monotonic ordinal from the checkpoint store, and take the last
-    // good score as the baseline (else a conservative uncovered baseline).
-    let reg = scrt_evolve::Regulator::new(cfg)?;
-    let start_ordinal = reg
-        .store()
-        .list()?
-        .iter()
-        .map(|m| m.ordinal)
-        .max()
-        .map(|o| o + 1)
-        .unwrap_or(1);
-    let baseline = reg
-        .store()
-        .last_good()
-        .and_then(|id| reg.store().load_manifest(&id).ok())
-        .and_then(|m| m.metrics)
-        .unwrap_or_else(|| scrt_evolve::ScoreReport::uncovered("probe-none", "baseline"));
+    set_ambient_env();
+    ensure_seed_adapter(cfg)?;
 
     // Capture train/score subprocess output to one durable daemon log.
     let _ = std::fs::create_dir_all(wd.root().join("logs"));
-    let log_path = wd.root().join("logs").join("daemon.log");
-    std::env::set_var("SCRT_EVOLVE_LOG_FILE", &log_path);
-
+    std::env::set_var(
+        "SCRT_EVOLVE_LOG_FILE",
+        wd.root().join("logs").join("daemon.log"),
+    );
     // Clear any stale stop-file; write a run marker for `daemon status`.
     let _ = std::fs::remove_file(daemon::stop_file(wd.root()));
     let _ = std::fs::write(daemon::run_file(wd.root()), b"running");
 
-    // --- Production hooks (mirror cmd_evolve_schedule) ---
-    let py_train = python.clone();
-    let train = |c: &EvolveConfig, ds: &scrt_evolve::Dataset| -> Result<Vec<String>> {
-        let w = WorkDir::from_config(c);
-        let data_path = w.root().join("dataset.daemon-step.jsonl");
-        ds.write_jsonl(&data_path)?;
-        cmd_train_transformers(c, Some(data_path), py_train.clone(), None, 40, 256)?;
-        Ok(provenance_of(ds))
-    };
-    let py_score = python.clone();
-    let score = |c: &EvolveConfig| -> Result<scrt_evolve::ScoreReport> {
-        scrt_evolve::eval::run_eval(c, py_score.as_deref())
-    };
-    let free_vram = probe_free_vram_gb;
-    let gpu_busy = probe_gpu_busy;
-    let hooks = DaemonHooks {
-        free_vram_gb: &free_vram,
-        gpu_busy: &gpu_busy,
-        train: &train,
-        score: &score,
-    };
-
-    let opts = DaemonOptions {
-        max_vram_gb,
-        batch: dcfg.batch.max(1),
-        max_steps,
-        exit_when_empty: drain,
-        poll_interval: std::time::Duration::from_secs(dcfg.poll_interval_secs.max(1)),
-        start_ordinal,
-        pause_on_gpu_process: dcfg.pause_on_gpu_process,
-        cpu_fallback: dcfg.cpu_fallback,
-        rotation_blocks: dcfg.rotation_blocks,
-        cooldown: std::time::Duration::from_secs(dcfg.cooldown_secs),
-    };
-
     println!(
-        "daemon start: budget={} batch={} {}{}{}{} (stop with `scrt-evolve daemon stop`)",
-        max_vram_gb
-            .map(|v| format!("{v:.1}G"))
-            .unwrap_or_else(|| "ungated".into()),
-        opts.batch,
-        if drain { "drain-once" } else { "continuous" },
-        if opts.pause_on_gpu_process {
-            " yield-to-gpu"
-        } else {
-            ""
-        },
-        if opts.cpu_fallback {
-            " cpu-fallback"
-        } else {
-            ""
-        },
-        if opts.rotation_blocks > 0 {
-            format!(" rotate/{}", opts.rotation_blocks)
-        } else {
-            String::new()
-        },
+        "daemon start: {} (stop with `scrt-evolve daemon stop`)",
+        if drain { "drain-once" } else { "continuous" }
     );
 
-    let stop_root = wd.root().to_path_buf();
-    let report = daemon::run_daemon(cfg, &opts, &baseline, &hooks, &|| {
-        daemon::stop_requested(&stop_root)
-    })?;
-
+    // Run, then ALWAYS clean the markers (even on a catastrophe-halt error, so
+    // `daemon status` doesn't get stuck reporting "running" after a crash).
+    let report = daemon_serve(cfg, python.as_deref(), max_vram, max_steps, drain);
     std::env::remove_var("SCRT_EVOLVE_LOG_FILE");
     let _ = std::fs::remove_file(daemon::run_file(wd.root()));
     let _ = std::fs::remove_file(daemon::stop_file(wd.root()));
+    let report = report?;
 
     let reason = if report.halted {
         "HALTED on catastrophe"
@@ -2979,8 +2992,6 @@ fn cmd_daemon_start(
         "steps": report.steps.len(),
         "committed": report.committed(),
         "halted": report.halted,
-        "stopped": report.stopped,
-        "drained": report.drained,
         "status": if report.halted { "halted" } else { "ok" },
     }));
     if report.halted {
@@ -2990,6 +3001,258 @@ fn cmd_daemon_start(
         );
     }
     Ok(())
+}
+
+/// Build the daemon hooks + options from config and run ONE daemon pass. Marker
+/// and log-env management is the caller's job. `drain` ⇒ exit when the queue
+/// empties. Shared by `daemon start` and the `ambient` self-feed loop.
+fn daemon_serve(
+    cfg: &EvolveConfig,
+    python: Option<&str>,
+    max_vram: Option<f64>,
+    max_steps: Option<u64>,
+    drain: bool,
+) -> Result<scrt_evolve::daemon::DaemonReport> {
+    use scrt_evolve::daemon::{self, DaemonHooks, DaemonOptions};
+    let wd = WorkDir::from_config(cfg);
+    let dcfg = cfg.daemon.clone().unwrap_or_default();
+    let max_vram_gb = max_vram.or(if dcfg.max_vram_gb > 0.0 {
+        Some(dcfg.max_vram_gb)
+    } else {
+        None
+    });
+
+    // Resume ordinal + baseline from the checkpoint store (last good score).
+    let reg = scrt_evolve::Regulator::new(cfg)?;
+    let start_ordinal = reg
+        .store()
+        .list()?
+        .iter()
+        .map(|m| m.ordinal)
+        .max()
+        .map(|o| o + 1)
+        .unwrap_or(1);
+    let baseline = reg
+        .store()
+        .last_good()
+        .and_then(|id| reg.store().load_manifest(&id).ok())
+        .and_then(|m| m.metrics)
+        .unwrap_or_else(|| scrt_evolve::ScoreReport::uncovered("probe-none", "baseline"));
+
+    // Resolve the interpreter ONCE from config (--python > $SCRT_EVOLVE_PYTHON >
+    // [hardware].python) and use it for BOTH hooks — the score subprocess does not
+    // consult [hardware].python on its own, so passing it here is what stops it
+    // falling back to a bare (often wrong) `python`.
+    let py = resolve_python(Some(cfg), python.map(str::to_string));
+    let py_train = py.clone();
+    let train = |c: &EvolveConfig, ds: &scrt_evolve::Dataset| -> Result<Vec<String>> {
+        let w = WorkDir::from_config(c);
+        let data_path = w.root().join("dataset.daemon-step.jsonl");
+        ds.write_jsonl(&data_path)?;
+        cmd_train_transformers(c, Some(data_path), Some(py_train.clone()), None, 40, 256)?;
+        Ok(provenance_of(ds))
+    };
+    let py_score = py.clone();
+    let score = |c: &EvolveConfig| -> Result<scrt_evolve::ScoreReport> {
+        scrt_evolve::eval::run_eval(c, Some(py_score.as_str()))
+    };
+    let free_vram = probe_free_vram_gb;
+    let gpu_busy = probe_gpu_busy;
+    let hooks = DaemonHooks {
+        free_vram_gb: &free_vram,
+        gpu_busy: &gpu_busy,
+        train: &train,
+        score: &score,
+    };
+    let opts = DaemonOptions {
+        max_vram_gb,
+        batch: dcfg.batch.max(1),
+        max_steps,
+        exit_when_empty: drain,
+        poll_interval: std::time::Duration::from_secs(dcfg.poll_interval_secs.max(1)),
+        start_ordinal,
+        pause_on_gpu_process: dcfg.pause_on_gpu_process,
+        cpu_fallback: dcfg.cpu_fallback,
+        rotation_blocks: dcfg.rotation_blocks,
+        cooldown: std::time::Duration::from_secs(dcfg.cooldown_secs),
+    };
+    let stop_root = wd.root().to_path_buf();
+    daemon::run_daemon(cfg, &opts, &baseline, &hooks, &|| {
+        daemon::stop_requested(&stop_root)
+    })
+}
+
+/// Set memory-friendly defaults for the ML subprocesses (inherited via env) if the
+/// user hasn't already. Currently the CUDA allocator's `expandable_segments` (a
+/// no-op on platforms that don't support it).
+fn set_ambient_env() {
+    if std::env::var_os("PYTORCH_CUDA_ALLOC_CONF").is_none() {
+        std::env::set_var("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True");
+    }
+}
+
+/// Seed `work_dir/adapter` from `[daemon].seed_adapter` if it's configured and the
+/// work-dir adapter is absent — continue an existing expert (e.g. a branch's
+/// current version) instead of training from base. Idempotent.
+fn ensure_seed_adapter(cfg: &EvolveConfig) -> Result<()> {
+    let seed = match cfg.daemon.as_ref().and_then(|d| d.seed_adapter.as_deref()) {
+        Some(s) if !s.trim().is_empty() => PathBuf::from(s),
+        _ => return Ok(()),
+    };
+    let dst = WorkDir::from_config(cfg).root().join("adapter");
+    if dst.join("adapter.safetensors").exists() {
+        return Ok(()); // already seeded / trained
+    }
+    if !seed.join("adapter.safetensors").exists() {
+        eprintln!(
+            "ambient: seed_adapter {} not found — training fresh",
+            seed.display()
+        );
+        return Ok(());
+    }
+    copy_dir_all(&seed, &dst)?;
+    println!("ambient: seeded adapter from {}", seed.display());
+    Ok(())
+}
+
+/// Recursively copy a directory tree (std has no built-in).
+fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&entry.path(), &to)?;
+        } else {
+            std::fs::copy(entry.path(), &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// `scrt-evolve --ambient` (or `ambient`) — the one-command ambient evolution
+/// pipeline: validate config → set env → seed adapter → self-feeding loop
+/// (auto-ingest fresh activity when the queue runs low → eval-gated drain-train →
+/// repeat). Runs until `daemon stop` (or one pass with `once`). Config-driven; no
+/// manual ingest/seed/env steps. See `src/AGENTS.md`.
+fn cmd_ambient(cfg: &EvolveConfig, once: bool) -> Result<()> {
+    use scrt_evolve::{daemon, Lane, LivingQueue};
+
+    validate_ambient(cfg);
+    let wd = WorkDir::from_config(cfg);
+    wd.ensure()?;
+    set_ambient_env();
+    ensure_seed_adapter(cfg)?;
+
+    let _ = std::fs::create_dir_all(wd.root().join("logs"));
+    std::env::set_var(
+        "SCRT_EVOLVE_LOG_FILE",
+        wd.root().join("logs").join("daemon.log"),
+    );
+    let _ = std::fs::remove_file(daemon::stop_file(wd.root()));
+    let _ = std::fs::write(daemon::run_file(wd.root()), b"running");
+
+    let dcfg = cfg.daemon.clone().unwrap_or_default();
+    println!(
+        "ambient: self-feeding evolution loop (auto_ingest={}, stop with `scrt-evolve daemon stop`)",
+        dcfg.auto_ingest
+    );
+
+    let run = || -> Result<()> {
+        loop {
+            if daemon::stop_requested(wd.root()) {
+                break;
+            }
+            // Refill the queue from [ingest] when it runs low (the self-feed).
+            let (p, r) = LivingQueue::from_config(cfg)?.pending();
+            if p + r < dcfg.refill_below && dcfg.auto_ingest {
+                if let Some(ic) = cfg.ingest.clone() {
+                    let from = if !ic.sources.is_empty() {
+                        ic.sources
+                    } else {
+                        vec![claude_projects_dir()?]
+                    };
+                    let lane = if ic.lane.as_deref() == Some("priority") {
+                        Lane::Priority
+                    } else {
+                        Lane::Raw
+                    };
+                    let n = run_ingest(
+                        cfg,
+                        &from,
+                        &ic.docs,
+                        ic.relevance.as_deref(),
+                        &ic.match_,
+                        ic.max,
+                        lane,
+                        false,
+                        true,
+                    )?;
+                    println!("ambient: refilled {n} row(s)");
+                }
+            }
+            // If still nothing to train, idle (or exit on `once`).
+            if LivingQueue::from_config(cfg)?.is_empty() {
+                if once {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(
+                    dcfg.poll_interval_secs.max(1),
+                ));
+                continue;
+            }
+            // Drain-train the queue, eval-gated, every step in the track-15 txn.
+            let report = daemon_serve(cfg, None, None, None, true)?;
+            println!(
+                "ambient: pass — {} step(s), {} committed",
+                report.steps.len(),
+                report.committed()
+            );
+            if report.halted {
+                anyhow::bail!(
+                    "ambient halted (catastrophe) — `quarantine clear` to re-arm, then re-run"
+                );
+            }
+            if report.stopped || once {
+                break;
+            }
+        }
+        Ok(())
+    };
+    let result = run();
+
+    std::env::remove_var("SCRT_EVOLVE_LOG_FILE");
+    let _ = std::fs::remove_file(daemon::run_file(wd.root()));
+    let _ = std::fs::remove_file(daemon::stop_file(wd.root()));
+    emit_json(serde_json::json!({
+        "command": "ambient",
+        "status": if result.is_err() { "halted" } else { "ok" },
+    }));
+    result
+}
+
+/// Warn (don't fail) on ambient-config gaps so the operator knows what will
+/// degrade: no model_path (can't train), no eval probe (gate degrades to
+/// accept-unless-NaN), auto_ingest without an `[ingest]` block (nothing to feed).
+fn validate_ambient(cfg: &EvolveConfig) {
+    if cfg.evolve.model_path.is_none() {
+        eprintln!("ambient: WARNING — [evolve].model_path is unset; training will fail");
+    }
+    let has_probe = cfg
+        .eval
+        .as_ref()
+        .and_then(|e| e.probe_path.as_ref())
+        .is_some()
+        || scrt_evolve::eval::probe_path(cfg).exists();
+    if !has_probe {
+        eprintln!("ambient: note — no eval probe; the gate degrades to accept-unless-NaN");
+    }
+    let auto = cfg.daemon.as_ref().map(|d| d.auto_ingest).unwrap_or(false);
+    if auto && cfg.ingest.is_none() {
+        eprintln!(
+            "ambient: note — [daemon].auto_ingest is on but no [ingest] block; nothing to refill"
+        );
+    }
 }
 
 /// `daemon stop` — signal a running daemon to exit after its current step.
@@ -3032,11 +3295,9 @@ fn cmd_daemon_status(cfg: &EvolveConfig) -> Result<()> {
     Ok(())
 }
 
-/// `daemon ingest` — mine real agent activity into the living queue, GENERICALLY.
-/// Interaction logs → mixed `cli`/`tool_call`/`qa` rows; docs → `completion` rows.
-/// An optional `--match` substring set cheaply bounds the candidate set; an
-/// optional `--relevance` criterion runs an LLM judge to keep only worthwhile
-/// rows. The config-driven passive-tail feed (replaces ad-hoc munging scripts).
+/// `daemon ingest` — mine real agent activity into the living queue. CLI flags
+/// override the `[ingest]` config block (so it's flagless when configured). See
+/// [`run_ingest`] for the mechanism and `src/AGENTS.md` §ingest.rs.
 #[allow(clippy::too_many_arguments)]
 fn cmd_daemon_ingest(
     cfg: &EvolveConfig,
@@ -3049,15 +3310,70 @@ fn cmd_daemon_ingest(
     dry_run: bool,
 ) -> Result<()> {
     use scrt_evolve::{Lane, LivingQueue};
+    let ic = cfg.ingest.clone().unwrap_or_default();
 
-    // Default transcript source: the Claude Code projects dir.
-    let from = if from.is_empty() {
-        vec![claude_projects_dir()?]
-    } else {
+    // CLI flags override [ingest] config; sources default to ~/.claude/projects.
+    let from = if !from.is_empty() {
         from
+    } else if !ic.sources.is_empty() {
+        ic.sources
+    } else {
+        vec![claude_projects_dir()?]
+    };
+    let docs = if !docs.is_empty() { docs } else { ic.docs };
+    let relevance = relevance.or(ic.relevance);
+    let match_ = if !match_.is_empty() {
+        match_
+    } else {
+        ic.match_
+    };
+    let max = if max > 0 { max } else { ic.max };
+    let lane = if priority || ic.lane.as_deref() == Some("priority") {
+        Lane::Priority
+    } else {
+        Lane::Raw
     };
 
-    // Cheap, generic substring pre-filter (case-insensitive). Empty ⇒ keep all.
+    let n = run_ingest(
+        cfg,
+        &from,
+        &docs,
+        relevance.as_deref(),
+        &match_,
+        max,
+        lane,
+        dry_run,
+        true,
+    )?;
+    let (prio, raw) = LivingQueue::from_config(cfg)?.pending();
+    emit_json(serde_json::json!({
+        "command": "daemon-ingest",
+        "dry_run": dry_run,
+        "enqueued": n,
+        "pending_priority": prio,
+        "pending_raw": raw,
+        "status": "ok",
+    }));
+    Ok(())
+}
+
+/// The ingest core (shared by `daemon ingest` + the `ambient` self-feed loop):
+/// walk interaction logs + docs → mixed candidate rows → optional `--match`
+/// prefilter → optional LLM relevance judge → enqueue. Returns rows enqueued
+/// (0 on `dry_run`). `verbose` prints human progress.
+#[allow(clippy::too_many_arguments)]
+fn run_ingest(
+    cfg: &EvolveConfig,
+    from: &[PathBuf],
+    docs: &[PathBuf],
+    relevance: Option<&str>,
+    match_: &[String],
+    max: usize,
+    lane: scrt_evolve::Lane,
+    dry_run: bool,
+    verbose: bool,
+) -> Result<usize> {
+    use scrt_evolve::LivingQueue;
     let needles: Vec<String> = match_.iter().map(|m| m.to_lowercase()).collect();
 
     let mut rows: Vec<scrt_evolve::GenExample> = Vec::new();
@@ -3065,8 +3381,7 @@ fn cmd_daemon_ingest(
     let mut files_scanned = 0usize;
     let mut files_kept = 0usize;
 
-    // --- Interaction logs → mixed cli/tool_call/qa rows ---
-    for dir in &from {
+    for dir in from {
         for path in collect_files(dir, &["jsonl"]) {
             files_scanned += 1;
             let Ok(text) = std::fs::read_to_string(&path) else {
@@ -3083,8 +3398,7 @@ fn cmd_daemon_ingest(
     }
     let log_rows = rows.len();
 
-    // --- Docs → completion rows (<=20 chunks/file so one doc can't dominate) ---
-    for path in &docs {
+    for path in docs {
         let files = if path.is_dir() {
             collect_files(path, &["md", "txt"])
         } else {
@@ -3102,26 +3416,23 @@ fn cmd_daemon_ingest(
     }
     let doc_rows = rows.len() - log_rows;
     let candidates = rows.len();
+    if verbose {
+        println!(
+            "ingest: scanned {files_scanned} log file(s) ({files_kept} matched) \
+             → {log_rows} interaction row(s) + {doc_rows} doc row(s) = {candidates} candidate(s)"
+        );
+    }
 
-    println!(
-        "ingest: scanned {files_scanned} log file(s) ({files_kept} matched) \
-         → {log_rows} interaction row(s) + {doc_rows} doc row(s) = {candidates} candidate(s)"
-    );
-
-    // --- Optional LLM relevance judge (generic, no domain hardcoding) ---
-    if let Some(criterion) = relevance.as_deref() {
+    if let Some(criterion) = relevance {
         match build_relevance_judge(cfg) {
             Ok(judge) => {
                 let before = rows.len();
                 rows = scrt_evolve::filter_relevant(&judge, criterion, rows)?;
-                println!(
-                    "ingest: LLM judge kept {}/{before} row(s) relevant to: {criterion}",
-                    rows.len()
-                );
+                if verbose {
+                    println!("ingest: LLM judge kept {}/{before} row(s)", rows.len());
+                }
             }
-            Err(e) => {
-                eprintln!("ingest: --relevance set but no usable chat endpoint ({e}); keeping all");
-            }
+            Err(e) => eprintln!("ingest: relevance set but no chat endpoint ({e}); keeping all"),
         }
     }
 
@@ -3129,40 +3440,18 @@ fn cmd_daemon_ingest(
         rows.truncate(max);
     }
 
-    let lane = if priority { Lane::Priority } else { Lane::Raw };
-    let lane_name = if priority { "priority" } else { "raw" };
-
     if dry_run {
-        println!(
-            "ingest: --dry-run, {} row(s) would enqueue to {lane_name}",
-            rows.len()
-        );
-        emit_json(serde_json::json!({
-            "command": "daemon-ingest",
-            "dry_run": true,
-            "candidates": candidates,
-            "rows": rows.len(),
-            "status": "ok",
-        }));
-        return Ok(());
+        if verbose {
+            println!("ingest: --dry-run, {} row(s) would enqueue", rows.len());
+        }
+        return Ok(0);
     }
 
-    let queue = LivingQueue::from_config(cfg)?;
-    let n = queue.enqueue_many(lane, &rows)?;
-    let (prio, raw) = queue.pending();
-    println!(
-        "ingest: enqueued {n} row(s) to {lane_name} lane (pending: priority={prio} raw={raw})"
-    );
-    emit_json(serde_json::json!({
-        "command": "daemon-ingest",
-        "lane": lane_name,
-        "candidates": candidates,
-        "enqueued": n,
-        "pending_priority": prio,
-        "pending_raw": raw,
-        "status": "ok",
-    }));
-    Ok(())
+    let n = LivingQueue::from_config(cfg)?.enqueue_many(lane, &rows)?;
+    if verbose {
+        println!("ingest: enqueued {n} row(s)");
+    }
+    Ok(n)
 }
 
 /// Build the LLM relevance judge from the config's chat endpoint (`[generate.api]`)

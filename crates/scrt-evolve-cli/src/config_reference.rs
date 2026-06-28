@@ -142,6 +142,18 @@ prints a copy-pasteable template.)
   cpu_fallback      = true         # when GPU busy/starved, train a light step on CPU (else pause)
   rotation_blocks   = 0            # >0: train one block/step, rotate (ordinal % N) — bounds VRAM, spreads coverage
   cooldown_secs     = 0            # sleep after each step to cap GPU duty cycle (0 => none)
+  # --- ambient self-feed (used by `scrt-evolve --ambient`) ---
+  seed_adapter      = "<adapter dir>"  # seed work_dir/adapter from here if absent (continue an expert)
+  auto_ingest       = false        # when queue runs low, re-run [ingest] to mine fresh activity
+  refill_below      = 1            # pending-rows threshold that triggers auto_ingest
+
+[ingest]                          # what `daemon ingest` / `--ambient` mine into the queue
+  sources   = ["~/.claude/projects"]  # interaction-log dirs (empty => Claude Code projects)
+  docs      = ["conductor"]        # doc dirs -> completion rows (*.md/*.txt)
+  match     = ["--mp-","--effort"] # cheap substring prefilter (bounds LLM-judge cost)
+  relevance = "<criterion>"        # LLM judges each candidate against this (via [generate.api])
+  lane      = "raw"                # raw (passive tail) | priority (drains first)
+  max       = 600                  # cap rows enqueued per ingest (0 => no cap)
 
 [[goals]]                         # learning-by-doing goals (repeatable)
   name          = "<goal>"

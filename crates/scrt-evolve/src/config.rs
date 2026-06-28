@@ -106,6 +106,36 @@ pub struct EvolveConfig {
     /// its parent. Absent ⇒ no version store (today's single-adapter path).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store: Option<StoreConfig>,
+    /// `[ingest]` — config-driven activity ingestion for the ambient daemon
+    /// (sources, relevance criterion, prefilters). Absent ⇒ `daemon ingest` needs
+    /// explicit flags. See `crates/scrt-evolve/src/AGENTS.md` §ingest.rs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest: Option<IngestConfig>,
+}
+
+/// `[ingest]` — what the ambient daemon mines into its living queue. Makes
+/// `daemon ingest` / `scrt-evolve --ambient` flagless. See `src/AGENTS.md`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IngestConfig {
+    /// Interaction-log dirs (scanned recursively for `*.jsonl`). Empty ⇒ the
+    /// Claude Code projects dir (`~/.claude/projects`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<PathBuf>,
+    /// Doc dirs/files chunked into `completion` rows (`*.md`/`*.txt`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub docs: Vec<PathBuf>,
+    /// Cheap case-insensitive substring prefilter (bounds the LLM-judge cost).
+    #[serde(default, rename = "match", skip_serializing_if = "Vec::is_empty")]
+    pub match_: Vec<String>,
+    /// LLM relevance criterion. Set ⇒ judge candidates via `[generate.api]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relevance: Option<String>,
+    /// Target lane: `raw` (default) or `priority`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<String>,
+    /// Cap rows enqueued per ingest (0 = no cap).
+    #[serde(default)]
+    pub max: usize,
 }
 
 /// `[store]` — bounded model-weight version management (storage + loading).
@@ -416,6 +446,17 @@ pub struct DaemonConfig {
     /// foreground apps get idle gaps (no sustained contention). `0` ⇒ no cooldown.
     #[serde(default = "default_daemon_cooldown")]
     pub cooldown_secs: u64,
+    /// Adapter dir to SEED `work_dir/adapter` from if absent (continue an existing
+    /// expert, e.g. a branch's current version). Absent ⇒ train fresh from base.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_adapter: Option<String>,
+    /// Self-feed: when queue pending falls below `refill_below`, re-run `[ingest]`
+    /// to mine fresh activity, then keep training. The "just goes on" switch.
+    #[serde(default)]
+    pub auto_ingest: bool,
+    /// Refill threshold for `auto_ingest` (pending rows below which to re-ingest).
+    #[serde(default = "default_daemon_refill_below")]
+    pub refill_below: u64,
 }
 
 fn default_daemon_max_vram() -> f64 {
@@ -439,6 +480,9 @@ fn default_daemon_rotation_blocks() -> usize {
 fn default_daemon_cooldown() -> u64 {
     0
 }
+fn default_daemon_refill_below() -> u64 {
+    1
+}
 
 impl Default for DaemonConfig {
     fn default() -> Self {
@@ -452,6 +496,9 @@ impl Default for DaemonConfig {
             cpu_fallback: true,
             rotation_blocks: default_daemon_rotation_blocks(),
             cooldown_secs: default_daemon_cooldown(),
+            seed_adapter: None,
+            auto_ingest: false,
+            refill_below: default_daemon_refill_below(),
         }
     }
 }
