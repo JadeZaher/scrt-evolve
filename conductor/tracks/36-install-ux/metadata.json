@@ -1,0 +1,8 @@
+{
+  "id": "36-install-ux",
+  "type": "feature",
+  "status": "planned",
+  "description": "End-to-end first-class install experience for the evolve CLI on Windows (native) and Linux: CI release artifacts, install.sh/install.ps1 scripts, evolve setup subcommand, and README quickstart.",
+  "created_at": "2026-07-02T00:00:00Z",
+  "updated_at": "2026-07-02T00:00:00Z"
+}
