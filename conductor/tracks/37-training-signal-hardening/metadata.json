@@ -1,0 +1,8 @@
+{
+  "id": "37-training-signal-hardening",
+  "type": "feature",
+  "status": "planned",
+  "description": "Training-signal hardening: outcome-stamped ingest + retry-collapse, per-pair LLM data judge (fail-open/closed) with manifest eval_report rollup + tier sovereignty, high-throughput judge-ranked synthesis (rejection sampling, Evol/Self-Instruct expansion, [domain] parameterization, planner modality fixes), steerable loop (absorbs track 35 nudge + data-layer allowlist + steering-compliance metric), and surgical training fixes (daemon end_task default, live calib batches, rotary kwargs). The prerequisite for lexame P2P marked-expertise sharing.",
+  "created_at": "2026-07-02T00:00:00Z",
+  "updated_at": "2026-07-02T00:00:00Z"
+}
