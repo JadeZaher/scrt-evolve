@@ -47,12 +47,15 @@ pub struct TrainingDirective {
 }
 
 impl TrainingDirective {
+    /// Serialize the directive to a pretty-printed JSON string.
     pub fn to_json(&self) -> serde_json::Result<String> {
         serde_json::to_string_pretty(self)
     }
+    /// Deserialize a directive from a JSON string.
     pub fn from_json(s: &str) -> anyhow::Result<Self> {
         Ok(serde_json::from_str(s)?)
     }
+    /// Write the directive as JSON to `path`, creating parent directories as needed.
     pub fn write(&self, path: impl AsRef<std::path::Path>) -> anyhow::Result<()> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
@@ -63,6 +66,7 @@ impl TrainingDirective {
         std::fs::write(path, self.to_json()?)?;
         Ok(())
     }
+    /// Read and deserialize a directive from a JSON file at `path`.
     pub fn read(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
         Self::from_json(&std::fs::read_to_string(path)?)
     }

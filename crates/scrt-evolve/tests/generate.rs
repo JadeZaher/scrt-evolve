@@ -4,7 +4,7 @@
 use std::cell::RefCell;
 
 use scrt_evolve::config::{GenerateApiConfig, GenerateConfig};
-use scrt_evolve::dataset::{Dataset, GenExample};
+use scrt_evolve::dataset::{Dataset, GenExample, Outcome, Tier, Verdict};
 use scrt_evolve::discover::{DiscoveredContext, Passage};
 use scrt_evolve::generate::api::{ApiEndpoint, ChatMessage, ChatTransport};
 use scrt_evolve::generate::run_with_backend;
@@ -144,6 +144,11 @@ fn dataset_round_trips_through_jsonl() {
             completion: "a".into(),
             source: Some("s.rs".into()),
             gen: Some("api".into()),
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         },
         GenExample::Instruction {
             instruction: "do x".into(),
@@ -151,16 +156,32 @@ fn dataset_round_trips_through_jsonl() {
             output: "done".into(),
             source: None,
             gen: None,
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         },
         GenExample::Completion {
             text: "raw".into(),
             source: None,
+            gen: None,
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         },
         GenExample::Contrastive {
             query: "auth".into(),
             positive: "login.rs".into(),
             negatives: vec!["db.rs".into()],
             stash: Some("auth".into()),
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         },
     ]);
 
@@ -323,4 +344,85 @@ fn backend_last_system_message(backend: &ApiEndpoint<MockTransport>) -> String {
         .map(|m| m.content.clone())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+// --- track 37 Phase C: rejection sampling wired into generation ---
+
+/// A judge that scores rows by a fixed script (one score per row, in order).
+struct ScriptedJudge {
+    scores: Vec<f32>,
+}
+impl scrt_evolve::judge::PairJudge for ScriptedJudge {
+    fn score(&self, rows: &[GenExample], _steering: Option<&str>) -> anyhow::Result<Vec<f32>> {
+        // Repeat the script to cover however many rows the pool holds.
+        Ok((0..rows.len())
+            .map(|i| self.scores[i % self.scores.len()])
+            .collect())
+    }
+}
+
+#[test]
+fn rejection_sampling_generates_n_and_keeps_top_k() {
+    // Each backend call yields ONE candidate qa row; candidates_per_seed=4 ⇒ the
+    // pool is 4 rows for the single passage/mode; keep_k (per_passage) = 2.
+    let response = r#"[{"kind":"qa","prompt":"q","completion":"a"}]"#;
+    let backend = ApiEndpoint::with_transport(
+        MockTransport::new(vec![response, response, response, response]),
+        1,
+    );
+    // Scores 0.2, 0.9, 0.4, 0.8 → top-2 above 0.5 = 0.9, 0.8.
+    let judge = ScriptedJudge {
+        scores: vec![0.2, 0.9, 0.4, 0.8],
+    };
+    let rs = scrt_evolve::generate::RejectionSampling {
+        candidates_per_seed: 4,
+        min_score: 0.5,
+        judge: Some(&judge),
+        steering: None,
+    };
+    let ds = scrt_evolve::generate::run_with_backend_sampled(
+        &backend,
+        &fixture_ctx(),
+        &["qa".to_string()],
+        2, // keep_k
+        &[],
+        &rs,
+    )
+    .unwrap();
+    assert_eq!(ds.len(), 2, "kept top-2 of 4 candidates");
+    // The backend was called 4 times (N candidates), proving fan-out.
+    assert_eq!(*backend.transport().calls.borrow(), 4);
+    // Kept rows carry judge scores + the rsample stamp.
+    for row in &ds.rows {
+        assert!(row.judge_score().is_some(), "kept row persists judge_score");
+        match row {
+            GenExample::Qa { gen, .. } => {
+                assert_eq!(gen.as_deref(), Some("rsample:4"))
+            }
+            other => panic!("expected Qa, got {other:?}"),
+        }
+    }
+    // Ranked: highest score first.
+    assert_eq!(ds.rows[0].judge_score(), Some(0.9));
+    assert_eq!(ds.rows[1].judge_score(), Some(0.8));
+}
+
+#[test]
+fn candidates_per_seed_one_is_single_pass() {
+    // n=1 (or no judge) ⇒ single backend call, no rsample stamp (byte-identical).
+    let response = r#"[{"kind":"qa","prompt":"q","completion":"a"}]"#;
+    let backend = ApiEndpoint::with_transport(MockTransport::new(vec![response]), 1);
+    let rs = scrt_evolve::generate::RejectionSampling::default();
+    let ds = scrt_evolve::generate::run_with_backend_sampled(
+        &backend,
+        &fixture_ctx(),
+        &["qa".to_string()],
+        3,
+        &[],
+        &rs,
+    )
+    .unwrap();
+    assert_eq!(ds.len(), 1);
+    assert_eq!(*backend.transport().calls.borrow(), 1, "single pass");
+    assert_eq!(ds.rows[0].judge_score(), None, "unjudged in single-pass");
 }

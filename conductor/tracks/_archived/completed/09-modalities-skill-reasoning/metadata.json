@@ -1,8 +1,8 @@
 {
   "id": "09-modalities-skill-reasoning",
   "type": "feature",
-  "status": "pending",
-  "description": "Extend the generation modality set with skill ingestion and reasoning-step edits.",
+  "status": "completed",
+  "description": "Extend the generation modality set with skill ingestion and reasoning-step edits. Shipped in commit fb192c9 (2026-06-28); status backfilled 2026-07-03 (plan checkboxes were never ticked; implementation named the variants Skill/ReasoningEdit).",
   "created_at": "2026-06-19T05:10:41-06:00",
-  "updated_at": "2026-06-19T05:10:41-06:00"
+  "updated_at": "2026-07-03T00:00:00Z"
 }

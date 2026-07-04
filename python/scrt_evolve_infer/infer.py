@@ -112,67 +112,104 @@ def apply_adapter(model: nn.Module, adapter_dir: str | Path) -> None:
         )
     print(f"INFO: attached {n_attached} LoRALinear modules", file=sys.stderr)
 
-    # Load adapter weights.
+    # Load adapter weights and copy them into the freshly attached wrappers.
     state = load_file(str(weights_path))  # dict[str, Tensor]
+    _copy_lora_state(model, state, where="apply_adapter")
 
-    # Build a map from module path → LoRALinear for all attached wrappers.
-    # named_modules() returns the SAME keys used by save_adapter() in trainer.py.
-    lora_modules: dict[str, LoRALinear] = {
+
+def _collect_lora_modules(model: nn.Module) -> dict[str, "LoRALinear"]:
+    """Map module-path → LoRALinear for every attached wrapper (save_adapter keys)."""
+    return {
         name: module
         for name, module in model.named_modules()
         if isinstance(module, LoRALinear)
     }
 
-    # Track which adapter tensors were consumed and which modules got weights.
-    consumed: set[str] = set()
-    modules_loaded: set[str] = set()
 
+def _copy_lora_state(
+    model: nn.Module, state: dict[str, torch.Tensor], *, where: str
+) -> tuple[int, int]:
+    """
+    Copy a lora_A/lora_B state dict into *model*'s LoRALinear wrappers in-place.
+
+    Uses the save_adapter() naming contract (module-path + ".lora_A"/".lora_B").
+    Validates every adapter tensor is consumed AND every LoRALinear is refreshed;
+    raises before any partial mutation if a name is missing on either side.
+    Returns (tensors_copied, modules_loaded).
+    """
+    lora_modules = _collect_lora_modules(model)
+
+    # Preflight: resolve every tensor key to a (module, suffix) target BEFORE
+    # mutating anything, so a bad adapter cannot leave the model half-swapped.
+    plan: list[tuple["LoRALinear", str, torch.Tensor]] = []
+    unmatched_tensors: list[str] = []
+    modules_targeted: set[str] = set()
     for tensor_key, tensor in state.items():
-        # tensor_key looks like: "model.layers.0.self_attn.q_proj.lora_A"
         if tensor_key.endswith(".lora_A"):
-            module_path = tensor_key[: -len(".lora_A")]
-            suffix = "lora_A"
+            module_path, suffix = tensor_key[: -len(".lora_A")], "lora_A"
         elif tensor_key.endswith(".lora_B"):
-            module_path = tensor_key[: -len(".lora_B")]
-            suffix = "lora_B"
+            module_path, suffix = tensor_key[: -len(".lora_B")], "lora_B"
         else:
-            continue  # unexpected key — skip silently; checked below
-
-        if module_path not in lora_modules:
-            # Will surface in the unmatched check below.
+            unmatched_tensors.append(tensor_key)
             continue
+        mod = lora_modules.get(module_path)
+        if mod is None:
+            unmatched_tensors.append(tensor_key)
+            continue
+        plan.append((mod, suffix, tensor))
+        modules_targeted.add(module_path)
 
-        lora_mod = lora_modules[module_path]
-        param = getattr(lora_mod, suffix)  # nn.Parameter
-        with torch.no_grad():
-            param.copy_(tensor)
-        consumed.add(tensor_key)
-        modules_loaded.add(module_path)
-
-    # Validate: every adapter tensor must have been consumed.
-    all_adapter_keys = set(state.keys())
-    unmatched_tensors = all_adapter_keys - consumed
     if unmatched_tensors:
         raise RuntimeError(
-            f"apply_adapter: {len(unmatched_tensors)} adapter tensor(s) had no "
+            f"{where}: {len(unmatched_tensors)} adapter tensor(s) had no "
             f"matching LoRALinear in the model:\n"
             + "\n".join(f"  {k}" for k in sorted(unmatched_tensors))
         )
 
-    # Validate: every attached LoRALinear must have received weights.
-    modules_missing = set(lora_modules.keys()) - modules_loaded
+    modules_missing = set(lora_modules.keys()) - modules_targeted
     if modules_missing:
         raise RuntimeError(
-            f"apply_adapter: {len(modules_missing)} LoRALinear module(s) received "
+            f"{where}: {len(modules_missing)} LoRALinear module(s) received "
             f"no weights from the adapter file:\n"
             + "\n".join(f"  {k}" for k in sorted(modules_missing))
         )
 
+    # All names resolved — now mutate.
+    with torch.no_grad():
+        for mod, suffix, tensor in plan:
+            getattr(mod, suffix).copy_(tensor)
+
     print(
-        f"INFO: adapter loaded — {len(consumed)} tensors into "
-        f"{len(modules_loaded)} LoRALinear modules",
+        f"INFO: adapter loaded — {len(plan)} tensors into "
+        f"{len(modules_targeted)} LoRALinear modules",
         file=sys.stderr,
     )
+    return len(plan), len(modules_targeted)
+
+
+def reload_adapter(model: nn.Module, adapter_dir: str | Path) -> None:
+    """
+    Hot-swap a freshly committed flat LoRA adapter over an ALREADY-LOADED model.
+
+    Unlike apply_adapter(), this assumes LoRALinear wrappers already exist and
+    only overwrites their lora_A/lora_B weights — no re-instantiation, no
+    re-attach. Reuses the save_adapter() naming contract and the same all-or-
+    nothing validation (raises before mutating if any tensor is missing).
+    """
+    adapter_dir = Path(adapter_dir)
+    weights_path = adapter_dir / "adapter.safetensors"
+    if not weights_path.exists():
+        raise FileNotFoundError(f"adapter.safetensors not found in {adapter_dir}")
+
+    existing = _collect_lora_modules(model)
+    if not existing:
+        raise RuntimeError(
+            "reload_adapter: model has no LoRALinear wrappers — call "
+            "apply_adapter() first to attach the adapter before hot-swapping."
+        )
+
+    state = load_file(str(weights_path))
+    _copy_lora_state(model, state, where="reload_adapter")
 
 
 # ---------------------------------------------------------------------------

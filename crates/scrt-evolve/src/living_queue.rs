@@ -5,7 +5,7 @@
 //! process fed by a **living queue** that grows from the user's own activity.
 //! Two lanes, both append-only JSONL under `work_dir/queue/`:
 //!
-//! - **`priority`** — EXPLICIT captures (`scrt-evolve teach …`). Skips the
+//! - **`priority`** — EXPLICIT captures (`evolve ambient teach …`). Skips the
 //!   relevance filter, drains FIRST. The user said "learn this," so it's trusted.
 //! - **`raw`** — the PASSIVE activity tail (distilled transcripts via
 //!   [`crate::harvest`]), gated by goal-relevance before it ever lands here.
@@ -28,6 +28,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::EvolveConfig;
 use crate::dataset::{Dataset, GenExample};
+#[cfg(test)]
+use crate::dataset::{Outcome, Tier, Verdict};
 use crate::workdir::WorkDir;
 
 /// Which lane a queued example belongs to. `priority` always drains before
@@ -54,9 +56,11 @@ impl Lane {
 /// from (the lane + its 0-based index in that lane file — the cursor coordinate).
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueuedItem {
+    /// The lane this item was popped from.
     pub lane: Lane,
     /// 0-based index within the lane file (the cursor coordinate this pop advanced past).
     pub ordinal: u64,
+    /// The training example payload.
     pub example: GenExample,
 }
 
@@ -250,6 +254,30 @@ impl LivingQueue {
         }
         Ok(out)
     }
+
+    /// NON-destructive read of the next `n` pending rows (priority-first) without
+    /// advancing the cursor. For sampling (track 37 steering-compliance) — the
+    /// rows stay queued for the real training pop.
+    pub fn peek(&self, n: usize) -> anyhow::Result<Vec<GenExample>> {
+        let cursor = self.load_cursor();
+        let mut out = Vec::with_capacity(n);
+        for lane in [Lane::Priority, Lane::Raw] {
+            let mut idx = cursor.consumed(lane);
+            while out.len() < n {
+                match self.read_at(lane, idx)? {
+                    Some(ex) => {
+                        out.push(ex);
+                        idx += 1;
+                    }
+                    None => break,
+                }
+            }
+            if out.len() >= n {
+                break;
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -262,6 +290,11 @@ mod tests {
             completion: format!("answer to {prompt}"),
             source: None,
             gen: Some("teach".to_string()),
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         }
     }
 

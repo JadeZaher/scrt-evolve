@@ -92,10 +92,10 @@ evaluate → keep-or-revert. Without it the loop has no convergence guarantee.
 - **History / observability**: `work_dir/evolution-log.jsonl` — one row per step
   {step, kind, verdict, metrics, action (commit|rollback|quarantine), cause}.
   The audit trail of how the model evolved (and what it refused to keep).
-- CLI: `scrt-evolve evolve step --kind <…>` (run one transactional step),
-  `scrt-evolve checkpoints list|show|restore <id>`, `scrt-evolve prune
-  [--experts|--base]` (transactional), `scrt-evolve quarantine list|clear`,
-  `scrt-evolve evolve rearm` (resume after a halt).
+- CLI: `evolve train auto step --kind <…>` (run one transactional step),
+  `evolve watch checkpoints list|show|restore <id>`, `scrt-evolve prune
+  [--experts|--base]` (transactional), `evolve watch quarantine list|clear`,
+  `evolve train auto rearm` (resume after a halt).
 
 ## Constraints
 - **Every destructive action is transactional.** Base pruning and any

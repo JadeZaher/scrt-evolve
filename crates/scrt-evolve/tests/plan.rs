@@ -3,7 +3,7 @@
 
 use std::cell::RefCell;
 
-use scrt_evolve::dataset::{Dataset, GenExample};
+use scrt_evolve::dataset::{Dataset, GenExample, Outcome, Tier, Verdict};
 use scrt_evolve::discover::{DiscoveredContext, Passage};
 use scrt_evolve::generate::api::{ApiEndpoint, ChatMessage, ChatTransport};
 use scrt_evolve::generate::run_plan_with_backend;
@@ -180,6 +180,11 @@ fn coverage_measure_counts_modalities_and_tools() {
             completion: "a".into(),
             source: None,
             gen: None,
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         },
         GenExample::ToolCall {
             prompt: "p".into(),
@@ -187,6 +192,11 @@ fn coverage_measure_counts_modalities_and_tools() {
             arguments: serde_json::json!({"name":"x","note":"y"}),
             source: None,
             gen: None,
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         },
     ]);
     let cov = measure(&ds);
@@ -232,7 +242,8 @@ fn planner_runs_end_to_end_with_mock() {
     let resp = r#"{"strategy":"s","specs":[{"modality":"cli","prompt":"emit scrt commands","count":3,"target_tools":[],"passage_shape":"any","rationale":"r"}]}"#;
     let t = MockTransport::new(vec![resp]);
     let directive = scrt_evolve::TrainingDirective::default();
-    let plan = plan_with_transport(&t, &sig, &ctx, &tools, &directive).unwrap();
+    let domain = scrt_evolve::config::DomainConfig::default();
+    let plan = plan_with_transport(&t, &sig, &ctx, &tools, &directive, &domain).unwrap();
     assert_eq!(plan.specs.len(), 1);
     assert_eq!(plan.specs[0].modality, "cli");
 }
@@ -277,6 +288,201 @@ fn directive_exclusion_matches_text() {
     assert!(d.excluded("scrt then rm -rf /tmp"));
     assert!(d.excluded("This is a DESTRUCTIVE example"));
     assert!(!d.excluded("scrt --mp-stash auth"));
+}
+
+/// A transport that records the system message it was handed, so tests can
+/// snapshot the planner's system prompt without a live endpoint.
+struct CapturingTransport {
+    last_system: RefCell<String>,
+    response: String,
+}
+impl CapturingTransport {
+    fn new(response: &str) -> Self {
+        Self {
+            last_system: RefCell::new(String::new()),
+            response: response.to_string(),
+        }
+    }
+}
+impl ChatTransport for CapturingTransport {
+    fn complete(&self, m: &[ChatMessage]) -> anyhow::Result<String> {
+        if let Some(sys) = m.iter().find(|c| c.role == "system") {
+            *self.last_system.borrow_mut() = sys.content.clone();
+        }
+        Ok(self.response.clone())
+    }
+}
+
+// Track 37 Phase C — TASK 1: planner can EMIT the track-09 modalities.
+#[test]
+fn planner_accepts_skill_and_reasoning_edit_modalities() {
+    let response = r#"{"strategy":"cover skills + reasoning","specs":[
+      {"modality":"skill","prompt":"teach scrt skills","count":3,"target_tools":[],"passage_shape":"any","rationale":"skill signal"},
+      {"modality":"reasoning_edit","prompt":"correct chains","count":2,"target_tools":[],"passage_shape":"any","rationale":"reasoning signal"}
+    ]}"#;
+    let plan = parse_plan(response).unwrap();
+    assert_eq!(plan.specs.len(), 2, "skill + reasoning_edit both accepted");
+    assert_eq!(plan.specs[0].modality, "skill");
+    assert_eq!(plan.specs[1].modality, "reasoning_edit");
+}
+
+// Track 37 Phase C — TASK 1b: `completion` is no longer a plannable modality
+// (doc-ingestion emits completion rows directly; planning one used to silently
+// degrade to Prose).
+#[test]
+fn planner_rejects_completion_modality() {
+    let response = r#"{"strategy":"x","specs":[
+      {"modality":"completion","prompt":"p","count":5,"target_tools":[],"passage_shape":"any","rationale":"r"},
+      {"modality":"qa","prompt":"q","count":5,"target_tools":[],"passage_shape":"any","rationale":"r"}
+    ]}"#;
+    let plan = parse_plan(response).unwrap();
+    assert_eq!(plan.specs.len(), 1, "completion dropped, qa kept");
+    assert_eq!(plan.specs[0].modality, "qa");
+}
+
+// Track 37 Phase C — TASK 1: a planned skill/reasoning_edit spec routes to the
+// right GenMode and produces a valid row through run_plan_with_backend.
+#[test]
+fn plan_driven_skill_routes_to_skill_mode() {
+    let plan = GenPlan {
+        round: 0,
+        strategy: "s".into(),
+        specs: vec![GenSpec {
+            modality: "skill".into(),
+            prompt: "emit a skill row".into(),
+            count: 1,
+            target_tools: vec![],
+            rationale: "r".into(),
+            passage_shape: "any".into(),
+        }],
+    };
+    // A valid skill row: named skill + non-empty invocation.
+    let response = r#"[{"kind":"skill","prompt":"how do I search?","skill_name":"scrt-context","invocation":"scrt \"auth\" --in .","expected_outcome":"token-budgeted search"}]"#;
+    let backend = ApiEndpoint::with_transport(MockTransport::new(vec![response]), 1);
+    let ctx = fixture_ctx();
+    let shapes = vec!["cli_ref".to_string(), "code".to_string()];
+    let dataset = run_plan_with_backend(&backend, &ctx, &plan, 3, &shapes).unwrap();
+    assert_eq!(dataset.len(), 1, "skill row routed + validated");
+    match &dataset.rows[0] {
+        GenExample::Skill { skill_name, .. } => assert_eq!(skill_name, "scrt-context"),
+        other => panic!("expected skill row, got {other:?}"),
+    }
+}
+
+// Track 37 Phase C — TASK 3a: with the DEFAULT domain the planner system prompt
+// is stable AND now advertises the skill/reasoning_edit modalities. The job
+// line uses the default (`scrt`) description verbatim, so existing configs get
+// the same wording they always had.
+#[test]
+fn default_domain_planner_prompt_is_stable() {
+    let cfg = scrt_evolve::EvolveConfig::from_toml_str("[evolve]\ncorpus_dir = \".\"").unwrap();
+    let ctx = fixture_ctx();
+    let sig = signals::extract(&cfg, &ctx);
+    let tools = scrt_evolve::toolspec::scrt_tools().unwrap();
+    let directive = scrt_evolve::TrainingDirective::default();
+    let domain = scrt_evolve::config::DomainConfig::default();
+
+    let resp = r#"{"strategy":"s","specs":[{"modality":"qa","prompt":"p","count":1,"target_tools":[],"passage_shape":"any","rationale":"r"}]}"#;
+    let t = CapturingTransport::new(resp);
+    let _ = plan_with_transport(&t, &sig, &ctx, &tools, &directive, &domain).unwrap();
+    let sys = t.last_system.borrow().clone();
+
+    // Job line uses the default scrt description (byte-identical wording).
+    assert!(
+        sys.contains(
+            "better at USING the `scrt` tool — both as structured tool calls and \
+as a CLI — plus understanding its concepts."
+        ),
+        "default-domain job line must reproduce the historical scrt wording"
+    );
+    // The new modalities are advertised (TASK 1c).
+    assert!(sys.contains("\"skill\":"), "skill modality advertised");
+    assert!(
+        sys.contains("\"reasoning_edit\":"),
+        "reasoning_edit modality advertised"
+    );
+    assert!(
+        sys.contains("tool_call|cli|qa|instruction|skill|reasoning_edit"),
+        "output-shape enum lists the new modalities"
+    );
+}
+
+// Track 37 Phase C — TASK 3a: a CUSTOM domain description replaces the job line
+// while leaving the rest of the prompt scaffolding intact.
+#[test]
+fn custom_domain_description_drives_planner_job_line() {
+    let cfg = scrt_evolve::EvolveConfig::from_toml_str("[evolve]\ncorpus_dir = \".\"").unwrap();
+    let ctx = fixture_ctx();
+    let sig = signals::extract(&cfg, &ctx);
+    let tools = scrt_evolve::toolspec::scrt_tools().unwrap();
+    let directive = scrt_evolve::TrainingDirective::default();
+    let domain = scrt_evolve::config::DomainConfig {
+        name: "kubectl".into(),
+        description: "the `kubectl` CLI and Kubernetes concepts".into(),
+        ..Default::default()
+    };
+
+    let resp = r#"{"strategy":"s","specs":[{"modality":"qa","prompt":"p","count":1,"target_tools":[],"passage_shape":"any","rationale":"r"}]}"#;
+    let t = CapturingTransport::new(resp);
+    let _ = plan_with_transport(&t, &sig, &ctx, &tools, &directive, &domain).unwrap();
+    let sys = t.last_system.borrow().clone();
+    assert!(
+        sys.contains("better at USING the `kubectl` CLI and Kubernetes concepts."),
+        "custom domain description appears in the job line"
+    );
+    assert!(
+        !sys.contains("the `scrt` tool — both as structured"),
+        "the hardcoded scrt wording is gone under a custom domain"
+    );
+}
+
+// Track 37 Phase C — TASK 3b: the DEFAULT domain yields identical signal counts
+// to the historical hardcoded scrt tool set + `--mp-` flag recognizer.
+#[test]
+fn default_domain_signal_counts_match_baseline() {
+    let cfg = scrt_evolve::EvolveConfig::from_toml_str("[evolve]\ncorpus_dir = \".\"").unwrap();
+    let ctx = fixture_ctx();
+    let sig = signals::extract(&cfg, &ctx);
+    // scrt_stash counted from the first passage; --mp-stash flag counted.
+    assert_eq!(
+        sig.cooccurrence.tool_frequency.get("scrt_stash").copied(),
+        Some(1)
+    );
+    assert!(sig.cooccurrence.flag_frequency.contains_key("--mp-stash"));
+    // A non-domain tool name is NOT counted.
+    assert!(!sig.cooccurrence.tool_frequency.contains_key("kubectl"));
+}
+
+// Track 37 Phase C — TASK 3b: a custom domain counts its OWN tool names + flag
+// prefixes in the co-occurrence signal.
+#[test]
+fn custom_domain_counts_its_own_tools_and_flags() {
+    let toml = "[evolve]\ncorpus_dir = \".\"\n\
+                [domain]\nname=\"kubectl\"\ntools=[\"kubectl_apply\"]\nflag_patterns=[\"-\"]\n";
+    let cfg = scrt_evolve::EvolveConfig::from_toml_str(toml).unwrap();
+    let ctx = DiscoveredContext {
+        passages: vec![Passage {
+            text: "run kubectl_apply -f pod.yaml then kubectl_apply -n ns".into(),
+            source: "notes.md".into(),
+            score: 5.0,
+            seed: "corpus:k8s".into(),
+        }],
+        anchors: vec![],
+    };
+    let sig = signals::extract(&cfg, &ctx);
+    assert_eq!(
+        sig.cooccurrence.tool_frequency.get("kubectl_apply").copied(),
+        Some(2),
+        "custom tool name counted twice"
+    );
+    // The `-` prefix picks up `-f` / `-n` (generic `--` rule wouldn't).
+    assert!(
+        sig.cooccurrence.flag_frequency.contains_key("-f")
+            || sig.cooccurrence.flag_frequency.contains_key("-n"),
+        "custom flag prefix recognizes single-dash flags"
+    );
+    // The scrt default tool set is NOT counted under a custom domain.
+    assert!(!sig.cooccurrence.tool_frequency.contains_key("scrt_stash"));
 }
 
 #[test]

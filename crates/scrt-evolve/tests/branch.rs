@@ -9,11 +9,11 @@ use scrt_evolve::branch::{
     self, BranchHooks, BranchManifest, BranchRegistry, Lineage, RegistryError,
 };
 use scrt_evolve::config::BranchRouterConfig;
-use scrt_evolve::dataset::{Dataset, GenExample};
+use scrt_evolve::dataset::{GenExample, Dataset, Outcome, Tier, Verdict};
 use scrt_evolve::discover::{DiscoveredContext, Passage};
 use scrt_evolve::eval::ScoreReport;
 use scrt_evolve::regulate::StepAction;
-use scrt_evolve::{BranchRouter, EvolveConfig, LocalBranchRouter, Quarantine};
+use scrt_evolve::{BranchRouter, EvolveConfig, LocalBranchRouter, Quarantine, dataset_signal_stats, dataset_tier};
 
 fn temp_dir(suffix: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
@@ -41,6 +41,7 @@ fn manifest(name: &str, domain_texts: &[&str]) -> BranchManifest {
         version: scrt_evolve::branch::MANIFEST_VERSION.to_string(),
         gguf_sha: scrt_evolve::branch::sha256_hex(name.as_bytes()),
         created: "2026-06-26T00:00:00Z".to_string(),
+        tier: Tier::Private,
     }
 }
 
@@ -488,6 +489,11 @@ fn qa(n: usize) -> Dataset {
                 completion: format!("answer {i}"),
                 source: None,
                 gen: None,
+                outcome: Outcome::Unknown,
+                judge_score: None,
+                judge_verdict: Verdict::Unjudged,
+                tier: Tier::Private,
+                chosen_over: None,
             })
             .collect(),
     )
@@ -659,4 +665,136 @@ fn catastrophe_quarantines_branch_provenance_and_halts() {
         q.contains("branch:dangerous"),
         "catastrophic branch provenance quarantined"
     );
+}
+
+// ──────────────── Track 37: manifest tier + signal-stats rollup ─────────────────
+
+/// Build a Dataset of n QA rows all marked Shared (for tier rollup tests).
+fn qa_shared(n: usize) -> Dataset {
+    Dataset::new(
+        (0..n)
+            .map(|i| GenExample::Qa {
+                prompt: format!("question {i}"),
+                completion: format!("answer {i}"),
+                source: None,
+                gen: None,
+                outcome: Outcome::Unknown,
+                judge_score: None,
+                judge_verdict: Verdict::Unjudged,
+                tier: Tier::Shared,
+                chosen_over: None,
+            })
+            .collect(),
+    )
+}
+
+#[test]
+fn manifest_round_trips_with_shared_tier_and_signal_stats() {
+    // A manifest with tier=Shared and signal-stat keys serializes and parses back equal.
+    let mut eval = BTreeMap::new();
+    eval.insert("correctness".to_string(), 0.9);
+    eval.insert("judged_fraction".to_string(), 0.0);
+    eval.insert("judge_mean_score".to_string(), 0.0);
+    eval.insert("outcome_verified_fraction".to_string(), 0.0);
+    let texts: Vec<String> = vec!["contract law clause".to_string()];
+    let m = BranchManifest {
+        name: "legal-shared".to_string(),
+        base_model: "granite-eval-0.5b".to_string(),
+        domain: "legal/shared".to_string(),
+        corpus_descriptor: "1 passages".to_string(),
+        router_signature: corpus_signature("simhash", &texts),
+        eval_report: eval,
+        lineage: Lineage::default(),
+        version: scrt_evolve::branch::MANIFEST_VERSION.to_string(),
+        gguf_sha: scrt_evolve::branch::sha256_hex(b"shared"),
+        created: "2026-06-26T00:00:00Z".to_string(),
+        tier: Tier::Shared,
+    };
+    let json = m.to_json().unwrap();
+    let back = BranchManifest::from_json(&json).unwrap();
+    assert_eq!(m, back, "round-trip must be lossless");
+    // Shared tier IS serialized (not skipped).
+    assert!(json.contains("\"tier\""), "Shared tier must appear in JSON");
+    assert!(json.contains("\"shared\""), "tier value must be 'shared'");
+}
+
+#[test]
+fn legacy_manifest_without_tier_defaults_to_private() {
+    // A manifest JSON that pre-dates the `tier` field must still deserialize (serde default).
+    let legacy = r#"{
+        "name": "legacy-branch",
+        "base_model": "granite-eval-0.5b",
+        "domain": "legal/tool-calling",
+        "corpus_descriptor": "5 passages from corpus",
+        "router_signature": {"kind": "simhash", "vector": []},
+        "eval_report": {"correctness": 0.85},
+        "lineage": {},
+        "version": "1",
+        "gguf_sha": "abc123",
+        "created": "2026-01-01T00:00:00Z"
+    }"#;
+    let m = BranchManifest::from_json(legacy).expect("legacy manifest must parse");
+    assert_eq!(m.tier, Tier::Private, "absent tier field defaults to Private");
+}
+
+#[test]
+fn create_eval_report_contains_signal_stats_and_tier() {
+    // Branch-create merges signal-stat keys into eval_report and sets tier to
+    // the most-restrictive row tier in the corpus (track 37).
+    let (_dir, cfg) = temp_branch_cfg("signal-stats");
+
+    // Mix: 7 Private + 1 Shared → most-restrictive = Private.
+    let mut rows = qa(7).rows;
+    rows.extend(qa_shared(1).rows);
+    let mixed_dataset = Dataset::new(rows);
+
+    let discover = |_: &EvolveConfig| Ok(ctx(&["contract law", "tort liability"]));
+    let generate = move |_: &EvolveConfig, _: &DiscoveredContext| Ok(mixed_dataset.clone());
+    let train = |_: &EvolveConfig, _: &Dataset| Ok(vec!["branch:signal".to_string()]);
+    let score = |_: &EvolveConfig| Ok(report(0.90));
+    let hooks = BranchHooks {
+        discover: &discover,
+        generate: &generate,
+        train: &train,
+        score: &score,
+        export: &good_export,
+    };
+
+    let out = branch::create(
+        &cfg,
+        "signal",
+        Some("granite-eval-0.5b"),
+        None,
+        Some("signal/test"),
+        &report(0.80),
+        "2026-07-02T00:00:00Z",
+        &hooks,
+    )
+    .unwrap();
+
+    assert_eq!(out.action, Some(StepAction::Commit));
+    let m = out.manifest.expect("manifest on commit");
+
+    // Signal-stat keys injected by dataset_signal_stats.
+    for key in ["judged_fraction", "judge_mean_score", "outcome_verified_fraction"] {
+        assert!(
+            m.eval_report.contains_key(key),
+            "eval_report missing signal-stat key: {key}"
+        );
+    }
+    // Most-restrictive: one Shared row + seven Private rows → Private wins.
+    assert_eq!(m.tier, Tier::Private, "most-restrictive tier is Private");
+
+    // Verify dataset_signal_stats and dataset_tier agree with the manifest values directly.
+    let rows_on_disk = Dataset::read_jsonl(
+        cfg.work_dir()
+            .join("branches")
+            .join("signal")
+            .join("dataset.train.jsonl"),
+    )
+    .unwrap();
+    let stats = dataset_signal_stats(&rows_on_disk.rows);
+    assert!(stats.contains_key("judged_fraction"));
+    let tier = dataset_tier(&rows_on_disk.rows);
+    assert_eq!(tier, Tier::Private);
 }

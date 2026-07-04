@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use scrt_core::palace::{ops::SystemClock, FilePalace, Palace};
 
-use crate::config::EvolveConfig;
+use crate::config::{DomainConfig, EvolveConfig};
 use crate::discover::DiscoveredContext;
 
 /// The full signal summary handed to the planner.
@@ -66,11 +66,15 @@ pub struct CorpusShapeSignal {
     pub per_passage: Vec<String>,
 }
 
-/// Extract all signals from the config + discovered context.
+/// Extract all signals from the config + discovered context. The `[domain]`
+/// block (track 37 Phase C) drives which tool names + flag prefixes count as
+/// co-occurrence signal; absent ⇒ [`DomainConfig::default`] ⇒ the built-in
+/// `scrt` tool set + `--mp-` flags (behavior-identical to before).
 pub fn extract(cfg: &EvolveConfig, ctx: &DiscoveredContext) -> Signals {
+    let domain = cfg.domain.clone().unwrap_or_default();
     Signals {
         palace: extract_palace(cfg),
-        cooccurrence: extract_cooccurrence(ctx),
+        cooccurrence: extract_cooccurrence(ctx, &domain),
         corpus_shape: extract_corpus_shape(ctx),
     }
 }
@@ -112,18 +116,11 @@ fn extract_palace(cfg: &EvolveConfig) -> PalaceSignal {
     }
 }
 
-/// Known scrt tool names + the flag pattern, for co-occurrence scanning.
-const SCRT_TOOLS: &[&str] = &[
-    "scrt_search",
-    "scrt_stash",
-    "scrt_list_stashes",
-    "scrt_get_stash",
-    "scrt_drop_stash",
-    "scrt_similar",
-];
-
-/// Tool/flag co-occurrence across passages.
-fn extract_cooccurrence(ctx: &DiscoveredContext) -> CooccurrenceSignal {
+/// Tool/flag co-occurrence across passages. `domain` supplies the tool names
+/// counted and the flag prefixes recognized (track 37 Phase C). With
+/// [`DomainConfig::default`] this is the built-in `scrt` tool set + the generic
+/// `--` flag recognizer — behavior-identical to before parameterization.
+fn extract_cooccurrence(ctx: &DiscoveredContext, domain: &DomainConfig) -> CooccurrenceSignal {
     let mut tool_frequency: BTreeMap<String, usize> = BTreeMap::new();
     let mut flag_frequency: BTreeMap<String, usize> = BTreeMap::new();
     let mut pairs: BTreeMap<String, usize> = BTreeMap::new();
@@ -131,20 +128,22 @@ fn extract_cooccurrence(ctx: &DiscoveredContext) -> CooccurrenceSignal {
     for p in &ctx.passages {
         let text = &p.text;
 
-        // Tools present in this passage.
+        // Tools present in this passage (domain-configured tool names).
         let mut present: Vec<String> = Vec::new();
-        for t in SCRT_TOOLS {
-            let n = text.matches(t).count();
+        for t in &domain.tools {
+            let n = text.matches(t.as_str()).count();
             if n > 0 {
-                *tool_frequency.entry((*t).to_string()).or_default() += n;
-                present.push((*t).to_string());
+                *tool_frequency.entry(t.clone()).or_default() += n;
+                present.push(t.clone());
             }
         }
 
-        // Flags present (--mp-foo / --foo style tokens).
+        // Flags present (`--mp-foo` / `--foo` style tokens, plus any domain flag
+        // prefixes). The generic `--` recognizer is always on (back-compat);
+        // `domain.flag_patterns` UNION-adds any extra prefixes to accept.
         let mut flags_here: Vec<String> = Vec::new();
         for tok in text.split(|c: char| c.is_whitespace() || c == '`' || c == '"') {
-            if let Some(flag) = parse_flag(tok) {
+            if let Some(flag) = parse_flag(tok, &domain.flag_patterns) {
                 *flag_frequency.entry(flag.clone()).or_default() += 1;
                 if !flags_here.contains(&flag) {
                     flags_here.push(flag);
@@ -177,13 +176,22 @@ fn extract_cooccurrence(ctx: &DiscoveredContext) -> CooccurrenceSignal {
 
 /// Recognize a CLI flag token (`--mp-stash`, `--effort`), trimming trailing
 /// punctuation. Returns the normalized flag or `None`.
-fn parse_flag(tok: &str) -> Option<String> {
-    let t = tok.trim_matches(|c: char| !c.is_alphanumeric() && c != '-');
+///
+/// The generic `--<name>` (len>3) recognizer is always on for back-compat; any
+/// prefix in `flag_patterns` is UNION-added as an additional accept rule, so a
+/// custom domain can count non-`--` flags (e.g. `-v`, `/flag`) without changing
+/// the default (`--mp-`) behavior, which already matches under the generic rule.
+fn parse_flag(tok: &str, flag_patterns: &[String]) -> Option<String> {
+    let t = tok.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '/');
     if t.starts_with("--") && t.len() > 3 {
-        Some(t.to_string())
-    } else {
-        None
+        return Some(t.to_string());
     }
+    for pat in flag_patterns {
+        if !pat.is_empty() && t.starts_with(pat.as_str()) && t.len() > pat.len() {
+            return Some(t.to_string());
+        }
+    }
+    None
 }
 
 /// Classify each passage's content shape.

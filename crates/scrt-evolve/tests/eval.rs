@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use scrt_evolve::dataset::GenExample;
+use scrt_evolve::dataset::{GenExample, Outcome, Tier, Verdict};
 use scrt_evolve::eval::gate::{ExecutableGate, GateVerdict};
 use scrt_evolve::eval::score::{ApiScorer, ScoreReport, Scorer};
 use scrt_evolve::eval::verdict::{classify, StepVerdict, VerdictError, VerdictTolerances};
@@ -113,6 +113,11 @@ fn sample_dataset() -> Dataset {
             command: format!("scrt \"item{i}\" --mp-stash item{i}"),
             source: Some("fixture".to_string()),
             gen: Some("test".to_string()),
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         })
         .collect();
     Dataset::new(rows)
@@ -161,6 +166,11 @@ fn stable_probe_excludes_overlap_to_form_the_train_remainder() {
                 command: format!("scrt \"f{i}\" --mp-stash f{i}"),
                 source: Some("fixture".to_string()),
                 gen: Some("test".to_string()),
+                outcome: Outcome::Unknown,
+                judge_score: None,
+                judge_verdict: Verdict::Unjudged,
+                tier: Tier::Private,
+                chosen_over: None,
             })
             .collect(),
     );

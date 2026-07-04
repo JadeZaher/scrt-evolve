@@ -58,7 +58,7 @@ No weights are mutated by anything signed off here.
   is built (`goals::run_buildable`, writes `work_dir/goals/<name>/dataset.jsonl`,
   tested in `tests/goals.rs`). The ~100+-row medium-round sizing + stash/trace
   merge belongs with the eval-gated round driver (slice 6). Carry-forward.
-- **Slice 10** (CLI surface): `scrt-evolve evolve --goals` exists and runs the
+- **Slice 10** (CLI surface): `evolve train auto --goals` exists and runs the
   bounded buildable loop (no weight mutation). The scheduler + through-the-txn
   weight path are slices 9/6. Carry-forward.
 

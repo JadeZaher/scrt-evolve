@@ -30,7 +30,7 @@ drive the preset against scrt-evolve datasets.
   Python `peft`/`trl` script can train using scrt-evolve as the data+config
   layer. This is the explicit merge point with the existing Python training
   stack.
-- `scrt-evolve train --preset lora [--data dataset.jsonl]` (CLI), runnable
+- `evolve train fit --preset lora [--data dataset.jsonl]` (CLI), runnable
   standalone from an on-disk dataset.
 
 ## Constraints
@@ -53,7 +53,7 @@ drive the preset against scrt-evolve datasets.
   adapter (assert injected layer count/shape).
 - Under `--features pyo3`, a Python `peft`/`trl`-style script trains one step
   on the same dataset via the bridge and saves a compatible adapter.
-- `scrt-evolve train --preset lora --data dataset.jsonl` runs standalone.
+- `evolve train fit --preset lora --data dataset.jsonl` runs standalone.
 
 ## Dependencies
 Track 02 (`Dataset`), track 03 (`model.rs` loader), track 00 (`train`/`pyo3`

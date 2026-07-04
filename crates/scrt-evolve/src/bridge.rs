@@ -53,7 +53,13 @@ fn training_pair(row: &GenExample) -> Option<(String, String)> {
             };
             Some((prompt, output.clone()))
         }
-        _ => None,
+        // Non-trainable kinds: no prompt-masked pair to extract.
+        GenExample::Completion { .. }
+        | GenExample::Contrastive { .. }
+        | GenExample::ToolCall { .. }
+        | GenExample::Cli { .. }
+        | GenExample::Skill { .. }
+        | GenExample::ReasoningEdit { .. } => None,
     }
 }
 
@@ -66,6 +72,7 @@ fn row_to_dict<'py>(py: Python<'py>, row: &GenExample) -> PyResult<Bound<'py, Py
             completion,
             source,
             gen,
+            ..
         } => {
             d.set_item("kind", "qa")?;
             d.set_item("prompt", prompt)?;
@@ -79,6 +86,7 @@ fn row_to_dict<'py>(py: Python<'py>, row: &GenExample) -> PyResult<Bound<'py, Py
             output,
             source,
             gen,
+            ..
         } => {
             d.set_item("kind", "instruction")?;
             d.set_item("instruction", instruction)?;
@@ -87,7 +95,7 @@ fn row_to_dict<'py>(py: Python<'py>, row: &GenExample) -> PyResult<Bound<'py, Py
             d.set_item("source", source.clone())?;
             d.set_item("gen", gen.clone())?;
         }
-        GenExample::Completion { text, source } => {
+        GenExample::Completion { text, source, .. } => {
             d.set_item("kind", "completion")?;
             d.set_item("text", text)?;
             d.set_item("source", source.clone())?;
@@ -97,6 +105,7 @@ fn row_to_dict<'py>(py: Python<'py>, row: &GenExample) -> PyResult<Bound<'py, Py
             positive,
             negatives,
             stash,
+            ..
         } => {
             d.set_item("kind", "contrastive")?;
             d.set_item("query", query)?;
@@ -110,6 +119,7 @@ fn row_to_dict<'py>(py: Python<'py>, row: &GenExample) -> PyResult<Bound<'py, Py
             arguments,
             source,
             gen,
+            ..
         } => {
             d.set_item("kind", "tool_call")?;
             d.set_item("prompt", prompt)?;
@@ -123,10 +133,49 @@ fn row_to_dict<'py>(py: Python<'py>, row: &GenExample) -> PyResult<Bound<'py, Py
             command,
             source,
             gen,
+            ..
         } => {
             d.set_item("kind", "cli")?;
             d.set_item("prompt", prompt)?;
             d.set_item("command", command)?;
+            d.set_item("source", source.clone())?;
+            d.set_item("gen", gen.clone())?;
+        }
+        // Skill ingestion: expose trigger prompt + invocation + optional outcome.
+        GenExample::Skill {
+            skill_name,
+            prompt,
+            invocation,
+            expected_outcome,
+            source,
+            gen,
+            ..
+        } => {
+            d.set_item("kind", "skill")?;
+            d.set_item("skill_name", skill_name)?;
+            d.set_item("prompt", prompt)?;
+            d.set_item("invocation", invocation)?;
+            d.set_item("expected_outcome", expected_outcome.clone())?;
+            d.set_item("source", source.clone())?;
+            d.set_item("gen", gen.clone())?;
+        }
+        // Reasoning edit: expose the full trace fields so Python tooling can render.
+        GenExample::ReasoningEdit {
+            prompt,
+            original_steps,
+            edit_op,
+            edited_steps,
+            final_action,
+            source,
+            gen,
+            ..
+        } => {
+            d.set_item("kind", "reasoning_edit")?;
+            d.set_item("prompt", prompt)?;
+            d.set_item("original_steps", original_steps.clone())?;
+            d.set_item("edit_op", edit_op)?;
+            d.set_item("edited_steps", edited_steps.clone())?;
+            d.set_item("final_action", final_action)?;
             d.set_item("source", source.clone())?;
             d.set_item("gen", gen.clone())?;
         }
@@ -165,7 +214,13 @@ fn dataset_rows_for_training(path: String) -> PyResult<Vec<(String, String)>> {
         let kind = match row {
             GenExample::Qa { .. } => "qa",
             GenExample::Instruction { .. } => "instruction",
-            _ => continue,
+            // Non-trainable kinds: skip — no prompt-masked pair.
+            GenExample::Completion { .. }
+            | GenExample::Contrastive { .. }
+            | GenExample::ToolCall { .. }
+            | GenExample::Cli { .. }
+            | GenExample::Skill { .. }
+            | GenExample::ReasoningEdit { .. } => continue,
         };
         if let Some((prompt, completion)) = training_pair(row) {
             out.push((format!("{prompt}{completion}"), kind.to_string()));
@@ -208,6 +263,8 @@ fn dataset_kind_counts(path: String) -> PyResult<HashMap<String, usize>> {
             GenExample::Contrastive { .. } => "contrastive",
             GenExample::ToolCall { .. } => "tool_call",
             GenExample::Cli { .. } => "cli",
+            GenExample::Skill { .. } => "skill",
+            GenExample::ReasoningEdit { .. } => "reasoning_edit",
         };
         *counts.entry(kind.to_string()).or_insert(0) += 1;
     }

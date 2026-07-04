@@ -57,6 +57,7 @@ impl DegradationReport {
 /// Judge whether each AFTER completion degraded vs its BEFORE. LLM in production
 /// ([`LlmDegradationJudge`]); mock in tests.
 pub trait DegradationJudge {
+    /// Score each triple: returns a report marking which AFTER answers got worse.
     fn judge(&self, triples: &[DegradationTriple]) -> anyhow::Result<DegradationReport>;
 }
 
@@ -69,6 +70,7 @@ pub struct LlmDegradationJudge<T: ChatTransport> {
 }
 
 impl<T: ChatTransport> LlmDegradationJudge<T> {
+    /// Build a judge with the given transport and batch size (clamped to ≥ 1).
     pub fn new(transport: T, batch: usize) -> Self {
         Self {
             transport,

@@ -52,8 +52,8 @@ python -m scrt_evolve_infer \
 Or via the Rust CLI shim (reads model_path from evolve.toml):
 
 ```
-scrt-evolve infer --prompt "What is scrt?" --ab
-scrt-evolve infer --prompt "What is scrt?" --adapter ./my-adapter --ab --temperature 0.7
+evolve model infer --prompt "What is scrt?" --ab
+evolve model infer --prompt "What is scrt?" --adapter ./my-adapter --ab --temperature 0.7
 ```
 
 ## Flags

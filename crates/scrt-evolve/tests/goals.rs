@@ -6,7 +6,7 @@
 //! is bounded by goal count, scopes discover by tag, and writes
 //! `work_dir/goals/<name>/{discovered.json,dataset.jsonl}`.
 
-use scrt_evolve::dataset::{Dataset, GenExample};
+use scrt_evolve::dataset::{Dataset, GenExample, Outcome, Tier, Verdict};
 use scrt_evolve::{DiscoveredContext, EvolveConfig};
 
 /// Build a fixture palace with two tagged stashes (security / perf) targeting
@@ -41,6 +41,11 @@ fn fake_generate(_cfg: &EvolveConfig, ctx: &DiscoveredContext) -> anyhow::Result
             completion: p.text.clone(),
             source: Some(p.source.clone()),
             gen: Some("test".to_string()),
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         })
         .collect();
     Ok(Dataset::new(rows))

@@ -60,7 +60,7 @@ pub fn run_eval(cfg: &EvolveConfig, python: Option<&str>) -> anyhow::Result<Scor
     if !ppath.exists() {
         eprintln!(
             "eval: no probe set at {} — returning an uncovered report (run \
-             `scrt-evolve probe build` first to gate rounds)",
+             `evolve train probe build` first to gate rounds)",
             ppath.display()
         );
         return Ok(ScoreReport::uncovered("probe-none", &ecfg.scorer_backend));

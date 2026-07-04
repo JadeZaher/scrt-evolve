@@ -44,3 +44,7 @@ bench/traces/
 
 # Bench: run logs are one-off validation scratch — never commit them.
 bench/**/*.log
+
+# Demo: scratch output dir written by demo/evolve.toml's work_dir (datasets,
+# discovered.json, plan.json, .bak) — regenerated on each run, never commit.
+demo/work/

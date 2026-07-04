@@ -2,7 +2,7 @@
 type: plan
 track: 37
 title: Training-signal hardening — implementation plan
-status: planned
+status: completed
 created: 2026-07-02
 depends_on: [35, 32, 31, 29, 26, 15, 9]
 ---

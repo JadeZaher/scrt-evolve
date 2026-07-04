@@ -32,7 +32,7 @@ GGUF-package it, register it, and route requests to it locally.
   via `transformers`.
 - **The candle `train` / `local` backends are FIXTURES.** The in-tree candle
   path is a tiny hand-built arch for mechanical validation. It **cannot load
-  real pretrained checkpoints.** `scrt-evolve train` defaults to `candle`, so for
+  real pretrained checkpoints.** `evolve train fit` defaults to `candle`, so for
   a real model you **must** pass `--backend transformers`.
 - **GPU training + llama.cpp (export/serve) run in WSL2 + CUDA** on the dev box;
   the LM Studio teacher endpoint is reachable from native Windows. A hybrid-SSM
@@ -50,7 +50,7 @@ GGUF-package it, register it, and route requests to it locally.
 ```bash
 # Rust CLI (ML-free by default — no torch/candle needed to build):
 cargo build --release -p scrt-evolve-cli
-# binary → target/release/scrt-evolve (.exe on Windows)
+# binary → target/release/evolve (.exe on Windows)
 
 # Optional features (off by default):
 #   train  → the in-tree candle FIXTURE backend (mechanical only)
@@ -64,6 +64,14 @@ export, `sentencepiece`/`bitsandbytes` as needed). The CLI auto-locates the
 `python/` package dir and puts it on `PYTHONPATH`; pass your interpreter with
 `--python /path/to/venv/python`. For GPU/Mamba/llama.cpp specifics, follow
 [`bench/RUNBOOK.md`](bench/RUNBOOK.md).
+
+### Feature flags
+
+| Feature | Default? | Enables | Build command | Extra deps |
+| :-- | :-- | :-- | :-- | :-- |
+| `default` | Yes | ML-free CLI + SDK — no torch, no candle, no Python headers required | `cargo build --release -p scrt-evolve-cli` | — |
+| `train` | No | In-tree candle **fixture** backend (LoRA training loop, local generation). Mechanical validation only — cannot load real pretrained models. | `cargo build --release -p scrt-evolve --features train` | candle-core, candle-nn, safetensors, tokenizers |
+| `pyo3` | No | Python dataset/training-step bridge (`bridge.rs`). Builds a native extension module — needs Python dev headers. | `cargo build --release -p scrt-evolve --features pyo3` | pyo3 (0.22), Python 3 dev headers |
 
 ---
 
@@ -110,47 +118,47 @@ metrics = ["correctness"]
 Run the stages (each writes an inspectable artifact under `work_dir`):
 
 ```bash
-EVOLVE=target/release/scrt-evolve
+EVOLVE=target/release/evolve
 PY=/path/to/venv/python                            # interpreter for real ML
 
 # 0. Scaffold a commented config (optional)
 $EVOLVE init                                       # → evolve.toml
 
 # 1. Discover context from corpus + palace          → discovered.json
-$EVOLVE discover --config evolve.toml
+$EVOLVE train discover --config evolve.toml
 
 # 2. Generate a dataset via the teacher              → dataset.jsonl
-$EVOLVE generate --config evolve.toml
-#    (1+2 in one shot:  $EVOLVE run --config evolve.toml)
+$EVOLVE train generate --config evolve.toml
+#    (1+2 in one shot:  $EVOLVE train run --config evolve.toml)
 
 # 3. Carve a held-out probe                          → probe.jsonl + dataset.train.jsonl
-$EVOLVE probe build --config evolve.toml
+$EVOLVE train probe build --config evolve.toml
 
 # 4. Train a REAL model (LoRA via transformers)      → work_dir/adapter/
-$EVOLVE train --config evolve.toml --backend transformers \
+$EVOLVE train fit --config evolve.toml --backend transformers \
   --data .scrt-evolve/dataset.train.jsonl --python $PY
 #    NOTE: omitting --backend gives the candle FIXTURE — not your model.
 
 # 5. Score against the probe                          → score.json
-$EVOLVE eval --config evolve.toml --python $PY
+$EVOLVE train eval --config evolve.toml --python $PY
 
 # 6. A/B the adapter vs base on a prompt (HF, via Python)
-$EVOLVE infer --config evolve.toml \
+$EVOLVE model infer --config evolve.toml \
   --prompt "What does scrt --mp-stash do?" --ab --python $PY
 
 # 7. Merge + export a quantized GGUF for LM Studio   → work_dir/<model>-Q4_K_M.gguf
-$EVOLVE export-gguf --config evolve.toml --quant Q4_K_M --python $PY
+$EVOLVE train export-gguf --config evolve.toml --quant Q4_K_M --python $PY
 ```
 
 ### Eval-gated multi-goal schedule
 
-For unattended evolution across several `[[goals]]`, the `evolve --schedule`
+For unattended evolution across several `[[goals]]`, the `train auto --schedule`
 umbrella runs bounded rounds of `discover → generate → train → eval →
 keep|rollback` through the transactional regulator (halts on catastrophe,
 resumable across runs):
 
 ```bash
-$EVOLVE evolve --schedule --config evolve.toml \
+$EVOLVE train auto --schedule --config evolve.toml \
   --max-rounds 4 --policy weighted --python $PY
 
 $EVOLVE checkpoints list --config evolve.toml     # inspect kept/rolled-back rounds
@@ -233,14 +241,14 @@ CLI surface, and the dataset / manifest / registry contracts).
 - [`conductor/UX-REVIEW.md`](conductor/UX-REVIEW.md) — known DevUX/AIUX rough edges.
 - [`bench/RUNBOOK.md`](bench/RUNBOOK.md) — the verified WSL2/GPU run procedure.
 - [`AGENTS.md`](AGENTS.md) — for an AI agent driving this repo.
-- `scrt-evolve config-reference [--toml]` — the full annotated `evolve.toml`
+- `evolve config reference [--toml]` — the full annotated `evolve.toml`
   schema, queryable from the CLI.
-- `scrt-evolve dataset-reference` — the `dataset.jsonl` row + branch
+- `evolve config dataset` — the `dataset.jsonl` row + branch
   manifest/registry schemas (the cross-language / cross-repo contracts).
-- `scrt-evolve doctor` — preflight your env (Python deps, model path, llama.cpp,
+- `evolve doctor` — preflight your env (Python deps, model path, llama.cpp,
   work_dir) with PASS/FAIL + a fix for each, before a long run.
-- `scrt-evolve config-show` — the fully-resolved config for THIS run (defaults
-  applied); `commands [--json]` — the machine-readable subcommand surface.
+- `evolve config show` — the fully-resolved config for THIS run (defaults
+  applied); `evolve commands [--json]` — the machine-readable subcommand surface.
 - `--json` (global) — a machine-readable summary line on the artifact-producing
   commands, for coding agents driving the CLI.
 - Per-track specs/plans live under `conductor/tracks/<NN>-<name>/`.

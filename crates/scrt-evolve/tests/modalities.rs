@@ -5,7 +5,7 @@
 //! reasoning-edit row renders so the corrected chain precedes the final action
 //! (the property that trains internal reasoning at inference).
 
-use scrt_evolve::dataset::{Dataset, GenExample};
+use scrt_evolve::dataset::{Dataset, GenExample, Outcome, Tier, Verdict};
 use scrt_evolve::generate::{plan_modes, GenMode};
 
 #[test]
@@ -18,6 +18,11 @@ fn skill_and_reasoning_rows_round_trip() {
             expected_outcome: Some("a named stash `auth` exists".to_string()),
             source: Some("AGENTS.md".to_string()),
             gen: Some("trace:scrt-cli".to_string()),
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         },
         GenExample::ReasoningEdit {
             prompt: "find files matching A that also reference B".to_string(),
@@ -33,6 +38,11 @@ fn skill_and_reasoning_rows_round_trip() {
             final_action: "scrt \"X\" --mp-intersect a b".to_string(),
             source: None,
             gen: None,
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         },
     ];
     let ds = Dataset::new(rows.clone());
@@ -77,6 +87,11 @@ fn reasoning_edit_renders_corrected_chain_before_action() {
         final_action: "scrt --mp-intersect a b".to_string(),
         source: None,
         gen: None,
+        outcome: Outcome::Unknown,
+        judge_score: None,
+        judge_verdict: Verdict::Unjudged,
+        tier: Tier::Private,
+        chosen_over: None,
     }]);
 
     let dir = {

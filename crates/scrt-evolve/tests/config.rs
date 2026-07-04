@@ -629,3 +629,59 @@ deploy_to = "/lmstudio/x.gguf"
     let minimal = EvolveConfig::from_toml_str("[evolve]\nmodel_path=\"/m\"\n[store]\n").unwrap();
     assert_eq!(minimal.store.unwrap().keep_versions, 2);
 }
+
+// --- track 37: [judge] + [domain] + [ingest].tier ---
+
+#[test]
+fn judge_config_defaults_and_validation() {
+    // Bare [judge] ⇒ documented defaults.
+    let cfg = EvolveConfig::from_toml_str("[evolve]\nmodel_path=\"/m\"\n[judge]\n").unwrap();
+    let j = cfg.judge.clone().expect("[judge] parses");
+    assert_eq!(j.min_score, 0.5);
+    assert_eq!(j.on_error, "keep");
+    assert_eq!(j.batch, 15);
+    assert_eq!(j.sample_k, 4);
+
+    // Out-of-range min_score rejected.
+    let bad = EvolveConfig::from_toml_str("[evolve]\nmodel_path=\"/m\"\n[judge]\nmin_score=1.5\n");
+    assert!(matches!(bad, Err(ConfigError::OutOfRange { field, .. }) if field == "judge.min_score"));
+
+    // Bad on_error rejected.
+    let bad2 =
+        EvolveConfig::from_toml_str("[evolve]\nmodel_path=\"/m\"\n[judge]\non_error=\"maybe\"\n");
+    assert!(matches!(bad2, Err(ConfigError::OutOfRange { field, .. }) if field == "judge.on_error"));
+}
+
+#[test]
+fn domain_absent_equals_scrt_defaults() {
+    use scrt_evolve::config::DomainConfig;
+    // Absent [domain] ⇒ code resolves to the scrt defaults (back-compat).
+    let cfg = EvolveConfig::from_toml_str("[evolve]\nmodel_path=\"/m\"\n").unwrap();
+    assert!(cfg.domain.is_none());
+    let resolved = cfg.domain.clone().unwrap_or_default();
+    assert_eq!(resolved, DomainConfig::default());
+    assert_eq!(resolved.name, "scrt");
+    assert_eq!(resolved.command_prefixes, vec!["scrt".to_string()]);
+    assert_eq!(resolved.flag_patterns, vec!["--mp-".to_string()]);
+    assert_eq!(resolved.tools.len(), 6);
+
+    // A custom [domain] parses its own values.
+    let custom = EvolveConfig::from_toml_str(
+        "[evolve]\nmodel_path=\"/m\"\n[domain]\nname=\"kubectl\"\ncommand_prefixes=[\"kubectl\",\"helm\"]\n",
+    )
+    .unwrap();
+    let d = custom.domain.unwrap();
+    assert_eq!(d.name, "kubectl");
+    assert_eq!(d.command_prefixes, vec!["kubectl".to_string(), "helm".to_string()]);
+    // Unset fields still fall back to scrt defaults.
+    assert_eq!(d.flag_patterns, vec!["--mp-".to_string()]);
+}
+
+#[test]
+fn ingest_tier_parses() {
+    let cfg = EvolveConfig::from_toml_str(
+        "[evolve]\nmodel_path=\"/m\"\n[ingest]\ntier=\"shared\"\n",
+    )
+    .unwrap();
+    assert_eq!(cfg.ingest.unwrap().tier.as_deref(), Some("shared"));
+}

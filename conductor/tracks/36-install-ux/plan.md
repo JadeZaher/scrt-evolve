@@ -65,13 +65,13 @@ or after). Phase 4 is last (references the real URLs from Phase 1).
 ---
 
 ## Phase 2 — Install scripts
+## Phase 2 — Install scripts
 
-**Goal:** One shell command bootstraps the full install (binary + Python
-backend) on Linux and Windows.
+**Goal:** One shell command bootstraps the full install (binary + Python backend) on Linux and Windows.
 
 ### Tasks
 
-- [ ] **Task:** Write `scripts/install.sh`.
+- [x] **Task:** Write `scripts/install.sh`.
   Logic:
   1. Detect OS/arch (error-out if not x86_64 Linux).
   2. Fetch latest release tag from GitHub API (`curl …/releases/latest`).
@@ -87,7 +87,7 @@ backend) on Linux and Windows.
   smoke test (replace the download step with a local copy) runs end-to-end
   without error.
 
-- [ ] **Task:** Write `scripts/install.ps1`.
+- [x] **Task:** Write `scripts/install.ps1`.
   Logic mirrors install.sh but PowerShell idioms:
   1. Detect arch (error if not AMD64).
   2. Fetch latest release tag via `Invoke-RestMethod`.

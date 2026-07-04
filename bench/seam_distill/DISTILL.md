@@ -87,7 +87,7 @@ calib_batches = 8
 
 ```bash
 # CLI flags override config; the weight-touching span runs inside the track-15 txn.
-scrt-evolve branch create --name scrt-distill \
+evolve branch create --name scrt-distill \
   --base /models/TinyLlama-1.1B --teacher /models/Wizard-Vicuna-7B \
   --distill --steps 300 --python ~/scrt-gpu-venv/bin/python
 ```
@@ -180,7 +180,7 @@ The daemon probes `nvidia-smi` each step: GPU free → train on GPU; another pro
 on the GPU (a game) → fall back to a CPU block or pause; VRAM starved → wait. Every
 step still runs through the track-15 transaction (eval-gate → keep|rollback), so
 ambient training can never silently degrade the model. **Recipe:** run the teacher
-capture once when idle (or overnight), then `daemon start` trains from the cache
+capture once when idle (or overnight), then `ambient start` trains from the cache
 forever, politely.
 
 ## Honest status

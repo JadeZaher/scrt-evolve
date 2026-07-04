@@ -1,0 +1,8 @@
+{
+  "id": "40-delegation-contract",
+  "type": "feature",
+  "status": "planned",
+  "description": "Cross-repo delegation contract (evolve <-> lexame): the capability card (manifest competence_profile: per-domain measured confidence backed by probe-evidence hashes, non-gameable-by-construction) and daisy-chain semantics. Canonical DELEGATION-CONTRACT.md mirrored in both repos' .omc. Evolve owns card schema/emission + shard packaging + conformance fixtures; lexame owns transport, hop budget/loop prevention, provenance, trust, confidence composition (product, never forwarded raw). Outbound scalar semantics contract-reserved but deferred (no implementation in this track).",
+  "created_at": "2026-07-03T00:00:00Z",
+  "updated_at": "2026-07-03T00:00:00Z"
+}

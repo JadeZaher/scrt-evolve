@@ -23,7 +23,7 @@ resource: ./metadata.json
 7. [x] Tiny fixture model for CI (or a gated small-model download). -- evidence: `crates/scrt-evolve/src/model.rs::LoadedModel::random_fixture` (line 450+, deterministic in-memory tiny model from seed, no download required).
 8. [x] Cross-backend interchangeability: a `LocalCandle` row and an
    `ApiEndpoint` row both validate against `Dataset` schema. -- evidence: `crates/scrt-evolve/tests/generate_local.rs::local_and_api_rows_are_schema_interchangeable` (line 101, round-trip JSONL identical).
-9. [x] `scrt-evolve generate --backend local` end-to-end on fixture. -- evidence: `crates/scrt-evolve/tests/generate_local.rs::local_backend_produces_valid_rows_on_fixture` (line 30, runs offline, stamps gen=local).
+9. [x] `evolve train generate --backend local` end-to-end on fixture. -- evidence: `crates/scrt-evolve/tests/generate_local.rs::local_backend_produces_valid_rows_on_fixture` (line 30, runs offline, stamps gen=local).
 10. [x] Final sweep: `cargo test --features train`, `cargo clippy
     --features train`. -- evidence: all tests pass (4 generate_local + 6 model tests green); clippy clean; default build ML-free.
 

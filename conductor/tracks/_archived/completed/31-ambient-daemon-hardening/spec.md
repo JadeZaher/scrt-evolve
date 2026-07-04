@@ -67,7 +67,7 @@ decision function (clock injected) like `decide_step`.
 correctness (already stored per checkpoint, currently low/noisy). It is not
 surfaced as a trend.
 **Fix.** Track the **probe-correctness trend** across committed checkpoints (read
-the evolution log / checkpoint manifests) and expose it (`daemon status` /
+the evolution log / checkpoint manifests) and expose it (`watch status` /
 `health` and/or a small `trend` view). Optionally an A/B infer on held-out
 prompts. Expect overfitting before broad change given the small pool — ties to Q5.
 
@@ -94,7 +94,7 @@ scope for this track).
 - A transient train/score error retries with backoff and the loop survives; a
   catastrophe still halts (track-15 semantics preserved). Both covered by daemon
   loop tests with injected failing hooks.
-- `daemon health` reports run-state, last step, last error, consecutive failures.
+- `watch health` reports run-state, last step, last error, consecutive failures.
 - A wall-clock budget pauses training when the period allotment is spent (pure
   decision-function test, clock injected).
 - The dedup ledger prevents re-enqueue of an already-ingested row (ingest test);

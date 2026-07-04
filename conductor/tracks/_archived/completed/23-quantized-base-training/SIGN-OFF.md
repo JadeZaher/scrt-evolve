@@ -2,7 +2,7 @@
 
 Date: 2026-06-20
 
-Lets scrt-evolve train models that exist on disk as quantized GGUFs, and adds
+Lets evolve train fit models that exist on disk as quantized GGUFs, and adds
 quantization-aware training so the LoRA adapter is learned against the
 deployment quant. Built **generic at the architecture level** (no model/brand
 logic), SDK-style, with an internal registry — per the user mandate.
@@ -23,7 +23,7 @@ logic), SDK-style, with an internal registry — per the user mandate.
   `_dequantized_from_gguf` (honest about lossiness). Unknown arch / unmapped
   tensors → clear errors, not silent breakage.
 - **`__main__.py`** — `--gguf/--out/--dtype/--tokenizer/--list-arch`.
-- **`scrt-evolve dequant`** Rust shim — subprocess, auto-detects the vendored
+- **`evolve train dequant`** Rust shim — subprocess, auto-detects the vendored
   `gguf-py` on PYTHONPATH (mirrors export-gguf). No model logic in Rust.
 
 ### QAT — quantization-aware training (`python/scrt_evolve_train/qat.py`)

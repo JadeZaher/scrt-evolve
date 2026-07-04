@@ -9,7 +9,7 @@ authors.workspace = true
 description = "Thin CLI shim over the scrt-evolve SDK: discover | generate | train | run | init."
 
 [[bin]]
-name = "scrt-evolve"
+name = "evolve"
 path = "src/main.rs"
 
 [features]

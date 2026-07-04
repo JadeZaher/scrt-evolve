@@ -58,8 +58,8 @@ consumers can depend on it.
   (api|pyo3|candle), `judge` (api endpoint for constitution scoring),
   `metrics` (which to compute). Absent block → no eval (lane runs unguarded with
   a logged warning).
-- CLI: `scrt-evolve eval --probe probe.jsonl` (score current model → report),
-  `scrt-evolve probe build --from dataset.jsonl --holdout 0.1` (carve a probe set).
+- CLI: `evolve train eval --probe probe.jsonl` (score current model → report),
+  `evolve train probe build --from dataset.jsonl --holdout 0.1` (carve a probe set).
 
 ## Constraints
 - **One harness, three consumers.** 11/12/15 MUST consume this module; they do

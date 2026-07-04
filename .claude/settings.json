@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wsl -e bash -lc 'source ~/.cargo/env && cd /mnt/c/Users/atooz/Programming/ai-utils-memory/scrt-evolve && cargo test 2>&1 | grep -E \"test result:|FAILED|error\\\\[|error:\" | tail -15')",
+      "Bash(sed -n '540,640p' crates/scrt-evolve/src/ingest.rs)",
+      "Bash(sed -n '90,170p' crates/scrt-evolve/src/eval/degrade.rs)"
+    ]
+  }
+}

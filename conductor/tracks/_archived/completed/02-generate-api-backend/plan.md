@@ -25,7 +25,7 @@ resource: ./metadata.json
 6. [x] Multi-turn refine loop when `turns > 1`. -- evidence: test `turns_greater_than_one_issues_refine_turns` (lines 105–117).
 7. [x] `generate::run(&cfg, &ctx) -> Dataset` driver (passage → N examples →
    rows). -- evidence: `src/generate/mod.rs` lines 81–139 (run + run_with_backend); test `mocked_backend_produces_qa_and_instruction_rows`.
-8. [x] `scrt-evolve generate [--in discovered.json] [--backend api]` →
+8. [x] `evolve train generate [--in discovered.json] [--backend api]` →
    `dataset.jsonl`; runs standalone from disk. -- evidence: CLI `crates/scrt-evolve-cli/src/main.rs` lines 228–238 (cmd_generate).
 9. [ ] PyO3 bridge: `read_dataset(path)` (+ iterator) under `--features pyo3`. -- (carry-forward: deferred; `bridge.rs` stubs only `version()` function; real read_dataset body is pending).
 10. [ ] Cross-language schema-parity test: Rust writes `dataset.jsonl`, Python

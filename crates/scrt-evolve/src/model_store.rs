@@ -187,12 +187,15 @@ impl ModelStore {
         )
     }
 
+    /// Returns the filesystem path of this store's root directory.
     pub fn dir(&self) -> &Path {
         &self.dir
     }
+    /// Returns the in-memory store manifest (metadata for all versions).
     pub fn manifest(&self) -> &StoreManifest {
         &self.manifest
     }
+    /// Returns all model versions tracked in this store.
     pub fn versions(&self) -> &[ModelVersion] {
         &self.manifest.versions
     }

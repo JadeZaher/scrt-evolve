@@ -32,9 +32,9 @@ bounded by VRAM; data is updated dynamically by user activity."
      usage) as the user works; gated by constitution/taste filters before
      becoming training examples.
    - `priority` lane: filled by EXPLICIT captures (`scrt stash …`, an
-     `scrt-evolve teach …` call); skips the filter, weighted higher.
+     `evolve ambient teach …` call); skips the filter, weighted higher.
    Both streams feed the daemon; priority drains first.
-2. **VRAM-bounded daemon, EXPLICIT start/stop** — `scrt-evolve daemon start`
+2. **VRAM-bounded daemon, EXPLICIT start/stop** — `evolve ambient start`
    runs until stopped (NOT idle-triggered, NOT always-auto). Per step: check free
    VRAM (`[hardware]` + `--max-vram`); if a microshard fits, pop the next
    training example(s), run ONE microshard step (track-25 `granularity=module`),
@@ -57,7 +57,7 @@ bounded by VRAM; data is updated dynamically by user activity."
 - Constitution/taste wiring into the generate prompt for queued synthesis.
 
 ## Acceptance (when built)
-- `scrt-evolve daemon start` runs bounded by `--max-vram`, consumes queued
+- `evolve ambient start` runs bounded by `--max-vram`, consumes queued
   activity microshard-by-microshard, and every committed step passes the eval
   gate (or rolls back) — verified on Granite with a live tail of real activity.
 - Stopping/restarting the daemon resumes from the queue (no lost/dup work).

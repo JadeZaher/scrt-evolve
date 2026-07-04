@@ -138,7 +138,86 @@ sweep at the end. This keeps signal high and noise (and cold-start cost) low.
   "Final sweep: `cargo build` / `cargo test` / `cargo clippy`" task) — that IS
   the end-of-cycle gate; per-change re-runs are not expected in the plan.
 
-## 5. How these are enforced
+## 5. Design & algorithmic quality — elegance in service of correctness
+
+**[REVIEW]** These are the "how to shape the code" rules. They are not taste for
+its own sake: the right abstraction makes the durability rules (§2) *cheaper to
+keep correct*. Prefer the design that makes a whole class of bug **impossible to
+express**, over one that merely avoids it this time. When two designs are equally
+correct, pick the one a reader understands faster.
+
+### 5.1 Composition over inheritance
+- **[REVIEW]** Model behavior with **small traits + concrete structs that hold
+  their collaborators**, not deep type hierarchies. Rust has no inheritance —
+  don't simulate it with enum-of-everything god-types or trait-object towers.
+  The shipped pattern is the standard: `LlmPairJudge<T: ChatTransport>` /
+  `LlmRelevanceJudge<T>` / `LlmDegradationJudge<T>` each **compose an injected
+  transport** behind one narrow trait (`ChatTransport`). New judges/backends
+  compose the same seam — they don't subclass a base judge.
+- **[REVIEW]** **Inject dependencies, don't reach for them.** Effects (clock,
+  RNG, LLM endpoint, "should I stop") enter through a struct field or a closure
+  param (the `DaemonHooks` pattern), so production and tests share one code path
+  and §2.1 (no ambient state) holds by construction. A function that reads a
+  global or a wall-clock is a defect (§2.1/§2.2), not a shortcut.
+- **[REVIEW]** **Prefer a struct that copies the fields it needs over a long-lived
+  closure that captures its whole environment** (echoes §Efficiency): the struct
+  documents its real dependencies and can't accidentally pin a large scope alive.
+
+### 5.2 Functional / data-oriented patterns where they pay
+- **[REVIEW]** **Prefer expression-style, pure transformations** — iterator
+  chains (`filter`/`map`/`filter_map`/`fold`), `match` that returns a value,
+  `Option`/`Result` combinators — over imperative accumulation with mutable flags.
+  A pure `fn(input) -> output` is testable, parallel-safe (§2.2), and cache-keyable
+  (§2.1) *for free*. Reserve `mut` + loops for where they're genuinely clearer
+  (e.g. index-walking a slice with look-ahead, like `filter_outcomes`' retry scan).
+- **[REVIEW]** **Make illegal states unrepresentable.** Encode invariants in the
+  type: a `Tier`/`Outcome`/`Verdict` enum instead of a stringly-typed field; a
+  method on the enum (`Tier::most_restrictive`, `GenExample::payload_len`) instead
+  of a free `fn` with a lossy `_ => 0`/`_ => default` catch-all. A catch-all arm
+  over an owned enum is a smell: it silently absorbs new variants — prefer an
+  **exhaustive match** so adding a variant is a *compile break*, not a silent bug.
+- **[REVIEW]** **Total functions over partial ones.** Return `Option`/`Result` at
+  the boundary; never `unwrap`/`panic` on SDK-reachable input (§1). Push
+  fallibility to one edge and keep the core total.
+- **[REVIEW]** **Immutability by default.** Bind with `let` (not `let mut`) unless
+  mutation is the point; take `&self` unless you mutate. Order-independent
+  merges/reductions (§2.2) fall out of writing them as `fold`s, not loops.
+
+### 5.3 Algorithmic excellence
+- **[REVIEW]** **Right complexity for the expected size.** Name the input scale in
+  a doc-comment when it's not obvious, and don't hide an O(n²) in an inner
+  `.contains`/re-scan on a hot path (the daemon step loop, ingest over a large
+  transcript). When a linear pass with a `HashMap`/`HashSet` index replaces a
+  quadratic scan, take it — but don't pre-optimize a bounded-tiny loop into
+  unreadability.
+- **[REVIEW]** **Recursion when it mirrors the data, iteration when it mirrors a
+  process.** Use recursion for genuinely recursive structure (trees, nested DAG
+  nodes, divide-and-conquer) where it's the clearest expression. On an unbounded
+  or deep-linear input, prefer iteration or explicit-stack traversal — Rust has no
+  guaranteed tail-call elimination, so deep recursion risks a stack overflow. Any
+  recursion (like any self-loop, §2.5) carries an explicit **depth bound /
+  base case that provably terminates**.
+- **[REVIEW]** **Don't recompute what you can carry.** Recall over re-derive
+  (§3's 3× rule applies to code too): compute a value once and thread it, rather
+  than re-deriving it per iteration. But don't cache what's cheap — a `HashMap`
+  guarding a two-field comparison is net-negative.
+
+### 5.4 Elegance guardrails (so "clever" stays correct)
+- **[REVIEW]** Elegance **never** overrides §2 (durability) or §1 (`unwrap`/panic,
+  feature-gating, additive config). A recursion, iterator fusion, or trait-object
+  indirection that obscures the atomic-write / transaction / provenance boundary
+  is wrong even if shorter.
+- **[REVIEW]** **DRY with judgment.** Extract a shared helper when logic is
+  *genuinely the same thing* (the repeated `parse_*_indices` JSON-array scan; the
+  duplicated `content_key`) — but don't hoist two things that merely *look* alike
+  today into a premature abstraction that couples them tomorrow. One clone-mutate-
+  writeback beats three (the `apply_nudge` `[generate]` merge); a macro to dodge an
+  8-arm match is only worth it if the arms are truly identical.
+- **[REVIEW]** **A new special-case layered on shared infra is a depth smell**
+  (echoes §4's altitude): generalize the mechanism (a method on the enum, a param
+  on the driver) instead of bolting a branch onto the call site.
+
+## 6. How these are enforced
 
 - **[MECH]** rules → CI: `cargo fmt --check`, `cargo clippy -D warnings`, the
   default-build no-ML/no-Python check, and the `Args: Serialize` / serializable-
@@ -148,4 +227,5 @@ sweep at the end. This keeps signal high and noise (and cold-start cost) low.
   exec via track 15", "rows stamp `gen` provenance"). A track is not signed off
   until its durability rules are demonstrated by a test or explicit evidence.
 - **[REVIEW]** §4 governs the *build process* of every track: scaffold →
-  minimal local checks → ONE end sweep → review+fix pass.
+  minimal local checks → ONE end sweep → review+fix pass. §5 governs the *shape*
+  of the code produced, checked in the review+fix pass.

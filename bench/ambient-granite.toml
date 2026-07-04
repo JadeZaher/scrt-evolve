@@ -1,0 +1,153 @@
+# Ambient continuous-evolution daemon — GRANITE student (track 26 + track 24 fusion).
+#
+# Same living-queue loop as ambient.toml, but the student is IBM
+# Granite-4.0-h-tiny (6.9B hybrid Mamba-2 + 64-expert MoE) instead of TinyLlama,
+# trained FRACTIONALLY (one contiguous layer-block per step, block-local
+# distillation) so peak VRAM ≈ one block (~3.1–3.4 GB) and fits the RTX 4060 8GB.
+#
+# RUN ENVIRONMENT: this config is consumed by the scrt-evolve binary running
+# UNDER WSL2 (Linux), NOT the Windows .exe. Granite's Mamba backward SEGFAULTS on
+# CPU-only torch and the native Windows venv has no mamba-ssm kernels; the WSL2
+# venv (~/scrt-gpu-venv: torch 2.5.1+cu121 + mamba-ssm + causal-conv1d) is the
+# ONLY path that trains Granite on this box. Therefore ALL PATHS HERE ARE LINUX
+# PATHS (/mnt/c/... or ~/...), and [hardware].python points at the WSL venv.
+#
+#   Feed:  evolve ambient ingest --config bench/ambient-granite.toml --docs conductor
+#   Run (from WSL):
+#     source ~/scrt-gpu-venv/bin/activate
+#     ./target/release/evolve ambient start --config bench/ambient-granite.toml
+#   Stop:  evolve ambient stop   --config bench/ambient-granite.toml
+#   Watch: evolve watch status   --config bench/ambient-granite.toml   (RAM/VRAM/liveness)
+
+[evolve]
+# Cached full-precision HF Granite snapshot. The FULL 3-shard f16 weights (~13GB)
+# live ONLY in the WINDOWS-side HF cache (/mnt/c/...); the WSL-side ~/.cache copy
+# has config+tokenizer but NO weight .safetensors (they were never pulled there /
+# got pruned when disk was freed). Point at the Windows cache via /mnt/c — reads
+# over 9p are fine (the RUNBOOK's /mnt/c warning is about large WRITES, not reads).
+model_path = "/mnt/c/Users/atooz/.cache/huggingface/hub/models--ibm-granite--granite-4.0-h-tiny/snapshots/791e0d3d28c86e106c9b6e0b4cecdee0375b6124"
+# Fresh work dir — do NOT reuse work/ambient (that's the TinyLlama state, with a
+# half-broken adapter). Granite starts clean and trains its own adapter.
+work_dir   = "/mnt/c/Users/atooz/Programming/ai-utils-memory/scrt-evolve/bench/work/ambient-granite"
+
+[train]
+preset = "lora"
+  [train.lora]
+  rank = 16
+  alpha = 32
+  # AUTO target detection — granitemoehybrid has no plain q_proj/v_proj coverage;
+  # the trainer enumerates real nn.Linear leaves when target_modules = ["auto"].
+  target_modules = ["auto"]
+  lr = 2e-4
+  epochs = 1
+  # NO init_adapter: there is no pre-built Granite scrt-cli adapter (the branch v1
+  # adapter is TinyLlama-shaped and would not load). The first daemon step trains
+  # FRESH into work_dir/adapter; every later step resumes work_dir/adapter (the
+  # daemon manages this). Seeding a TinyLlama adapter here would crash the load.
+
+  # Quantization-aware training toward the deployment quant (Q4_K_M GGUF) so the
+  # eventual export degrades less. Forwarded as --qat to the trainer.
+  [train.qat]
+  enabled = true
+  quant = "Q4_K_M"
+  group_size = 32
+  calibrate_batches = 8
+
+  # FRACTIONAL / sharded layer-block training — the VRAM-bounding mode. The
+  # daemon (see [daemon].rotation_blocks) overrides shard_index per step so each
+  # microshard step trains ONE block and rotates through all of them.
+  [train.fractional]
+  enabled = true
+  block_size = 8        # 40 Granite layers → 5 shards; the hard VRAM knob
+  calib_batches = 8     # token batches each block is distilled over
+  granularity = "block" # "module" = sub-layer floor (~0.9GB) if 8GB ever too tight
+
+[eval]
+# The probe is model-agnostic scrt-cli QA (instruction/input/output rows); the
+# transformers scorer runs it as a FORWARD pass through Granite, so it's reusable
+# as-is. Forward-only ⇒ no mamba backward ⇒ no segfault risk on eval.
+scorer_backend = "transformers"
+probe_path     = "/mnt/c/Users/atooz/Programming/ai-utils-memory/scrt-evolve/bench/work/scrt-cli-branch/branches/scrt-cli/probe.jsonl"
+stable_probe   = true
+metrics        = ["correctness"]
+
+# Only used by `daemon ingest --relevance` (the LLM relevance judge). The daemon's
+# own eval uses transformers above and needs no teacher. If LM Studio is down, the
+# judge degrades to keep-all; `--match` still bounds the candidate set.
+[generate]
+backend = "api"
+  [generate.api]
+  base_url = "http://localhost:1234/v1"
+  model    = "ibm/granite-4-h-tiny"
+  turns    = 1
+
+[regulate]
+# Every step is guarded: checkpoint → eval → keep | rollback. A tiny score on a
+# hard probe is legitimate; catastrophe_floor=0 means only NaN halts. Low/
+# regressing scores roll back, not halt, so the ambient loop keeps going.
+catastrophe_floor = 0.0
+accept_tolerance  = 0.05
+keep_checkpoints  = 2     # bound disk: current + one rollback target
+# --- track 32: the JUDGE gate (opt-in) ---
+# A weak student on tiny per-step QA counts rarely moves absolute correctness;
+# flip gate="judge" to accept a step UNLESS an LLM judge sees DEGRADATION (this
+# is what lets Granite make progress on small batches). Left off for the first
+# verification run so the math is transparent; turn on once the loop is proven.
+# gate = "judge"
+
+[hardware]
+device = "cuda"
+# The WSL2 GPU venv — torch 2.5.1+cu121 + mamba-ssm + causal-conv1d (Granite GPU
+# backward VERIFIED). This is the interpreter the daemon spawns for `-m
+# scrt_evolve_train`; since the daemon ITSELF runs under WSL, this is a plain
+# Linux path called directly (no wsl.exe shim, no path translation).
+python = "/home/atooz/scrt-gpu-venv/bin/python3"
+vram_gb = 8.0
+ram_gb  = 26.0
+kernels = ["mamba-ssm", "causal-conv1d"]   # gates can_train_state_space() preflight
+
+[daemon]
+max_vram_gb          = 3.5    # one Granite block ≈ 3.1–3.4GB; train only when this is FREE
+min_free_ram_gb      = 16.0   # SYSTEM-FREEZE GUARD: loading the 13GB f16 Granite for a
+                              # step (and the A/B eval loads it TWICE) spikes host RAM;
+                              # on the 30GB-capped WSL that starved Windows to ~1GB free
+                              # and froze the machine. Wait until ≥16GB host RAM is free
+                              # before starting a step. Low RAM ⇒ WAIT (never CPU).
+batch                = 8      # queued items folded into one microshard step
+poll_interval_secs   = 20     # wait this long when throttled / queue idle
+pause_on_gpu_process = true   # yield the GPU the moment another process computes
+cpu_fallback         = false  # NEVER fall back to CPU for Granite — Mamba backward
+                              # segfaults on CPU. Wait for the GPU instead.
+rotation_blocks      = 5      # 40 layers / block_size 8 = 5 blocks; train one per
+                              # step, cycling (step%5) → bounds VRAM to one block
+granularity          = "block" # IMPORTANT: the daemon DEFAULTS this to "module"
+                              # (sub-layer floor, ~0.9GB but much slower/step). The
+                              # daemon's apply_plan overrides [train.fractional]
+                              # granularity with THIS field, so set it explicitly.
+                              # "block" ≈ 3.3GB/step on the 4060 — fits max_vram_gb.
+cooldown_secs        = 15     # idle gap after each step so foreground apps breathe
+# --- self-feed: refills the queue from live activity when it runs low ---
+auto_ingest  = true
+refill_below = 8              # refill when < one batch remains
+# --- track 32: min-QA-pairs floor — don't train on < N pending rows ---
+min_train_pairs = 4
+# --- track 33 (serve-while-you-train, disabled by default) ---
+# serve_reservation_gb = 3.5  # VRAM carved out for a co-resident live server;
+#                             # trainer waits until (free − reservation) ≥ block_need.
+# NO seed_adapter: see [train.lora] note — Granite trains its own fresh adapter.
+
+# --- track 33: live serve-while-you-train (disabled by default) ---
+# Uncomment to run a long-lived inference server that hot-swaps the adapter at
+# each keep-commit, VRAM-arbitrated against the trainer via [daemon].serve_reservation_gb.
+# [serve]
+# live                  = true   # start the long-lived server (false = today's one-shot run-model)
+# swap_debounce_commits = 0      # swap every keep (N = coalesce N commits into one swap)
+# mode                  = "auto" # "auto" = doctor measures + picks B/A; "b" force co-resident; "a" force alternate
+
+# What the self-feed mines (LLM-judged). One command, no flags:
+#   scrt-evolve --ambient --dir bench   (if this file is the dir's ambient config)
+[ingest]
+docs      = ["/mnt/c/Users/atooz/Programming/ai-utils-memory/scrt-evolve/conductor"]
+match     = ["--mp-", "--effort", "scrt_search", "scrt_stash", "scrt_similar", "--in ."]
+relevance = "Keep only interactions that actually invoke the scrt CLI or its mind-palace (scrt search with --in/--effort, --mp-stash/compose/intersect/graph/link/similar/prune, or scrt_* tools) as a real, reusable usage example. Drop incidental mentions, failed/garbled commands, and unrelated tooling."
+max       = 600

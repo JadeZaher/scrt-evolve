@@ -1,6 +1,6 @@
 //! llama.cpp export tests.
 
-use scrt_evolve::dataset::{Dataset, GenExample};
+use scrt_evolve::dataset::{Dataset, GenExample, Outcome, Tier, Verdict};
 
 fn temp_dir(suffix: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
@@ -21,6 +21,11 @@ fn export_writes_gemma_chat_corpus_and_jsonl() {
             completion: "Use scrt --mp-stash NAME.".into(),
             source: Some("README.md".into()),
             gen: Some("api".into()),
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         },
         GenExample::Instruction {
             instruction: "Compose two stashes".into(),
@@ -28,6 +33,11 @@ fn export_writes_gemma_chat_corpus_and_jsonl() {
             output: "scrt PATTERN --mp-compose stash-a stash-b".into(),
             source: None,
             gen: None,
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         },
         // Non-instruction rows are skipped by the export.
         GenExample::Contrastive {
@@ -35,6 +45,11 @@ fn export_writes_gemma_chat_corpus_and_jsonl() {
             positive: "y".into(),
             negatives: vec![],
             stash: None,
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         },
     ]);
 
@@ -73,6 +88,11 @@ fn tool_call_rows_render_in_gemma_tool_code_format() {
         arguments: serde_json::json!({"name": "auth", "note": "Auth findings"}),
         source: Some("README.md".into()),
         gen: Some("api".into()),
+        outcome: Outcome::Unknown,
+        judge_score: None,
+        judge_verdict: Verdict::Unjudged,
+        tier: Tier::Private,
+        chosen_over: None,
     }]);
 
     let model = std::path::Path::new("/models/gemma.gguf");
@@ -106,6 +126,11 @@ fn stubbed_tool_formats_drop_tool_call_rows() {
             completion: "a".into(),
             source: None,
             gen: None,
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         },
         GenExample::ToolCall {
             prompt: "p".into(),
@@ -113,6 +138,11 @@ fn stubbed_tool_formats_drop_tool_call_rows() {
             arguments: serde_json::json!({"name": "x", "note": "y"}),
             source: None,
             gen: None,
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         },
     ]);
     let model = std::path::Path::new("/m.gguf");

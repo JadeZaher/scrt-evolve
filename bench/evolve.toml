@@ -32,7 +32,7 @@
 [evolve]
 # Cached full-precision HF Granite snapshot (granitemoehybrid: Mamba-2 + 64-expert MoE).
 model_path  = "C:/Users/atooz/.cache/huggingface/hub/models--ibm-granite--granite-4.0-h-tiny/snapshots/791e0d3d28c86e106c9b6e0b4cecdee0375b6124"
-# Corpus = the adapted Claude Code transcripts (produced by harvest_claude_projects.py).
+# Corpus = the adapted Claude Code transcripts (produced by `evolve ingest`).
 # The transcript harvester (track 20 slice 4) distills these into trace:<goal> rows.
 corpus_dir  = "C:/Users/atooz/Programming/ai-utils-memory/scrt-evolve/bench/corpus"
 # A mind-palace for goal-tagged stashes (curated, high-signal). Optional —
@@ -148,6 +148,18 @@ n_threads = 8
   temperature = 0.0
   top_p = 1.0
   max_tokens = 256
+
+# --- track 33: live serve-while-you-train (disabled by default) ---
+# A long-lived inference server that hot-swaps the adapter at each keep-commit,
+# VRAM-arbitrated against the fractional trainer. The trainer's carve-out lives
+# under [daemon] (this config has no [daemon] block — add one to use it):
+#   [daemon]
+#   serve_reservation_gb = 3.5  # VRAM reserved for the co-resident server; trainer
+#                               # waits until (free − reservation) ≥ block_need.
+# [serve]
+# live                  = true   # start the long-lived server (false = one-shot run-model)
+# swap_debounce_commits = 0      # swap every keep (N = coalesce N commits into one swap)
+# mode                  = "auto" # "auto" = doctor measures + picks B/A; "b" co-resident; "a" alternate
 
 [eval]
 # Held-out probe carved from each round's dataset; gates keep|rollback.

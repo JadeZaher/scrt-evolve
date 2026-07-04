@@ -61,8 +61,8 @@ decision tracks 11/15 both call. Tests: `verdict_classifies_three_outcomes`,
 `verdict_refuses_probe_version_mismatch`.
 
 ### CLI ✅
-`scrt-evolve eval [--probe] [--python]` (score → `work_dir/score.json`) and
-`scrt-evolve probe build [--from --holdout --out --remainder]` (carve a probe).
+`evolve train eval [--probe] [--python]` (score → `work_dir/score.json`) and
+`evolve train probe build [--from --holdout --out --remainder]` (carve a probe).
 
 ### Python: `python/scrt_evolve_score/` ✅
 `score.py` (gate mirror kept in sync with `eval/gate.rs`, perplexity, logit-lens

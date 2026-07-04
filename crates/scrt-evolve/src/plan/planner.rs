@@ -17,12 +17,19 @@ use crate::toolspec;
 /// the tool schemas, the human's training directive, and the required output
 /// shape. The directive is the human's stated INTENT and OVERRIDES pure signal
 /// inference where they conflict.
-fn system_prompt(tools_block: &str, directive_block: &str) -> String {
+///
+/// `domain` parameterizes the job description (track 37 Phase C). With
+/// [`DomainConfig::default`] the emitted prompt is BYTE-IDENTICAL to the prior
+/// hardcoded `scrt` wording (asserted by a snapshot test in `tests/plan.rs`).
+fn system_prompt(
+    tools_block: &str,
+    directive_block: &str,
+    domain: &crate::config::DomainConfig,
+) -> String {
+    let domain_desc = &domain.description;
     format!(
         "You are a TRAINING-DATA PLANNER. Your job is to decide what supervised \
-fine-tuning data to generate so a model becomes better at USING the `scrt` \
-tool — both as structured tool calls and as a CLI — plus understanding its \
-concepts.\n\n\
+fine-tuning data to generate so a model becomes better at USING {domain_desc}.\n\n\
 You are given the HUMAN'S TRAINING DIRECTIVE, usage signals (palace structure, \
 tool/flag co-occurrence, corpus shape), and the real tool schemas. The DIRECTIVE \
 is the human's intent and TAKES PRECEDENCE over signal inference when they \
@@ -37,11 +44,15 @@ Available modalities:\n\
 args). Best for high-co-occurrence tool workflows.\n\
 - \"cli\": runnable `scrt …` command lines. Best for CLI-reference content.\n\
 - \"qa\": question/answer prose. Best for conceptual content.\n\
-- \"instruction\": instruction/output prose.\n\n\
+- \"instruction\": instruction/output prose.\n\
+- \"skill\": skill-invocation rows (name a real skill + its invocation). Best \
+for teaching when/how to invoke a named capability.\n\
+- \"reasoning_edit\": reasoning-trace edits (correct/insert/prune/reorder steps \
+toward a final action). Best for teaching self-correction over a chain.\n\n\
 Real tools (ground truth — never invent tools/params):\n{tools_block}\n\
 Output ONLY a JSON object, no prose/markdown, of this exact shape:\n\
 {{\n  \"strategy\": \"<one sentence on your overall plan>\",\n  \"specs\": [\n\
-    {{\n      \"modality\": \"tool_call|cli|qa|instruction\",\n\
+    {{\n      \"modality\": \"tool_call|cli|qa|instruction|skill|reasoning_edit\",\n\
       \"prompt\": \"<CONTENT GUIDANCE for this batch: WHAT topics/tools/scenarios \
 to cover and how to ground them in the passage. Do NOT specify output format — \
 the generator already enforces a strict JSON-array schema. Write guidance, not \
@@ -120,8 +131,16 @@ pub fn parse_plan(raw: &str) -> anyhow::Result<GenPlan> {
     })
 }
 
+/// Modalities the planner is allowed to EMIT. Must stay in sync with
+/// `generate::mode_for_modality` (every accepted string routes to a real
+/// `GenMode`). `completion` is intentionally excluded: doc-ingestion produces
+/// completion rows directly, so the planner should never plan them (planning
+/// one used to silently degrade to Prose). See `src/plan/AGENTS.md` §planner.
 fn is_valid_modality(m: &str) -> bool {
-    matches!(m, "qa" | "instruction" | "tool_call" | "cli" | "completion")
+    matches!(
+        m,
+        "qa" | "instruction" | "tool_call" | "cli" | "skill" | "reasoning_edit"
+    )
 }
 
 fn extract_json_object(raw: &str) -> &str {
@@ -143,11 +162,13 @@ pub fn plan_with_transport<T: ChatTransport>(
     ctx: &DiscoveredContext,
     tools: &[toolspec::ToolSchema],
     directive: &TrainingDirective,
+    domain: &crate::config::DomainConfig,
 ) -> anyhow::Result<GenPlan> {
     let messages = vec![
         ChatMessage::system(system_prompt(
             &toolspec::tools_compact_block(tools),
             &directive.prompt_block(),
+            domain,
         )),
         ChatMessage::user(user_prompt(signals, ctx)),
     ];
@@ -164,8 +185,9 @@ pub fn run(
     let signals = signals::extract(cfg, ctx);
     let tools = toolspec::scrt_tools()?;
     let gcfg = cfg.generate.clone().unwrap_or_default();
+    let domain = cfg.domain.clone().unwrap_or_default();
     let transport = HttpTransport::from_api_config(&gcfg)?;
-    plan_with_transport(&transport, &signals, ctx, &tools, directive)
+    plan_with_transport(&transport, &signals, ctx, &tools, directive, &domain)
 }
 
 // Re-export a small constructor so planner/critic can build an HttpTransport

@@ -1,0 +1,8 @@
+{
+  "id": "35-nudge-live-retuning",
+  "type": "feature",
+  "status": "completed",
+  "description": "Nudge: live-retune a running ambient daemon (goal weights, focus, throttle knobs) via a control-file the loop polls at the step boundary. Safe-live allowlist; restart-required knobs rejected. 'teach' stays the content knob; nudge is the direction knob. DELIVERED by track 37 Phase D — do not build separately.",
+  "created_at": "2026-06-30T00:00:00-06:00",
+  "updated_at": "2026-07-03T00:00:00Z"
+}

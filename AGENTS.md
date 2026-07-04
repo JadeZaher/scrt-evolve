@@ -103,40 +103,40 @@ then a desktop client cannot drive `evolve` in-process — only via the CLI.
 ## CLI surface an agent drives
 
 Config flag defaults to `evolve.toml` everywhere. Binary:
-`target/release/scrt-evolve`.
+`target/release/evolve`.
 
 | Command | Purpose | Key flags |
 |---|---|---|
-| `init` | scaffold a commented `evolve.toml` | `--path` |
-| `config-reference` | print annotated schema (queryable) | `--toml` (copy-pasteable template) |
-| `discover` | corpus+palace → `discovered.json` | `--config` |
-| `interview` | human directive → `directive.json` | `--answer id=value` (repeatable), `--core-only` |
-| `plan` | planner LLM → `plan.json` | `--in` |
-| `generate` | dataset → `dataset.jsonl` | `--backend local\|api`, `--self-route`, `--gap-rounds N` |
-| `run` | discover → generate (→ export) | `--export` |
+| `evolve init` | scaffold a commented `evolve.toml` | `--path` |
+| `evolve config reference` | print annotated schema (queryable) | `--toml` (copy-pasteable template) |
+| `evolve train discover` | corpus+palace → `discovered.json` | `--config` |
+| `evolve train interview` | human directive → `directive.json` | `--answer id=value` (repeatable), `--core-only` |
+| `evolve train plan` | planner LLM → `plan.json` | `--in` |
+| `evolve train generate` | dataset → `dataset.jsonl` | `--backend local\|api`, `--self-route`, `--gap-rounds N` |
+| `evolve train run` | discover → generate (→ export) | `--export` |
 | `probe build` | carve held-out probe | `--from`, `--holdout`, `--out`, `--remainder` |
-| `train` | LoRA adapter → `work_dir/adapter` | `--backend candle\|transformers`, `--python`, `--data`, `--preset`, `--out`, `--steps`, `--max-seq-len` |
-| `eval` | score vs probe → `score.json` | `--probe`, `--python` |
-| `infer` | HF base-vs-adapter A/B | `--prompt` (req), `--adapter`, `--ab`, `--max-new-tokens`, `--temperature`, `--chat`, `--python` |
-| `run-model` | serve via `[runtime]` (llamacpp/transformers) | `--prompt` (req), `--python` |
-| `export-gguf` | merge adapter → f16 → quantize | `--adapter`, `--out`, `--quant`, `--llama-cpp`, `--keep-intermediates`, `--python` |
-| `dequant` | GGUF → HF safetensors (so it can be trained) | `--gguf`, `--out`, `--dtype`, `--tokenizer`, `--python` |
-| `checkpoints {list,show <id>,restore <id>}` | checkpoint store inspection / manual rollback | `--config` |
-| `quarantine {list,clear}` | provenance the loop skips after catastrophe | `--config` |
-| `evolve <project>` | auto-detect palace+corpus, self-route pipeline | `--config`, `--gap-rounds`, `--export` |
-| `evolve --goals` | multi-goal discover→generate (no eval gate) | `--config` |
-| `evolve --schedule` | EVAL-GATED multi-goal rounds | `--max-rounds`, `--policy round-robin\|weighted`, `--python` |
-| `branch create` | build+gate+export+register a branch | `--name` (req), `--base`, `--corpus`, `--domain`, `--distill`, `--teacher <path>`, `--steps`, `--python` |
-| `branch list` | registered fleet (`branches/registry.json`) | `--config` |
-| `branch register` | admit an externally-built GGUF (ML-free) | `--name` (req), `--gguf` (req), `--base`, `--domain`, `--dataset`, `--correctness`, `--parent` |
-| `branch route <query>` | resolve request → branch(es) + scores | `--config` |
-| `branch serve [<name>]` | serve a branch (one-shot) | `--route <query>`, `--prompt`, `--python` |
-| `daemon {start,stop,status}` | ambient continuous-evolution loop (track 26): living-queue → microshard → track-15 txn. **Gentle-background** (default): yields the GPU to other processes (`pause_on_gpu_process`), CPU-fallback when busy, optional block rotation + cooldown — coexists with gaming/video | `start`: `--max-vram`, `--max-steps`, `--drain`, `--python`; `[daemon]`: `pause_on_gpu_process`/`cpu_fallback`/`rotation_blocks`/`cooldown_secs`; `status`: queue pending |
-| `teach` | enqueue a prompt→completion on the daemon PRIORITY lane | `--prompt` (req), `--completion` (req) |
-| `doctor` | preflight env (python/cuda/mamba/model/llama.cpp/work_dir) | `--python`, `--json` |
-| `config-show` / `dataset-reference` / `commands` | resolved config / data-contract schema / subcommand manifest | `commands --json` |
+| `evolve train fit` | LoRA adapter → `work_dir/adapter` | `--backend candle\|transformers`, `--python`, `--data`, `--preset`, `--out`, `--steps`, `--max-seq-len` |
+| `evolve train eval` | score vs probe → `score.json` | `--probe`, `--python` |
+| `evolve model infer` | HF base-vs-adapter A/B | `--prompt` (req), `--adapter`, `--ab`, `--max-new-tokens`, `--temperature`, `--chat`, `--python` |
+| `evolve model run` | serve via `[runtime]` (llamacpp/transformers) | `--prompt` (req), `--python` |
+| `evolve train export-gguf` | merge adapter → f16 → quantize | `--adapter`, `--out`, `--quant`, `--llama-cpp`, `--keep-intermediates`, `--python` |
+| `evolve train dequant` | GGUF → HF safetensors (so it can be trained) | `--gguf`, `--out`, `--dtype`, `--tokenizer`, `--python` |
+| `evolve watch checkpoints {list,show <id>,restore <id>}` | checkpoint store inspection / manual rollback | `--config` |
+| `evolve watch quarantine {list,clear}` | provenance the loop skips after catastrophe | `--config` |
+| `evolve train auto <project>` | auto-detect palace+corpus, self-route pipeline | `--config`, `--gap-rounds`, `--export` |
+| `evolve train auto --goals` | multi-goal discover→generate (no eval gate) | `--config` |
+| `evolve train auto --schedule` | EVAL-GATED multi-goal rounds | `--max-rounds`, `--policy round-robin\|weighted`, `--python` |
+| `evolve branch create` | build+gate+export+register a branch | `--name` (req), `--base`, `--corpus`, `--domain`, `--distill`, `--teacher <path>`, `--steps`, `--python` |
+| `evolve branch list` | registered fleet (`branches/registry.json`) | `--config` |
+| `evolve branch register` | admit an externally-built GGUF (ML-free) | `--name` (req), `--gguf` (req), `--base`, `--domain`, `--dataset`, `--correctness`, `--parent` |
+| `evolve branch route <query>` | resolve request → branch(es) + scores | `--config` |
+| `evolve branch serve [<name>]` | serve a branch (one-shot) | `--route <query>`, `--prompt`, `--python` |
+| `evolve ambient {start,stop}` + `evolve watch status` | ambient continuous-evolution loop (track 26): living-queue → microshard → track-15 txn. **Gentle-background** (default): yields the GPU to other processes (`pause_on_gpu_process`), CPU-fallback when busy, optional block rotation + cooldown — coexists with gaming/video | `start`: `--max-vram`, `--max-steps`, `--drain`, `--python`; `[daemon]`: `pause_on_gpu_process`/`cpu_fallback`/`rotation_blocks`/`cooldown_secs`; `watch status`: queue pending |
+| `evolve ambient teach` | enqueue a prompt→completion on the daemon PRIORITY lane | `--prompt` (req), `--completion` (req) |
+| `evolve doctor` | preflight env (python/cuda/mamba/model/llama.cpp/work_dir) | `--python`, `--json` |
+| `evolve config show` / `evolve config dataset` / `evolve commands` | resolved config / data-contract schema / subcommand manifest | `commands --json` |
 
-**`evolve` is overloaded:** positional `<project>` is required for the plain
+**`evolve train auto` is overloaded:** positional `<project>` is required for the plain
 form, optional under `--goals`/`--schedule`. Pick the form explicitly.
 
 ## Contracts
@@ -187,7 +187,7 @@ resolver (simhash similarity vs each branch's `router_signature`, filtered by
 base-only (the safety floor). hivemind implements `RemoteBranchRouter` over the
 **same trait** returning `(peer, branch)` — do not fork the trait.
 
-## Config blocks (full schema: `scrt-evolve config-reference`)
+## Config blocks (full schema: `evolve config reference`)
 
 `[evolve]` (model_path/corpus_dir/palace_path/work_dir/constitution/taste),
 `[discover]`, `[generate]` (+`.api`/`.local`), `[train]` (+`.lora`/`.qat`/

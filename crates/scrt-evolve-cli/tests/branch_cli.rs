@@ -11,7 +11,7 @@ use scrt_evolve::branch::router::corpus_signature;
 use scrt_evolve::branch::{BranchManifest, BranchRegistry, Lineage, MANIFEST_VERSION};
 
 fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_scrt-evolve")
+    env!("CARGO_BIN_EXE_evolve")
 }
 
 fn manifest(name: &str, domain: &str, texts: &[&str]) -> BranchManifest {
@@ -29,6 +29,7 @@ fn manifest(name: &str, domain: &str, texts: &[&str]) -> BranchManifest {
         version: MANIFEST_VERSION.to_string(),
         gguf_sha: "deadbeef".to_string(),
         created: "2026-06-26T00:00:00Z".to_string(),
+        tier: scrt_evolve::dataset::Tier::Private,
     }
 }
 

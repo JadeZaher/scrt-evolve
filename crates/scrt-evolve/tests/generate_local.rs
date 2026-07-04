@@ -5,7 +5,7 @@
 //! determinism (styleguide §2.2).
 #![cfg(feature = "train")]
 
-use scrt_evolve::dataset::{Dataset, GenExample};
+use scrt_evolve::dataset::{Dataset, GenExample, Outcome, Tier, Verdict};
 use scrt_evolve::discover::{DiscoveredContext, Passage};
 use scrt_evolve::generate::local::{filter_degenerate, LocalCandle};
 use scrt_evolve::generate::run_with_backend;
@@ -61,6 +61,11 @@ fn degenerate_output_is_filtered() {
         completion: "Use scrt --mp-stash NAME to store it.".into(),
         source: Some("README.md".into()),
         gen: Some("local".into()),
+        outcome: Outcome::Unknown,
+        judge_score: None,
+        judge_verdict: Verdict::Unjudged,
+        tier: Tier::Private,
+        chosen_over: None,
     };
     let rows = vec![
         good.clone(),
@@ -72,6 +77,11 @@ fn degenerate_output_is_filtered() {
             completion: "".into(),
             source: None,
             gen: Some("local".into()),
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         },
         // repeated single char
         GenExample::Qa {
@@ -79,6 +89,11 @@ fn degenerate_output_is_filtered() {
             completion: "aaaaaaaa".into(),
             source: None,
             gen: Some("local".into()),
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         },
         // answer echoes the prompt
         GenExample::Instruction {
@@ -87,6 +102,11 @@ fn degenerate_output_is_filtered() {
             output: "Explain --mp-stash".into(),
             source: None,
             gen: Some("local".into()),
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         },
     ];
 
@@ -104,12 +124,22 @@ fn local_and_api_rows_are_schema_interchangeable() {
         completion: "Use scrt --mp-stash NAME.".into(),
         source: Some("README.md".into()),
         gen: Some("local".into()),
+        outcome: Outcome::Unknown,
+        judge_score: None,
+        judge_verdict: Verdict::Unjudged,
+        tier: Tier::Private,
+        chosen_over: None,
     };
     let api_row = GenExample::Qa {
         prompt: "How do I stash a search?".into(),
         completion: "Use scrt --mp-stash NAME.".into(),
         source: Some("README.md".into()),
         gen: Some("api".into()),
+        outcome: Outcome::Unknown,
+        judge_score: None,
+        judge_verdict: Verdict::Unjudged,
+        tier: Tier::Private,
+        chosen_over: None,
     };
 
     let ds = Dataset::new(vec![local_row.clone(), api_row.clone()]);

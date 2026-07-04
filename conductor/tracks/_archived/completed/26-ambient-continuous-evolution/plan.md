@@ -16,20 +16,20 @@ resource: ./metadata.json
 2. [ ] Activity tail → enqueue:
    - passive watcher over `~/.claude/projects/*.jsonl` reusing the track-20
      harvest adapter → `raw` lane;
-   - explicit `scrt-evolve teach <…>` / scrt-capture hook → `priority` lane.
+   - explicit `evolve ambient teach <…>` / scrt-capture hook → `priority` lane.
 3. [ ] Constitution/taste-driven synthesis: when the queue needs generated QA
    (not raw activity), shape the generate prompt with the active constitution +
    taste meta-modules (tracks 21/22).
 4. [ ] `daemon` subcommand: VRAM-gated loop (`[hardware]` + `--max-vram`), per
    step → one microshard (track 25 `granularity=module`) over the next queued
    item(s) → track-15 transaction (keep|rollback) → durable per-step log.
-   Explicit `daemon start` / `daemon stop`.
+   Explicit `ambient start` / `ambient stop`.
 5. [ ] `[daemon]` config block: `max_vram`, `poll_interval`, lane weights,
    granularity (default `module`), eval cadence. Additive.
 6. [ ] Tests: queue enqueue/pop/restart round-trip (Rust); VRAM-gate skip logic;
    transactional commit on a stubbed trainer (machinery testable ML-free, same
    injected-closure pattern as track 20 rounds).
-7. [ ] Real verification: run `daemon start --max-vram 4G` on Granite (WSL2) with
+7. [ ] Real verification: run `ambient start --max-vram 4G` on Granite (WSL2) with
    a live tail of actual CLI activity; confirm bounded VRAM, eval-gated commits,
    resume-after-stop.
 
@@ -56,7 +56,7 @@ the live GPU run is the only deferred piece.
   production wiring (reuses `harvest::harvest_entries`).
 - [ ] **Task 3 — constitution/taste synthesis**: deferred — depends on tracks
   21/22 (taste/meta-objects), which are not built.
-- [x] **Task 4 — `daemon` subcommand** (`src/daemon.rs` + CLI `daemon start/stop/
+- [x] **Task 4 — `daemon` subcommand** (`src/daemon.rs` + CLI `ambient start/stop/
   status`): VRAM-gated loop (`[hardware]`/`[daemon]` + `--max-vram`), per step →
   track-15 transaction (keep|rollback), catastrophe → halt, durable
   `logs/daemon.log`, explicit stop-file control, resume from the queue cursor.

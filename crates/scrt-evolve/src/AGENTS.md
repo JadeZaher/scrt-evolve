@@ -34,7 +34,7 @@ Rows are stamped **per source** (track 31 Q2): transcript-derived rows carry
 a catastrophe in one source quarantines only that source, not all ingested data
 (the old single `INGEST_GEN_STAMP = "ingest"` blanket is kept for back-compat).
 
-The CLI layer (`daemon ingest` in `scrt-evolve-cli`) adds a cheap, generic
+The CLI layer (`ambient ingest` in `scrt-evolve-cli`) adds a cheap, generic
 `--match` substring pre-filter (bounds the candidate set / LLM cost before any
 call) and `--relevance` (the judge criterion). The intent prompt for a tool row
 is the call's own `description` when present, else the recent user text.
@@ -60,8 +60,8 @@ Answers "is behavior actually changing?" — because loss falling per step does 
 mean the kept model changed. Pure arithmetic over the track-15 evolution log:
 takes only **committed** steps (a rolled-back step didn't move the kept model),
 reads each one's `ScoreReport.correctness`, and reports the series + mean-delta +
-total-change + a direction arrow. The CLI surfaces it in `daemon status`
-(latest + arrow), `daemon health`, and `daemon trend` (full series). Over a small
+total-change + a direction arrow. The CLI surfaces it in `watch status`
+(latest + arrow), `watch health`, and `watch trend` (full series). Over a small
 data pool expect overfitting (rising probe score) before broad change — which is
 exactly why this is read alongside the Q5 ledger's "nothing new" signal.
 
@@ -87,7 +87,7 @@ track-15 transaction's keep|rollback/catastrophe semantics untouched:
 - **Budget (Q3).** `within_budget` (pure) checks a sliding 1-hour window of
   (timestamp, train_secs) against `max_minutes_per_hour`; over budget ⇒ `Wait`
   like the VRAM gate. The clock is injected (`now_secs` hook) so it's testable.
-- **Health/observability (Q2).** `daemon health` reads the evolution log for
+- **Health/observability (Q2).** `watch health` reads the evolution log for
   run-state, last step+verdict, committed count, last cause/error, and a halt
   flag. Caveat: only *transactional* steps land in the evolution log, so a
   transient subprocess failure (which never completes a txn) shows in
@@ -136,3 +136,85 @@ signal"); the right N is **empirical** — tune via the `bench/` sweep (vary
 `min_train_pairs ∈ {1,2,4,8}`, watch the Q4 trend slope + the judge regress rate;
 pick the smallest non-degrading N). The number is the deliverable's *output*, not
 an assertion.
+
+## dataset contract v1.1 (track 37) — additive training-signal metadata
+
+`GenExample` carries five OPTIONAL fields on every variant (per-variant, NOT
+`#[serde(flatten)]` — flatten misbehaves under the internally-tagged `kind` enum):
+`outcome` (success|failure|unknown), `judge_score` (0–1), `judge_verdict`
+(keep|drop|unjudged), `tier` (private|shared), `chosen_over` (content-key of the
+rejected half of a preference pair). All are `#[serde(default, skip_serializing_if)]`
+so a v1.0 line round-trips **byte-identically** (a defaulted field never
+serializes). Uniform accessors (`.outcome()/.set_outcome()`, `.set_judge()`,
+`.tier()`, `.set_chosen_over()`) stamp rows without matching every variant. The
+dedup ledger is UNCHANGED — `content_hash` keys on content only (`content_key`),
+so a re-mined row with a fresh outcome stamp is still a duplicate. `chosen_over` is
+the **recorded-not-trained** DPO contract (track 37 non-goal: no trl lane here).
+
+## ingest.rs — outcome signal + retry-collapse (track 37 Phase A)
+
+`interaction_log_rows` now correlates `tool_use.id` → the following `tool_result`
+block (`is_error` primary; a Bash text heuristic — "command not found"/"fatal:"/…
+— secondary) and stamps `outcome`; err toward `Unknown` when no signal. Parse-time
+length cap is raised to `MAX_ROW_CHARS_VERIFIED` (8000) so a long SUCCESS survives;
+`filter_outcomes` then (1) **retry-collapses** a run of ~same-command failures
+followed by a success into the ONE success row (recording the failed variant's key
+in `chosen_over`), (2) **excludes bare failures** from training (they go to the
+`rejected.jsonl` audit sidecar under `work_dir/queue/`), (3) drops a non-success row
+still over `MAX_ROW_CHARS` (2000), and (4) stamps `tier` from `[ingest].tier`.
+"Same command" is a normalized-PREFIX match (first two tokens, lowercased) — NOT
+equality — to catch "same command, tweaked args" while erring toward not-similar.
+
+## judge.rs — per-pair data judge + synthesis (track 37 Phase B/C)
+
+`LlmPairJudge` (a `ChatTransport` mirror of the relevance/degradation judges) scores
+each row 0–1 on correctness/quality/steering-alignment; `judge_rows` stamps
+`judge_score`+`judge_verdict` and splits kept (≥ `[judge].min_score`, default 0.5) /
+dropped. `[judge].on_error` (default `keep` = fail-open, matching the relevance-judge
+precedent + track-31 preflight backstop; flip to `drop` = fail-closed before
+publishing branches P2P). Wired into the ingest path (`run_ingest`, post-mine /
+pre-enqueue) so the living queue holds only judged rows — strictly UPSTREAM of the
+track-15 weight-touching txn (untouched). Standalone `evolve dataset judge
+--in dataset.jsonl` for stage independence. `dataset_signal_stats` (judged_fraction,
+judge_mean_score, outcome_verified_fraction) + `dataset_tier` (most-restrictive-wins)
+roll up into the branch manifest's `eval_report` + new `tier` field — the lexame
+"marked expertise" a peer reads to trust a shared branch. `rejection_sample`
+(RAFT-style best-of-N: `[generate].candidates_per_seed`, judge-rank, keep top-k,
+stamp `gen=rsample:<n>`) and `expand_dataset` (Evol/Self-Instruct, stamp
+`gen=expand:<op>`, each judged before admission — `evolve dataset expand`).
+
+## [domain] parameterization (track 37 Phase C)
+
+`[domain]` (name, description, command_prefixes, flag_patterns, tools) de-hardcodes
+`scrt` from the planner job prompt (`planner::system_prompt`), signal extraction
+(`signals::extract` tool/flag counting), and cli validation (`generate::api`
+`cli_command_allowed`). Defaults reproduce the scrt values **byte-identically** —
+absent `[domain]` is behavior-identical (asserted by a snapshot test). The planner
+also now routes `skill`/`reasoning_edit` (was unreachable) and no longer silently
+degrades `completion` to Prose (rejected at plan-parse).
+
+## nudge.rs + steerable loop (track 37 Phase D = track 35 delivered)
+
+`evolve ambient nudge` writes an atomic `nudge.json` (tmp→rename, mirroring
+`daemon::stop_file`). The daemon polls + DELETES it (consume-once) at the TOP of a
+step, after the stop-check — the loop owns the config then (`take_nudge` hook is the
+test seam, like `should_stop`). `apply_nudge` merges only the SAFE-LIVE allowlist
+into a `live_cfg` clone: goal weights (sticky), judge `min_score`, modality mix,
+`candidates_per_seed`, synthesis rate, gate mode, and a `focus` with a step-count
+TTL. Restart-required knobs (model_path, fractional shape, rotation_blocks, work_dir)
+are REJECTED with a reason. Nudges are **ephemeral** — the TOML `cfg` wins on restart
+(`live_cfg` dies with the loop). Each accepted nudge writes a `kind:"nudge"`
+evolution-log row (surfaced by `watch status`/`health`); each committed step samples
+`[judge].sample_k` queue rows against `compose_steering()` and logs a
+`kind:"steering_compliance"` row (charted by `watch trend`) — only when steering is
+set AND the sampler hook is wired (no judge call otherwise).
+
+## objective asymmetry (track 37 Phase E) — see `config.rs` `default_daemon_objective`
+
+`[daemon].objective` defaults to `end_task` (the KNOWLEDGE signal) — the ambient loop
+exists to actually teach from judged live data. It overrides
+`[train.fractional].objective` for daemon steps EXACTLY as `[daemon].granularity`
+overrides its fractional twin (applied in `daemon::apply_plan`). The NON-daemon
+fractional default stays `distill` (a representation-only near-no-op) with its
+rationale intact. The Python trainer's live-calib sourcing + same-model rotary-kwargs
+fix are documented in `python/scrt_evolve_train/AGENTS.md`.

@@ -26,7 +26,7 @@ resource: ./metadata.json
    exposed under `--features pyo3`. -- evidence: bridge.rs — read_dataset, dataset_rows_for_training, dataset_prompt_completion_pairs, dataset_kind_counts; all #[pyfunction], compiles under --features pyo3.
 8. [ ] Python parity: a `peft`/`trl`-style script trains one step on the same
    dataset and saves a compatible adapter. -- (carry-forward: Rust-side bridge seam implemented + compiles under --features pyo3; no actual .py test/script exists in repo; end-to-end Python peft/trl parity test is deferred).
-9. [x] `scrt-evolve train --preset lora [--data dataset.jsonl]` standalone. -- evidence: CLI cmd_train (main.rs:466-478) loads dataset via --data or work_dir/dataset.jsonl, calls train::run, prints report; train_run_driver_routes_lora test validates routing.
+9. [x] `evolve train fit --preset lora [--data dataset.jsonl]` standalone. -- evidence: CLI cmd_train (main.rs:466-478) loads dataset via --data or work_dir/dataset.jsonl, calls train::run, prints report; train_run_driver_routes_lora test validates routing.
 10. [x] Final sweep: `cargo test --features train`, pyo3 bridge test,
     `cargo clippy --features train`. -- evidence: all 4 LoRA tests pass (adapter_injection_reflects_config, overfit_tiny_batch_loss_decreases, adapter_saves_and_reloads, train_run_driver_routes_lora); cargo clippy --features train clean; bridge compiles under --features pyo3.
 

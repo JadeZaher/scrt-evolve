@@ -30,6 +30,11 @@ pub enum ConfigError {
     InlineSecret { field: &'static str },
     #[error("`model_path` is required for the `{stage}` stage but was not set in [evolve]")]
     MissingModelPath { stage: &'static str },
+    #[error("`{field}` out of range: {detail}")]
+    OutOfRange {
+        field: &'static str,
+        detail: &'static str,
+    },
 }
 
 /// Top-level config: `[evolve]` + the three optional stage blocks.
@@ -94,7 +99,7 @@ pub struct EvolveConfig {
     /// `[daemon]` — the ambient continuous-evolution daemon (track 26). Turns
     /// evolution into an always-on, VRAM-bounded background process fed by the
     /// living activity queue, every step eval-gated through track 15. Absent ⇒
-    /// `daemon start` uses its flag/default values. Additive + non-breaking
+    /// `evolve ambient start` uses its flag/default values. Additive + non-breaking
     /// (styleguide §1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon: Option<DaemonConfig>,
@@ -107,14 +112,218 @@ pub struct EvolveConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store: Option<StoreConfig>,
     /// `[ingest]` — config-driven activity ingestion for the ambient daemon
-    /// (sources, relevance criterion, prefilters). Absent ⇒ `daemon ingest` needs
+    /// (sources, relevance criterion, prefilters). Absent ⇒ `evolve ambient ingest` needs
     /// explicit flags. See `crates/scrt-evolve/src/AGENTS.md` §ingest.rs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingest: Option<IngestConfig>,
+    /// `[judge]` — per-pair data judge (track 37 Phase B): scores each candidate
+    /// row before it trains. Absent ⇒ no pre-queue judging (today's behavior).
+    /// See `crates/scrt-evolve/src/AGENTS.md` §judge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge: Option<JudgeConfig>,
+    /// `[domain]` — domain parameterization (track 37 Phase C): what the planner
+    /// is tuning FOR. Absent ⇒ the built-in `scrt` defaults (behavior-identical).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<DomainConfig>,
+    /// `[serve]` — the live serve-while-you-train server (track 33). Turns on a
+    /// long-lived inference server that hot-swaps the adapter at each keep-commit,
+    /// VRAM-arbitrated against the fractional trainer. Absent ⇒ no live serving
+    /// (today's one-shot `run-model` path is unchanged). Additive + non-breaking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serve: Option<ServeConfig>,
+}
+
+/// `[serve.placement]` — per-shard GPU placement (track 39). Controls which
+/// layer indices reside on GPU vs CPU/RAM; supports arbitrary interleaving
+/// (e.g. `gpu_shards = [0,1,2,8,9,16]`) which llama.cpp's contiguous
+/// `n_gpu_layers` prefix could not express.
+///
+/// - `mode = "auto"` (default): measure free VRAM at load and fill greedily.
+/// - `mode = "manual"`: honor `gpu_shards` exactly; refuses fast on impossible maps.
+///
+/// When absent the engine uses its own placement heuristic (all-CPU for the
+/// candle reference backend; VRAM-measured auto for live serving).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlacementConfig {
+    /// Placement resolve mode: `auto` | `manual`.
+    #[serde(default = "default_placement_mode")]
+    pub mode: String,
+    /// `mode = "manual"`: explicit layer indices to reside on GPU. Indices are
+    /// zero-based, may be non-contiguous (interleaved). Ignored in `auto` mode.
+    #[serde(default)]
+    pub gpu_shards: Vec<usize>,
+}
+
+fn default_placement_mode() -> String {
+    "auto".to_string()
+}
+
+impl Default for PlacementConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_placement_mode(),
+            gpu_shards: Vec::new(),
+        }
+    }
+}
+
+/// `[serve]` — the live inference server (track 33). All fields default so an
+/// absent/partial block behaves like today (no live serving). See
+/// `src/arbitration.rs` and the track 33 `AGENTS.md`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServeConfig {
+    /// Run a long-lived server that hot-swaps the adapter at each keep-commit.
+    /// `false` (default) ⇒ no live serving.
+    #[serde(default)]
+    pub live: bool,
+    /// Coalesce swaps: only hot-swap every N `served-ready` records (`0` = swap
+    /// on every keep). Bounds re-quantization cost on the GGUF path.
+    #[serde(default)]
+    pub swap_debounce_commits: u32,
+    /// Residency mode: `auto` (doctor measures + decides), `b` (force co-resident),
+    /// `a` (force strict-alternate). Default `auto`.
+    #[serde(default)]
+    pub mode: ServeMode,
+    /// `[serve.placement]` — per-layer GPU placement for the native candle engine
+    /// (track 39). `mode = "auto"` (default) probes free VRAM; `mode = "manual"`
+    /// honors `gpu_shards` exactly. Absent ⇒ engine default heuristic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<PlacementConfig>,
+}
+
+impl Default for ServeConfig {
+    fn default() -> Self {
+        Self {
+            live: false,
+            swap_debounce_commits: 0,
+            mode: ServeMode::Auto,
+            placement: None,
+        }
+    }
+}
+
+/// Serve residency mode selector (track 33). `auto` lets `doctor` pick B-or-A
+/// from a live VRAM measurement; `a`/`b` force the choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServeMode {
+    /// Measure co-resident footprint and select B (fits) or degrade to A.
+    #[default]
+    Auto,
+    /// Force strict-alternate (mode A).
+    A,
+    /// Force co-resident (mode B).
+    B,
+}
+
+/// `[judge]` — the per-pair data judge (track 37 Phase B). Scores every candidate
+/// row 0–1 on correctness/quality/steering-alignment before it enters the living
+/// queue (daemon) or the on-disk dataset (`evolve dataset judge`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JudgeConfig {
+    /// Keep only rows scoring ≥ this (0.0–1.0). Default 0.5.
+    #[serde(default = "default_judge_min_score")]
+    pub min_score: f32,
+    /// On judge/transport error: `keep` (fail-open, default — matches the
+    /// relevance-judge precedent + track-31 preflight backstop; a flaky judge
+    /// must not stall an unattended daemon) or `drop` (fail-closed — the
+    /// documented flip before publishing branches P2P).
+    #[serde(default = "default_judge_on_error")]
+    pub on_error: String,
+    /// Rows per LLM call. Default 15 (matches the relevance judge).
+    #[serde(default = "default_judge_batch")]
+    pub batch: usize,
+    /// How many generated rows to sample per daemon step for the steering-
+    /// compliance metric (track 37 Phase D). Default 4. `0` ⇒ disabled.
+    #[serde(default = "default_judge_sample_k")]
+    pub sample_k: usize,
+}
+
+impl Default for JudgeConfig {
+    fn default() -> Self {
+        Self {
+            min_score: default_judge_min_score(),
+            on_error: default_judge_on_error(),
+            batch: default_judge_batch(),
+            sample_k: default_judge_sample_k(),
+        }
+    }
+}
+
+fn default_judge_min_score() -> f32 {
+    0.5
+}
+fn default_judge_on_error() -> String {
+    "keep".to_string()
+}
+fn default_judge_batch() -> usize {
+    15
+}
+fn default_judge_sample_k() -> usize {
+    4
+}
+
+/// `[domain]` — what the planner tunes FOR (track 37 Phase C). Absent, or any
+/// unset field, resolves to the built-in `scrt` value so existing configs are
+/// byte-identical.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DomainConfig {
+    /// Short domain name used in the planner's job description (default `scrt`).
+    #[serde(default = "default_domain_name")]
+    pub name: String,
+    /// One-line domain description for the planner prompt.
+    #[serde(default = "default_domain_description")]
+    pub description: String,
+    /// Command prefixes that a `cli` row must start with (default `["scrt"]`).
+    #[serde(default = "default_domain_command_prefixes")]
+    pub command_prefixes: Vec<String>,
+    /// Flag token prefixes counted as signal (default `["--mp-"]`).
+    #[serde(default = "default_domain_flag_patterns")]
+    pub flag_patterns: Vec<String>,
+    /// Tool names counted as signal (default = the scrt tool set).
+    #[serde(default = "default_domain_tools")]
+    pub tools: Vec<String>,
+}
+
+impl Default for DomainConfig {
+    fn default() -> Self {
+        Self {
+            name: default_domain_name(),
+            description: default_domain_description(),
+            command_prefixes: default_domain_command_prefixes(),
+            flag_patterns: default_domain_flag_patterns(),
+            tools: default_domain_tools(),
+        }
+    }
+}
+
+fn default_domain_name() -> String {
+    "scrt".to_string()
+}
+fn default_domain_description() -> String {
+    "the `scrt` tool — both as structured tool calls and as a CLI — plus \
+     understanding its concepts"
+        .to_string()
+}
+fn default_domain_command_prefixes() -> Vec<String> {
+    vec!["scrt".to_string()]
+}
+fn default_domain_flag_patterns() -> Vec<String> {
+    vec!["--mp-".to_string()]
+}
+fn default_domain_tools() -> Vec<String> {
+    vec![
+        "scrt_search".to_string(),
+        "scrt_stash".to_string(),
+        "scrt_list_stashes".to_string(),
+        "scrt_get_stash".to_string(),
+        "scrt_drop_stash".to_string(),
+        "scrt_similar".to_string(),
+    ]
 }
 
 /// `[ingest]` — what the ambient daemon mines into its living queue. Makes
-/// `daemon ingest` / `scrt-evolve --ambient` flagless. See `src/AGENTS.md`.
+/// `evolve ambient ingest` / `evolve --ambient` flagless. See `src/AGENTS.md`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IngestConfig {
     /// Interaction-log dirs (scanned recursively for `*.jsonl`). Empty ⇒ the
@@ -136,6 +345,10 @@ pub struct IngestConfig {
     /// Cap rows enqueued per ingest (0 = no cap).
     #[serde(default)]
     pub max: usize,
+    /// Data-sovereignty tier stamped on mined rows: `private` (default) or
+    /// `shared` (track 37). Flows to the branch manifest, most-restrictive-wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
 }
 
 /// `[store]` — bounded model-weight version management (storage + loading).
@@ -253,6 +466,12 @@ pub struct EvolveSection {
     /// alongside `constitution`. Minimal slice; a plain string for now.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub taste: Option<String>,
+    /// EPHEMERAL live-focus (track 37 nudge). `#[serde(skip)]` — never read from
+    /// or written to TOML, so it exists only on the daemon's live config clone
+    /// and dies on restart (nudges are ephemeral by contract). Composed into
+    /// steering for its TTL window, then cleared by the daemon.
+    #[serde(skip)]
+    pub focus: Option<String>,
 }
 
 impl EvolveSection {
@@ -435,6 +654,19 @@ pub struct DaemonConfig {
     /// (train whenever the queue is non-empty).
     #[serde(default = "default_daemon_max_vram")]
     pub max_vram_gb: f64,
+    /// HOST-RAM floor in GB (system-freeze guard). Train only when at least this
+    /// much system RAM is FREE (`MemAvailable`). A big f16 model load — especially
+    /// the A/B eval that loads the model TWICE — can otherwise consume all host
+    /// memory and freeze the machine. Low RAM ⇒ WAIT (never CPU fallback, which
+    /// uses more RAM). `None`/absent ⇒ ungated (back-compat).
+    #[serde(default)]
+    pub min_free_ram_gb: Option<f64>,
+    /// Serve carve-out in GB (track 33): VRAM reserved for a co-resident live
+    /// inference server. The trainer subtracts this from available headroom
+    /// before starting a block (`free − reservation ≥ block_need`). `None`/absent
+    /// ⇒ no carve-out (behave exactly as today). See `src/arbitration.rs`.
+    #[serde(default)]
+    pub serve_reservation_gb: Option<f64>,
     /// Seconds to wait when throttled or the queue is idle, before re-checking.
     #[serde(default = "default_daemon_poll")]
     pub poll_interval_secs: u64,
@@ -445,6 +677,15 @@ pub struct DaemonConfig {
     /// floor — the default for the ambient daemon. `block` trains a layer-block.
     #[serde(default = "default_daemon_granularity")]
     pub granularity: String,
+    /// Fractional learning objective for DAEMON steps (track 37 Phase E).
+    /// Defaults to `end_task` — the KNOWLEDGE signal — because the ambient loop
+    /// exists to actually teach the model from judged live data (unlike the
+    /// non-daemon `[train.fractional].objective` default of `distill`, a
+    /// representation-only near-no-op). Overrides `[train.fractional].objective`
+    /// for daemon steps exactly as `granularity` overrides its fractional twin.
+    /// See `crates/scrt-evolve/src/config.rs` §objective asymmetry.
+    #[serde(default = "default_daemon_objective")]
+    pub objective: String,
     /// Eval cadence (reserved): v1 gates EVERY step for safety; a value > 1 is
     /// accepted but does not yet skip evals (documented seam).
     #[serde(default = "default_daemon_eval_cadence")]
@@ -522,6 +763,10 @@ fn default_daemon_batch() -> usize {
 fn default_daemon_granularity() -> String {
     "module".to_string()
 }
+fn default_daemon_objective() -> String {
+    // Track 37 Phase E: the KNOWLEDGE signal by default for the ambient loop.
+    "end_task".to_string()
+}
 fn default_daemon_eval_cadence() -> u64 {
     1
 }
@@ -553,9 +798,12 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             max_vram_gb: default_daemon_max_vram(),
+            min_free_ram_gb: None,
+            serve_reservation_gb: None,
             poll_interval_secs: default_daemon_poll(),
             batch: default_daemon_batch(),
             granularity: default_daemon_granularity(),
+            objective: default_daemon_objective(),
             eval_cadence: default_daemon_eval_cadence(),
             pause_on_gpu_process: true,
             cpu_fallback: true,
@@ -751,6 +999,19 @@ pub struct GenerateConfig {
     pub local: Option<GenerateLocalConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api: Option<GenerateApiConfig>,
+    /// Rejection sampling (track 37 Phase C): generate N candidate rows per seed
+    /// passage, judge-rank, keep top-k above `[judge].min_score`. Default 1 =
+    /// today's behavior (no rejection sampling). See `src/AGENTS.md` §judge.
+    #[serde(default = "default_candidates_per_seed")]
+    pub candidates_per_seed: usize,
+    /// Synthesis rate (track 37 Phase C/D): fraction 0.0–1.0 of steps that run an
+    /// Evol/Self-Instruct expansion pass. `None` ⇒ off. Set live via a nudge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthesis_rate: Option<f32>,
+}
+
+fn default_candidates_per_seed() -> usize {
+    1
 }
 
 fn default_tool_format() -> String {
@@ -776,6 +1037,8 @@ impl Default for GenerateConfig {
             tool_format: default_tool_format(),
             local: None,
             api: None,
+            candidates_per_seed: default_candidates_per_seed(),
+            synthesis_rate: None,
         }
     }
 }
@@ -1020,7 +1283,7 @@ impl Default for FractionalConfig {
 /// convert to GGUF → quantize → place. Every knob the manual pipeline needed —
 /// sharding-merge rules, the merge-load dtype/device, the format conversion
 /// target, source (llama.cpp) + scratch + target weight paths — lives here so
-/// `scrt-evolve export-gguf` runs the whole chain from config. Absent ⇒ the CLI
+/// `evolve train export-gguf` runs the whole chain from config. Absent ⇒ the CLI
 /// falls back to its flag defaults (non-breaking). Generic + architecture-level.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportConfig {
@@ -1117,14 +1380,21 @@ impl Default for MergeShardsConfig {
 }
 
 /// `[runtime]` — the inference runtime: how to LOAD + RUN a model efficiently for
-/// generation, config-driven and backend-generic. `scrt-evolve infer/run-model`
+/// generation, config-driven and backend-generic. `evolve model infer` / `evolve model run`
 /// use this to serve the evolved model (or any model). Absent ⇒ infer falls back
 /// to the transformers HF path against `[evolve].model_path`. Additive.
 ///
+/// **DEPRECATED (track 39):** The llama.cpp-specific keys in this block
+/// (`backend = "llamacpp"`, `llama_cpp_path`, `n_gpu_layers`) are deprecated now
+/// that evolve owns its inference runtime natively (candle, in-process). Use
+/// `[serve.placement]` for GPU placement control (supports interleaved shards),
+/// and `[evolve].model_path` / the native `evolve model infer` command instead.
+/// These keys still parse and function during the retirement window but will emit
+/// a warning at config load.
+///
 /// `backend` selects the engine by an internal registry (no brand logic):
-///   - `llamacpp`  → a GGUF served via the llama.cpp `llama-cli` runner
-///     (efficient quantized inference; the right path for hybrid-SSM models whose
-///     naive transformers forward OOMs — llama.cpp handles SSM state properly).
+///   - `llamacpp`  → **DEPRECATED** — GGUF served via the llama.cpp `llama-cli`
+///     runner. Migrate to the native candle engine (`evolve model infer`).
 ///   - `transformers` → a HuggingFace model via the Python `scrt_evolve_infer`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
@@ -1592,7 +1862,33 @@ impl EvolveConfig {
     pub fn from_toml_str(text: &str) -> Result<Self, ConfigError> {
         let cfg: EvolveConfig = toml::from_str(text)?;
         cfg.validate()?;
+        cfg.emit_deprecation_warnings();
         Ok(cfg)
+    }
+
+    /// Emit load-time deprecation warnings for legacy config keys.
+    ///
+    /// `[runtime]` llama.cpp keys (`backend = "llamacpp"`, `llama_cpp_path`,
+    /// `n_gpu_layers`) are deprecated since track 39 (native candle engine).
+    /// They still parse and the config is usable during the retirement window,
+    /// but users should migrate to `[serve.placement]` for GPU placement and
+    /// use `evolve model infer` (native) instead of the llama.cpp sidecar.
+    fn emit_deprecation_warnings(&self) {
+        if let Some(runtime) = &self.runtime {
+            let has_llamacpp_keys = runtime.backend == "llamacpp"
+                || runtime.llama_cpp_path.is_some()
+                || runtime.n_gpu_layers > 0;
+            if has_llamacpp_keys {
+                eprintln!(
+                    "[scrt-evolve] DEPRECATION WARNING: `[runtime]` llama.cpp keys \
+                     (`backend = \"llamacpp\"`, `llama_cpp_path`, `n_gpu_layers`) are \
+                     deprecated (track 39 — native candle inference). Migrate GPU \
+                     placement to `[serve.placement]` and use `evolve model infer` \
+                     for native serving. These keys will be removed after the \
+                     retirement window completes. See PORTABILITY.md for details."
+                );
+            }
+        }
     }
 
     /// Serialize to a pretty TOML string — used to PERSIST a branch's
@@ -1615,6 +1911,21 @@ impl EvolveConfig {
                         });
                     }
                 }
+            }
+        }
+        if let Some(judge) = &self.judge {
+            if !(0.0..=1.0).contains(&judge.min_score) {
+                return Err(ConfigError::OutOfRange {
+                    field: "judge.min_score",
+                    detail: "must be between 0.0 and 1.0",
+                });
+            }
+            let oe = judge.on_error.trim().to_ascii_lowercase();
+            if oe != "keep" && oe != "drop" {
+                return Err(ConfigError::OutOfRange {
+                    field: "judge.on_error",
+                    detail: "must be \"keep\" or \"drop\"",
+                });
             }
         }
         Ok(())
@@ -1662,6 +1973,8 @@ impl EvolveConfig {
         // (seed = corpus|both), keep it as "both" so a transcript/code corpus
         // still contributes when the palace is empty (the bench case). Only when
         // the base was palace-only do we stay palace-only.
+        // `seed` is a free-form string field ("palace" | "corpus" | "both");
+        // `_` is correct here — any non-corpus/both value falls back to "palace".
         dcfg.seed = match dcfg.seed.as_str() {
             "corpus" | "both" => "both".to_string(),
             _ => "palace".to_string(),
@@ -1707,6 +2020,13 @@ impl EvolveConfig {
                 parts.push(format!("## Taste (the form ideas should take)\n{t}"));
             }
         }
+        // Ephemeral live-focus (track 37 nudge) — a transient emphasis for its
+        // TTL window; steers generation while active, then the daemon clears it.
+        if let Some(f) = self.evolve.focus.as_ref().map(|s| s.trim()) {
+            if !f.is_empty() {
+                parts.push(format!("## Focus (emphasize this right now)\n{f}"));
+            }
+        }
         if parts.is_empty() {
             None
         } else {
@@ -1738,4 +2058,115 @@ fn looks_like_inline_secret(value: &str) -> bool {
     // A very long all-caps-or-mixed token is suspicious; real env var names
     // are short. 40+ chars in a single identifier reads as a key, not a name.
     v.len() >= 40
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+
+    #[test]
+    fn placement_config_round_trips() {
+        // auto mode — default
+        let text = "[serve.placement]\nmode = \"auto\"\n";
+        let cfg = EvolveConfig::from_toml_str(text).unwrap();
+        let serve = cfg.serve.expect("serve present");
+        let placement = serve.placement.expect("placement present");
+        assert_eq!(placement.mode, "auto");
+        assert!(placement.gpu_shards.is_empty());
+
+        // manual mode with interleaved shards
+        let text = "[serve.placement]\nmode = \"manual\"\ngpu_shards = [0, 1, 2, 8, 9, 16]\n";
+        let cfg = EvolveConfig::from_toml_str(text).unwrap();
+        let serve = cfg.serve.expect("serve present");
+        let placement = serve.placement.expect("placement present");
+        assert_eq!(placement.mode, "manual");
+        assert_eq!(placement.gpu_shards, vec![0, 1, 2, 8, 9, 16]);
+    }
+
+    #[test]
+    fn placement_absent_is_none() {
+        let cfg = EvolveConfig::from_toml_str("[serve]\nlive = true\n").unwrap();
+        let serve = cfg.serve.expect("serve present");
+        assert!(serve.placement.is_none());
+    }
+
+    #[test]
+    fn runtime_llamacpp_keys_still_parse_and_emit_warning() {
+        // A config with llama.cpp keys must parse successfully (retirement window).
+        // We can't easily capture eprintln! in a test, but we can verify it doesn't
+        // error and that the fields round-trip correctly.
+        let text = r#"
+[runtime]
+backend = "llamacpp"
+n_gpu_layers = 32
+llama_cpp_path = "/opt/llama.cpp"
+"#;
+        let cfg = EvolveConfig::from_toml_str(text).unwrap();
+        let runtime = cfg.runtime.expect("runtime present");
+        assert_eq!(runtime.backend, "llamacpp");
+        assert_eq!(runtime.n_gpu_layers, 32);
+        assert_eq!(runtime.llama_cpp_path.as_deref(), Some("/opt/llama.cpp"));
+    }
+
+    #[test]
+    fn runtime_and_placement_coexist() {
+        // A config may have both [runtime] (legacy) and [serve.placement] (new).
+        let text = r#"
+[runtime]
+backend = "llamacpp"
+n_gpu_layers = 16
+
+[serve.placement]
+mode = "manual"
+gpu_shards = [0, 1, 2]
+"#;
+        let cfg = EvolveConfig::from_toml_str(text).unwrap();
+        let serve = cfg.serve.expect("serve present");
+        let placement = serve.placement.expect("placement present");
+        assert_eq!(placement.mode, "manual");
+        assert_eq!(placement.gpu_shards, vec![0, 1, 2]);
+        let runtime = cfg.runtime.expect("runtime present");
+        assert_eq!(runtime.n_gpu_layers, 16);
+    }
+}
+
+#[cfg(test)]
+mod serve_tests {
+    use super::*;
+
+    #[test]
+    fn serve_and_reservation_parse_from_toml() {
+        let text = r#"
+[daemon]
+max_vram_gb = 3.5
+serve_reservation_gb = 4.0
+
+[serve]
+live = true
+swap_debounce_commits = 3
+mode = "b"
+"#;
+        let cfg = EvolveConfig::from_toml_str(text).unwrap();
+        let daemon = cfg.daemon.expect("daemon present");
+        assert_eq!(daemon.serve_reservation_gb, Some(4.0));
+        let serve = cfg.serve.expect("serve present");
+        assert!(serve.live);
+        assert_eq!(serve.swap_debounce_commits, 3);
+        assert_eq!(serve.mode, ServeMode::B);
+    }
+
+    #[test]
+    fn serve_defaults_when_omitted() {
+        // No [serve] block, no serve_reservation_gb ⇒ back-compat defaults.
+        let cfg = EvolveConfig::from_toml_str("[daemon]\nmax_vram_gb = 3.5\n").unwrap();
+        assert!(cfg.serve.is_none());
+        assert_eq!(cfg.daemon.unwrap().serve_reservation_gb, None);
+
+        // An empty [serve] block resolves every field to its default.
+        let cfg = EvolveConfig::from_toml_str("[serve]\n").unwrap();
+        let serve = cfg.serve.expect("serve present");
+        assert!(!serve.live);
+        assert_eq!(serve.swap_debounce_commits, 0);
+        assert_eq!(serve.mode, ServeMode::Auto);
+    }
 }

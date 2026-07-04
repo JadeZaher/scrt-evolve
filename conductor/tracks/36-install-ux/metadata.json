@@ -1,8 +1,18 @@
 {
   "id": "36-install-ux",
   "type": "feature",
-  "status": "planned",
+  "status": "in_progress",
   "description": "End-to-end first-class install experience for the evolve CLI on Windows (native) and Linux: CI release artifacts, install.sh/install.ps1 scripts, evolve setup subcommand, and README quickstart.",
   "created_at": "2026-07-02T00:00:00Z",
-  "updated_at": "2026-07-02T00:00:00Z"
+  "updated_at": "2026-07-04T11:45:00Z",
+  "progress": {
+    "phase_1_ci": "not_started",
+    "phase_2_scripts": "done - install.sh and install.ps1 created",
+    "phase_3_cli": "not_started - evolve setup subcommand pending",
+    "phase_4_docs": "not_started"
+  },
+  "artifacts_created": [
+    "scripts/install.sh - Linux bash installer (syntax verified)",
+    "scripts/install.ps1 - Windows PowerShell installer"
+  ]
 }

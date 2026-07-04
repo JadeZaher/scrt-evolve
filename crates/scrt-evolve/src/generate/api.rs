@@ -21,18 +21,21 @@ pub struct ChatMessage {
 }
 
 impl ChatMessage {
+    /// Construct a `system`-role message.
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: "system".into(),
             content: content.into(),
         }
     }
+    /// Construct a `user`-role message.
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: "user".into(),
             content: content.into(),
         }
     }
+    /// Construct an `assistant`-role message.
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: "assistant".into(),
@@ -44,6 +47,7 @@ impl ChatMessage {
 /// The transport seam: send a chat request, get back the assistant's text.
 /// Implemented by [`HttpTransport`] for real calls and by mocks in tests.
 pub trait ChatTransport {
+    /// Send a chat completion request and return the assistant turn's text.
     fn complete(&self, messages: &[ChatMessage]) -> anyhow::Result<String>;
 }
 
@@ -230,14 +234,9 @@ pub fn parse_examples(raw: &str, ctx: &GenContext) -> anyhow::Result<Vec<GenExam
         if kind == "tool_call" && !valid_tool_call(&obj, &tool_index) {
             continue;
         }
-        // CLI rows must actually be a `scrt ` command.
-        if kind == "cli"
-            && !obj
-                .get("command")
-                .and_then(|c| c.as_str())
-                .map(|c| c.trim_start().starts_with("scrt"))
-                .unwrap_or(false)
-        {
+        // CLI rows must actually start with a domain command prefix (default
+        // `["scrt"]` when the context supplies none — behavior-identical).
+        if kind == "cli" && !cli_command_allowed(&obj, ctx.command_prefixes) {
             continue;
         }
         // Skill rows must name a non-empty skill and carry a non-empty invocation
@@ -269,6 +268,28 @@ fn default_kind_for(mode: GenMode) -> String {
         GenMode::Skill => "skill".into(),
         GenMode::ReasoningEdit => "reasoning_edit".into(),
     }
+}
+
+/// True if a `cli` row's `command` starts (after trimming) with any of the
+/// domain command prefixes. An EMPTY `prefixes` slice ⇒ the built-in `["scrt"]`
+/// default, so existing configs validate identically (track 37 Phase C).
+fn cli_command_allowed(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    prefixes: &[String],
+) -> bool {
+    let default_prefix = ["scrt".to_string()];
+    let prefixes = if prefixes.is_empty() {
+        &default_prefix[..]
+    } else {
+        prefixes
+    };
+    obj.get("command")
+        .and_then(|c| c.as_str())
+        .map(|c| {
+            let cmd = c.trim_start();
+            prefixes.iter().any(|p| cmd.starts_with(p.as_str()))
+        })
+        .unwrap_or(false)
 }
 
 /// True if `obj[key]` is a present, non-empty string.

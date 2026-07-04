@@ -5,7 +5,7 @@
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
-use scrt_evolve::dataset::GenExample;
+use scrt_evolve::dataset::{GenExample, Outcome, Tier, Verdict};
 use scrt_evolve::eval::ScoreReport;
 use scrt_evolve::regulate::{Regulator, StepAction};
 use scrt_evolve::{Dataset, EvolveConfig, Quarantine};
@@ -161,12 +161,22 @@ fn catastrophe_rolls_back_quarantines_and_halts() {
             completion: "x".to_string(),
             source: None,
             gen: Some("trace:goalB".to_string()),
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         },
         GenExample::Qa {
             prompt: "bad".to_string(),
             completion: "y".to_string(),
             source: None,
             gen: Some("trace:goalA".to_string()), // quarantined
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         },
     ]);
     let (kept, dropped) = q.filter(&ds);

@@ -1,14 +1,14 @@
 //! Annotated `evolve.toml` config reference + a copy-pasteable template, surfaced
-//! via `scrt-evolve config-reference [--toml]`. Kept here so the schema docs live
+//! via `evolve config reference [--toml]`. Kept here so the schema docs live
 //! in one place a coding agent can read in full.
 
 /// Human/agent-readable reference: every config block, its fields, defaults, and
-/// purpose. Printed by `scrt-evolve config-reference`.
+/// purpose. Printed by `evolve config reference`.
 pub const CONFIG_REFERENCE: &str = r#"scrt-evolve — evolve.toml CONFIG REFERENCE
 ================================================================================
 Everything scrt-evolve does is driven by an evolve.toml. Blocks are ADDITIVE:
 omit a block to get its defaults (or to disable that stage). Below: every block,
-field, default, and what it controls. (`scrt-evolve config-reference --toml`
+field, default, and what it controls. (`evolve config reference --toml`
 prints a copy-pasteable template.)
 
 [evolve]                          # core paths
@@ -34,10 +34,26 @@ prints a copy-pasteable template.)
   kinds       = ["qa","instruction","cli","tool_call"]
   per_passage = 3
   tool_format = "gemma"
+  candidates_per_seed = 1         # track 37: >1 + [judge] => rejection sampling
+                                  # (best-of-N: gen N, judge-rank, keep top-per_passage)
+  # synthesis_rate    = 0.25      # track 37: fraction of steps that run Evol expansion (nudge-settable)
   [generate.api]
     base_url    = "http://localhost:1234/v1"
     model       = "<served-model-id>"
     api_key_env = "<ENV_VAR>"     # optional; local endpoints ignore auth
+
+[judge]                           # track 37: per-pair DATA judge (pre-queue quality gate)
+  min_score = 0.5                 # keep rows scoring >= this (0.0-1.0)
+  on_error  = "keep"              # keep (fail-open, default) | drop (fail-closed; flip before P2P publish)
+  batch     = 15                  # rows per LLM judge call
+  sample_k  = 4                   # rows sampled/step for the steering-compliance metric (0 = off)
+
+[domain]                          # track 37: what the planner tunes FOR (absent => scrt defaults, byte-identical)
+  name             = "scrt"
+  description      = "the `scrt` tool ..."
+  command_prefixes = ["scrt"]     # a `cli` row must start with one of these
+  flag_patterns    = ["--mp-"]    # flag prefixes counted as signal
+  tools            = ["scrt_search","scrt_stash","scrt_list_stashes","scrt_get_stash","scrt_drop_stash","scrt_similar"]
 
 [train]                           # dataset.jsonl -> adapter
   preset = "lora"                 # lora | full | pretrain | contrastive | shard
@@ -119,12 +135,23 @@ prints a copy-pasteable template.)
     enabled = true
     pattern = "adapter-shard-*.safetensors"
 
-[runtime]                         # load + run a model for generation
-  backend      = "llamacpp"       # llamacpp (GGUF via llama-completion) | transformers (HF)
+[serve.placement]                 # TRACK 39: per-layer GPU placement for the native candle engine
+  mode       = "auto"             # auto: probe free VRAM at load and fill greedily
+                                  # manual: honor gpu_shards exactly; refuses fast on impossible maps
+  gpu_shards = [0,1,2,8,9,16]    # (manual only) explicit layer indices on GPU — interleaved OK
+                                  # the rest reside on CPU/RAM
+                                  # Replaces llama.cpp's contiguous n_gpu_layers prefix limit.
+
+[runtime]                         # DEPRECATED (track 39): load + run a model via llama.cpp sidecar
+                                  # llama.cpp keys (backend="llamacpp", llama_cpp_path, n_gpu_layers)
+                                  # are deprecated. Migrate to [serve.placement] for GPU placement;
+                                  # use `evolve model infer` (native candle) for serving.
+                                  # These keys still parse during the retirement window but warn.
+  backend      = "llamacpp"       # DEPRECATED: llamacpp | transformers (HF)
   model_path   = "<file.gguf|dir>"  # weights to serve (default: [export].out_path or [evolve].model_path)
-  llama_cpp_path = "<dir>"        # llama.cpp build (shared w/ [export] if unset)
+  llama_cpp_path = "<dir>"        # DEPRECATED: llama.cpp build (shared w/ [export] if unset)
   n_ctx        = 8192
-  n_gpu_layers = 0                # llama.cpp -ngl: 0=CPU, 99=offload all that fit
+  n_gpu_layers = 0                # DEPRECATED: use [serve.placement].gpu_shards instead
   n_threads    = 0                # 0 => engine default
   [runtime.sampling]
     temperature = 0.0             # 0 => greedy
@@ -136,6 +163,8 @@ prints a copy-pasteable template.)
   poll_interval_secs = 30          # wait this long when throttled / queue idle
   batch             = 1            # queued items folded into one microshard step
   granularity       = "module"     # track-25 microshard granularity (module | block)
+  objective         = "end_task"   # track 37: daemon learning objective (end_task = knowledge signal;
+                                   #   overrides [train.fractional].objective for daemon steps, like granularity)
   eval_cadence      = 1            # reserved; v1 eval-gates EVERY step (safe default)
   # --- gentle background (coexist with gaming / video) ---
   pause_on_gpu_process = true      # yield the GPU when ANOTHER process uses it
@@ -147,13 +176,14 @@ prints a copy-pasteable template.)
   auto_ingest       = false        # when queue runs low, re-run [ingest] to mine fresh activity
   refill_below      = 1            # pending-rows threshold that triggers auto_ingest
 
-[ingest]                          # what `daemon ingest` / `--ambient` mine into the queue
+[ingest]                          # what `evolve ambient ingest` / `--ambient` mine into the queue
   sources   = ["~/.claude/projects"]  # interaction-log dirs (empty => Claude Code projects)
   docs      = ["conductor"]        # doc dirs -> completion rows (*.md/*.txt)
   match     = ["--mp-","--effort"] # cheap substring prefilter (bounds LLM-judge cost)
   relevance = "<criterion>"        # LLM judges each candidate against this (via [generate.api])
   lane      = "raw"                # raw (passive tail) | priority (drains first)
   max       = 600                  # cap rows enqueued per ingest (0 => no cap)
+  tier      = "private"            # track 37: sovereignty tier stamped on mined rows (private | shared)
 
 [[goals]]                         # learning-by-doing goals (repeatable)
   name          = "<goal>"
@@ -164,16 +194,16 @@ prints a copy-pasteable template.)
   taste         = "<text>"        # goal-specific form, layered on [evolve].taste
 
 Umbrella commands:
-  scrt-evolve evolve --schedule --max-rounds N   # eval-gated multi-goal loop
-  scrt-evolve daemon start [--max-vram 4G]       # ambient continuous-evolution loop
-  scrt-evolve teach --prompt "..." --completion "..."  # explicit priority-lane capture
-  scrt-evolve export-gguf                         # the [export] pipeline
-  scrt-evolve run-model --prompt "..."            # the [runtime] serving lane
+  evolve train auto --schedule --max-rounds N    # eval-gated multi-goal loop
+  evolve ambient start [--max-vram 4G]           # ambient continuous-evolution loop
+  evolve ambient teach --prompt "..." --completion "..."  # explicit priority-lane capture
+  evolve train export-gguf                        # the [export] pipeline
+  evolve model run --prompt "..."                 # the [runtime] serving lane
 "#;
 
 /// Copy-pasteable commented template. Printed by `config-reference --toml`.
 pub const CONFIG_TEMPLATE: &str = r#"# evolve.toml — scrt-evolve config (generated template). Edit paths to taste.
-# Run `scrt-evolve config-reference` for the full annotated schema.
+# Run `evolve config reference` for the full annotated schema.
 
 [evolve]
 model_path  = "/path/to/hf-model"
@@ -217,17 +247,24 @@ place_dir = "/path/to/lmstudio/models/your-model"
   enabled = true
   pattern = "adapter-shard-*.safetensors"
 
-[runtime]
-backend = "llamacpp"
-n_ctx = 8192
-n_gpu_layers = 99
-  [runtime.sampling]
-  temperature = 0.0
-  max_tokens = 256
+# [runtime] is DEPRECATED for serving (track 39 — native candle engine).
+# Migrate GPU placement to [serve.placement]; use `evolve model infer` natively.
+# These keys still parse during the retirement window but emit a warning.
+# [runtime]
+# backend = "llamacpp"
+# n_ctx = 8192
+# n_gpu_layers = 99
+#   [runtime.sampling]
+#   temperature = 0.0
+#   max_tokens = 256
+
+# [serve.placement]               # track 39: native per-layer GPU placement
+# mode = "auto"                   # auto (probe VRAM) | manual (honor gpu_shards)
+# gpu_shards = [0, 1, 2, 8, 9, 16]  # manual: interleaved layer indices on GPU
 "#;
 
 /// Dataset (`dataset.jsonl`) + branch manifest/registry schema reference.
-/// Printed by `scrt-evolve dataset-reference`. These are the cross-language
+/// Printed by `evolve config dataset`. These are the cross-language
 /// (Rust writer ↔ Python reader) and cross-repo (hivemind Merge) contracts;
 /// changing a field is a breaking change.
 pub const DATASET_REFERENCE: &str = r#"scrt-evolve — DATA CONTRACTS REFERENCE

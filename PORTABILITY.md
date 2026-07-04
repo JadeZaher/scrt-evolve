@@ -29,7 +29,7 @@ One resolver, precedence high→low:
 The CLI runs `-m <module>` against the **installed** `scrt-evolve-ml`. A repo
 checkout's `python/` dir is added to `PYTHONPATH` only as a dev fallback, so you do
 NOT need the source tree once the package is installed. Verify the whole chain with
-`scrt-evolve doctor`.
+`evolve doctor`.
 
 ## OS × accelerator matrix
 
@@ -69,7 +69,7 @@ cmake -S ~/llama.cpp -B ~/llama.cpp/build && cmake --build ~/llama.cpp/build -j
 
 # 6. Bind + preflight.
 export SCRT_EVOLVE_PYTHON=~/scrt-gpu-venv/bin/python
-scrt-evolve doctor
+evolve doctor
 ```
 
 ### WSL gotchas that cost real time
@@ -100,7 +100,7 @@ scrt-evolve doctor
 The Rust CLI and `scrt-evolve-ml` version **in lockstep** (both `0.1.0` today).
 The durable interface between them is **stable, not the versions**:
 
-- the `dataset.jsonl` row schema (`scrt-evolve dataset-reference`),
+- the `dataset.jsonl` row schema (`evolve config dataset`),
 - the subprocess CLI flags the Rust side passes to each `-m scrt_evolve_*` module,
 - the final-line JSON the score/dequant modules print back.
 

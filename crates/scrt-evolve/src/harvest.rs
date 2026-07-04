@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::config::GoalConfig;
-use crate::dataset::{Dataset, GenExample};
+use crate::dataset::{Dataset, GenExample, Outcome, Tier, Verdict};
 
 /// One entry in a captured frontier transcript (the capture artifact schema).
 ///
@@ -164,7 +164,8 @@ pub fn harvest_entries(goal: &GoalConfig, entries: &[TranscriptEntry]) -> Harves
                     }
                 }
             }
-            // system / tool entries are context, not standalone training rows.
+            // Foreign extensible role strings (e.g. "system", "tool") are context,
+            // not standalone training rows.
             _ => {}
         }
     }
@@ -178,7 +179,9 @@ pub fn harvest_entries(goal: &GoalConfig, entries: &[TranscriptEntry]) -> Harves
 /// The pure harvest output: distilled rows + how many survived the filter.
 #[derive(Debug, Clone)]
 pub struct HarvestedRows {
+    /// The distilled, goal-stamped training rows.
     pub dataset: Dataset,
+    /// Number of entries that survived the goal-relevance filter.
     pub kept: usize,
 }
 
@@ -200,6 +203,11 @@ fn distill_exchange(prompt: &str, entry: &TranscriptEntry, stamp: &str) -> Optio
                 command: command.to_string(),
                 source,
                 gen: Some(stamp.to_string()),
+                outcome: Outcome::Unknown,
+                judge_score: None,
+                judge_verdict: Verdict::Unjudged,
+                tier: Tier::Private,
+                chosen_over: None,
             });
         }
     }
@@ -213,6 +221,11 @@ fn distill_exchange(prompt: &str, entry: &TranscriptEntry, stamp: &str) -> Optio
         completion: completion.to_string(),
         source,
         gen: Some(stamp.to_string()),
+        outcome: Outcome::Unknown,
+        judge_score: None,
+        judge_verdict: Verdict::Unjudged,
+        tier: Tier::Private,
+        chosen_over: None,
     })
 }
 
@@ -226,9 +239,28 @@ fn dedup_key(row: &GenExample) -> String {
         GenExample::Cli {
             prompt, command, ..
         } => format!("cli\u{1}{}\u{1}{}", prompt.trim(), command.trim()),
-        // Other variants aren't produced by distill_exchange, but key them
-        // defensively so this stays total.
-        other => format!("other\u{1}{other:?}"),
+        // These variants are not produced by distill_exchange, but are keyed
+        // explicitly so a new variant addition is a compile break, not a silent
+        // dedup collision.
+        GenExample::Instruction { instruction, output, .. } => {
+            format!("instruction\u{1}{}\u{1}{}", instruction.trim(), output.trim())
+        }
+        GenExample::Completion { text, .. } => format!("compl\u{1}{}", text.trim()),
+        GenExample::Contrastive { query, positive, .. } => {
+            format!("contrastive\u{1}{}\u{1}{}", query.trim(), positive.trim())
+        }
+        GenExample::ToolCall { tool, arguments, .. } => format!(
+            "tool\u{1}{tool}\u{1}{}",
+            serde_json::to_string(arguments).unwrap_or_default()
+        ),
+        GenExample::Skill { skill_name, invocation, .. } => {
+            format!("skill\u{1}{skill_name}\u{1}{}", invocation.trim())
+        }
+        GenExample::ReasoningEdit { prompt, final_action, .. } => format!(
+            "reasoning\u{1}{}\u{1}{}",
+            prompt.trim(),
+            final_action.trim()
+        ),
     }
 }
 

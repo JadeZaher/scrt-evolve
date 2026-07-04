@@ -126,7 +126,7 @@ scrt-evolve's **PRIMARY real-model training and inference path** is Python, driv
 
 - **`python/scrt_evolve_train/`** — standalone transformers-based LoRA trainer. Loads real HuggingFace causal-LM checkpoints (handles RoPE/GQA/BF16), attaches LoRA adapters to q_proj/v_proj, trains on the dataset.jsonl schema with prompt masking, saves `adapter.safetensors` (correct GQA output shapes). Ported from lexame hivemind-models with no `peft` dependency (hand-rolled `LoRALinear`).
 - **`python/scrt_evolve_infer/`** — standalone inference module. Loads base + optional adapter, runs A/B comparison (base vs base+adapter), supports sampling/temperature.
-- **CLI surface:** `scrt-evolve train --backend transformers` shells out to `python -m scrt_evolve_train`; `scrt-evolve infer` drives inference.
+- **CLI surface:** `evolve train fit --backend transformers` shells out to `python -m scrt_evolve_train`; `evolve model infer` drives inference.
 
 **Consistency with DESIGN.md directives:** This confirms the existing lane directive (DESIGN.md lines 55–60, "Heavy ML via PyO3→transformers (lane directive)... candle is an optional later path"). The directive was authored to defer candle ecosystem maturity and endorse Python-first heavy ML. This amendment extends the directive from the self-evolve lane (10–15) to the **core training path** (tracks 02–04).
 
@@ -384,7 +384,7 @@ instruction presets (`pretrain` = raw corpus passages; `contrastive` =
 palace structure, not generated QA) — the `train()` driver routes the right
 dataset shape to each.
 
-\* **Note (Amendment 2026-06-20):** The candle `lora` preset is primary among the **candle-based** presets; the real-model training path that works with production checkpoints (RoPE/GQA/BF16) is Python/transformers, driven via `scrt-evolve train --backend transformers` (track 19). See §Amendment 2026-06-20 for details.
+\* **Note (Amendment 2026-06-20):** The candle `lora` preset is primary among the **candle-based** presets; the real-model training path that works with production checkpoints (RoPE/GQA/BF16) is Python/transformers, driven via `evolve train fit --backend transformers` (track 19). See §Amendment 2026-06-20 for details.
 
 ## Dataset format (the generate↔train boundary)
 
@@ -466,17 +466,17 @@ the framework reads the named env var.
 
 ```bash
 # full pipeline in one shot
-scrt-evolve run --config evolve.toml
+evolve train run --config evolve.toml
 
 # or each stage independently (the composable form you described)
-scrt-evolve discover --config evolve.toml            -> work_dir/discovered.json
-scrt-evolve generate --config evolve.toml [--in discovered.json]  -> dataset.jsonl
-scrt-evolve train    --config evolve.toml [--data dataset.jsonl]  -> adapter/weights
+evolve train discover --config evolve.toml            -> work_dir/discovered.json
+evolve train generate --config evolve.toml [--in discovered.json]  -> dataset.jsonl
+evolve train fit      --config evolve.toml [--data dataset.jsonl]  -> adapter/weights
 
 # presets are selectable inline too (override config)
-scrt-evolve train --preset lora --data dataset.jsonl
-scrt-evolve train --preset contrastive   # consumes palace structure directly
-scrt-evolve generate --backend api       # override the configured backend
+evolve train fit --preset lora --data dataset.jsonl
+evolve train fit --preset contrastive   # consumes palace structure directly
+evolve train generate --backend api     # override the configured backend
 ```
 
 Each stage reads/writes the work-dir artifacts, so you can stop, inspect,

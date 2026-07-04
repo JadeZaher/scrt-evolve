@@ -32,7 +32,7 @@ keywords = ["llm", "lora", "finetuning", "gguf", "quantization", "transformers"]
 # Core deps shared by all paths. torch is deliberately NOT here — its build flavor
 # (CPU vs CUDA) is platform-specific, so it lives in the [cpu]/[cuda] extras.
 dependencies = [
-    "transformers>=4.40",
+    "transformers>=4.40,<5.0",
     "safetensors>=0.4",
     "numpy>=1.24",
 ]

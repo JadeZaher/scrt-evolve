@@ -1,6 +1,6 @@
 //! Point-at-a-project resolution.
 //!
-//! `scrt-evolve evolve <project-dir>` should "just work": take a directory,
+//! `evolve train auto <project-dir>` should "just work": take a directory,
 //! auto-detect an initialized mpg/scrt mind-palace inside it, and build an
 //! [`EvolveConfig`] whose corpus is the project and whose palace is the
 //! detected one — no hand-configuration. This is the project-aware entry point

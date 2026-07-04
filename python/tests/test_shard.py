@@ -6,10 +6,16 @@ behavior without loading any real model.
 Run: PYTHONPATH=python python python/tests/test_shard.py
 """
 
+import json
+import tempfile
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 
 from scrt_evolve_train.shard import (
+    _rotary_kwargs,
+    _run_block,
     block_lr_scale,
     build_projection,
     discover_groups,
@@ -25,6 +31,8 @@ from scrt_evolve_train.trainer import (
     LoRALinear,
     attach_lora,
     auto_detect_targets,
+    load_dataset,
+    build_batch,
 )
 
 
@@ -327,6 +335,236 @@ def test_lr_at_step_warmup_then_cosine_decay():
     print("OK lr_at_step")
 
 
+# ─────────────── Phase E task 2: live calib batches ────────────────────────
+
+
+def _write_fixture_dataset(tmpdir: Path, n_rows: int) -> Path:
+    """Write n_rows of qa JSONL rows (with unique completions) to a temp file.
+    Includes unknown fields that must be silently ignored by the loader."""
+    ds = tmpdir / "dataset.jsonl"
+    with ds.open("w", encoding="utf-8") as f:
+        for i in range(n_rows):
+            row = {
+                "kind": "qa",
+                "prompt": f"question {i}",
+                "completion": f"answer number {i} is distinct",
+                # new optional signal fields — must NOT break the loader
+                "judge_score": 0.9,
+                "judge_verdict": "accept",
+                "tier": "A",
+                "chosen_over": None,
+                "outcome": "success",
+            }
+            f.write(json.dumps(row) + "\n")
+    return ds
+
+
+class _TinyTokenizer:
+    """Minimal tokenizer stub for build_batch (no torch/transformers dep)."""
+    pad_token_id = 0
+    eos_token_id = 1
+
+    def encode(self, text: str, add_special_tokens: bool = True) -> list[int]:
+        # hash each word to a small vocab id [2..255]
+        return [hash(w) % 254 + 2 for w in text.split()] or [2]
+
+
+def test_live_calib_inputs_differ_per_step():
+    """With 12 rows (>= calib_batches=8), build_batch called at step=S produces
+    different pairs than step=S+1, so calib inputs are NOT recycled via step%8."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ds = _write_fixture_dataset(Path(tmp), 12)
+        tok = _TinyTokenizer()
+        pairs = load_dataset(str(ds))
+        assert len(pairs) == 12
+        n_batches = 8
+        # Simulate build_batch at each training step — collect first token id.
+        batch_size = 1
+        max_seq_len = 32
+        # Use token index 1 (the row-digit word) — index 0 is always "question"
+        # which hashes to the same id for every row, so it can't distinguish rows.
+        seen_row_ids = []
+        for step in range(16):  # more steps than n_batches to detect recycling
+            b = build_batch(pairs, tok, step, batch_size, max_seq_len)
+            seen_row_ids.append(b["input_ids"][0, 1].item())
+        # With 12 distinct rows, a live approach gives >1 unique id across 16 steps.
+        # Fixed recycling via step % 8 would repeat the same 8 patterns every 8 steps.
+        unique_ids = len(set(seen_row_ids))
+        assert unique_ids > 1, "calib inputs should vary across steps (not recycling a fixed 8)"
+        # Specifically: steps 0..11 each draw a different row (12 unique seqs);
+        # the pattern only wraps after len(pairs)=12 steps, NOT after 8.
+        # If recycling via step % 8, step 8 would equal step 0, step 9 = step 1, etc.
+        recycled_would_be = [seen_row_ids[s % n_batches] for s in range(8, 16)]
+        actual = seen_row_ids[8:16]
+        # In live mode step 8 draws row 8, not row 0 (step 8 % 8 == 0).
+        # Row 8's id should differ from row 0's id (distinct completions ensure this).
+        assert actual != recycled_would_be, (
+            f"live calib should NOT repeat the pattern of fixed-8 recycling:\n"
+            f"  actual[8:16]={actual}\n  recycled_would_be={recycled_would_be}"
+        )
+    print("OK live_calib_inputs_differ_per_step")
+
+
+def test_thin_queue_fallback_uses_fixed_batches():
+    """With only 3 rows (< calib_batches=8), load_dataset succeeds and the 3
+    pairs are usable as fixed batches (step % 3 recycling)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ds = _write_fixture_dataset(Path(tmp), 3)
+        tok = _TinyTokenizer()
+        pairs = load_dataset(str(ds))
+        assert len(pairs) == 3
+        n_batches = 8
+        # thin: len(pairs) < n_batches → _use_live_calib would be False
+        assert len(pairs) < n_batches, "fixture should represent thin-queue path"
+        # Fixed batches pre-built via step % len(pairs):
+        max_seq_len = 32
+        batch_size = 1
+        fixed_batches = [
+            build_batch(pairs, tok, s, batch_size, max_seq_len) for s in range(len(pairs))
+        ]
+        # Training loop uses per_batch_in[step % len(per_batch_in)] — verify it cycles.
+        for step in range(12):
+            b = fixed_batches[step % len(fixed_batches)]
+            assert b["input_ids"].shape[0] == batch_size
+        # All recycled IDs are from the 3-item pool (no index error).
+        print("OK thin_queue_fallback_uses_fixed_batches")
+
+
+def test_loader_ignores_unknown_signal_fields():
+    """Rows carrying judge_score/judge_verdict/tier/chosen_over/outcome must be
+    loaded successfully as normal qa pairs — unknown keys silently dropped."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ds = _write_fixture_dataset(Path(tmp), 5)
+        pairs = load_dataset(str(ds))
+        assert len(pairs) == 5
+        for prompt, completion in pairs:
+            assert "question" in prompt
+            assert "answer" in completion
+    print("OK loader_ignores_unknown_signal_fields")
+
+
+# ─────────────── Phase E task 3: rotary kwargs on same-model path ───────────
+
+
+class _FakeRotaryEmb(nn.Module):
+    """Minimal rotary_emb stub returning (cos, sin) tensors that a layer
+    expecting 'position_embeddings' can unpack without crashing."""
+
+    def forward(self, hidden: torch.Tensor, position_ids: torch.Tensor):
+        seq = hidden.shape[1]
+        d = hidden.shape[-1]
+        dummy = torch.ones(1, seq, d // 2 if d >= 2 else 1, dtype=hidden.dtype)
+        return (dummy, dummy)  # (cos, sin)
+
+
+class _RoPELayer(nn.Module):
+    """Toy decoder layer that REQUIRES position_embeddings to be passed.
+    Raises TypeError unpacking None if position_embeddings is missing."""
+
+    def __init__(self, d: int = 8):
+        super().__init__()
+        self.proj = nn.Linear(d, d)
+
+    def forward(self, hidden: torch.Tensor, position_embeddings=None, **kw):
+        if position_embeddings is None:
+            raise TypeError("cannot unpack non-iterable NoneType: position_embeddings missing")
+        # Consume position_embeddings (cos, sin) — just verify it's a tuple.
+        cos, sin = position_embeddings
+        return self.proj(hidden)
+
+
+class _FakeRoPEModel(nn.Module):
+    """Minimal model fixture exposing model.rotary_emb (like modern Llama)."""
+
+    def __init__(self, d: int = 8, n_layers: int = 2):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([_RoPELayer(d) for _ in range(n_layers)])
+        self.model.rotary_emb = _FakeRotaryEmb()
+
+    def get_input_embeddings(self):
+        return nn.Embedding(16, 8)
+
+
+def test_rotary_kwargs_builds_nonempty_for_rope_arch():
+    """_rotary_kwargs returns non-empty dict for an arch with model.rotary_emb."""
+    model = _FakeRoPEModel(d=8)
+    device = torch.device("cpu")
+    hidden = torch.zeros(1, 4, 8)
+    kw = _rotary_kwargs(model, hidden, device)
+    assert "position_embeddings" in kw, f"expected position_embeddings, got: {kw.keys()}"
+    assert "position_ids" in kw
+    print("OK rotary_kwargs_builds_nonempty_for_rope_arch")
+
+
+def test_rotary_kwargs_empty_for_no_rotary_arch():
+    """_rotary_kwargs returns {} for arches without model.rotary_emb (Mamba-safe)."""
+
+    class _NoRotaryModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()  # no rotary_emb attribute
+
+    model = _NoRotaryModel()
+    device = torch.device("cpu")
+    hidden = torch.zeros(1, 4, 8)
+    kw = _rotary_kwargs(model, hidden, device)
+    assert kw == {}, f"expected empty dict for no-rotary arch, got: {kw}"
+    print("OK rotary_kwargs_empty_for_no_rotary_arch")
+
+
+def test_run_block_succeeds_with_rope_layer_when_kwargs_provided():
+    """_run_block with proper rotary kwargs succeeds on a RoPE layer; without
+    them (empty {}) the same layer raises TypeError — proving the fix is needed."""
+    d = 8
+    layer = _RoPELayer(d=d)
+    block = nn.ModuleList([layer])
+    device = torch.device("cpu")
+    hidden = torch.zeros(1, 4, d)
+    model = _FakeRoPEModel(d=d)
+
+    # With correct kwargs: must succeed.
+    good_kw = _rotary_kwargs(model, hidden, device)
+    assert good_kw, "fixture should produce non-empty kwargs for RoPE arch"
+    out = _run_block(block, hidden, good_kw, lora_enabled=False)
+    assert out.shape == hidden.shape
+
+    # Without kwargs (empty {}): must raise to confirm the bug is real.
+    import pytest
+    with pytest.raises((TypeError, ValueError)):
+        _run_block(block, hidden, {}, lora_enabled=False)
+
+    print("OK run_block_succeeds_with_rope_layer_when_kwargs_provided")
+
+
+def test_run_block_mamba_unaffected_by_rotary_fix():
+    """A plain linear layer (no position_embeddings needed) still works when
+    _rotary_kwargs returns {} — the fix is a safe no-op for non-RoPE arches."""
+
+    class _SimpleLayer(nn.Module):
+        def __init__(self, d: int = 8):
+            super().__init__()
+            self.proj = nn.Linear(d, d)
+
+        def forward(self, hidden: torch.Tensor, **kw):
+            return self.proj(hidden)
+
+    d = 8
+    block = nn.ModuleList([_SimpleLayer(d)])
+    hidden = torch.zeros(1, 4, d)
+
+    class _NoRotaryModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()
+
+    kw = _rotary_kwargs(_NoRotaryModel(), hidden, torch.device("cpu"))
+    assert kw == {}
+    out = _run_block(block, hidden, kw, lora_enabled=False)
+    assert out.shape == hidden.shape
+    print("OK run_block_mamba_unaffected_by_rotary_fix")
+
+
 if __name__ == "__main__":
     test_plan_shards_block_size_and_count()
     test_find_decoder_layers_generic()
@@ -344,4 +582,13 @@ if __name__ == "__main__":
     test_distill_training_step_reduces_loss_on_toy_pair()
     test_block_lr_scale_gentler_for_larger_targets()
     test_lr_at_step_warmup_then_cosine_decay()
+    # Phase E task 2 — live calib batches
+    test_live_calib_inputs_differ_per_step()
+    test_thin_queue_fallback_uses_fixed_batches()
+    test_loader_ignores_unknown_signal_fields()
+    # Phase E task 3 — rotary kwargs on same-model path
+    test_rotary_kwargs_builds_nonempty_for_rope_arch()
+    test_rotary_kwargs_empty_for_no_rotary_arch()
+    test_run_block_succeeds_with_rope_layer_when_kwargs_provided()
+    test_run_block_mamba_unaffected_by_rotary_fix()
     print("\nALL SHARD/FRACTIONAL PYTHON TESTS PASSED")

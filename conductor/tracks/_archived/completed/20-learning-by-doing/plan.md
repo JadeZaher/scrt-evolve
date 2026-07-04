@@ -69,7 +69,7 @@ eval-gated round + scheduler depend on the lane (tracks 10, 15) existing.
    stop-condition, resumable. DONE: `rounds::run_schedule` (bounded by
    `max_rounds`, halts on catastrophe, `start_ordinal` resume). Tests:
    `schedule_is_bounded_and_round_robins_two_goals`, `weighted_schedule_favors_heavier_goal`.
-10. [x] `scrt-evolve evolve --schedule` CLI: runs the bounded eval-gated schedule;
+10. [x] `evolve train auto --schedule` CLI: runs the bounded eval-gated schedule;
     weight changes go THROUGH the track-15 txn. DONE: `cmd_evolve_schedule` wires
     production hooks (discover/generate from SDK; train/score as Python
     subprocesses) into `run_schedule`. `--goals` (buildable, no gate) retained.

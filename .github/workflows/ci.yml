@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ── Lint (fmt + clippy, default features only) ────────────────────────
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy (default features)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  # ── Build + test across all three feature configurations ──────────────
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            build: cargo build --workspace --locked
+            test: cargo test --workspace --locked
+            python: false
+
+          - name: train
+            build: cargo build -p scrt-evolve --features train --locked
+            test: cargo test -p scrt-evolve --features train --locked
+            python: false
+
+          # pyo3 is build-only: the workspace enables pyo3's `extension-module`,
+          # which deliberately omits libpython linkage on Linux (symbols resolve
+          # at dlopen), so TEST executables cannot link (pyo3 FAQ). No tests are
+          # pyo3-gated, so build coverage is the meaningful check.
+          - name: pyo3
+            build: cargo build -p scrt-evolve --features pyo3 --locked
+            test: echo "pyo3 leg is build-only (extension-module cannot link test executables on Linux)"
+            python: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up Python (pyo3 only)
+        if: matrix.python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build (${{ matrix.name }})
+        run: ${{ matrix.build }}
+
+      - name: Test (${{ matrix.name }})
+        run: ${{ matrix.test }}

@@ -42,7 +42,7 @@ No ML.
     doesn't re-mine one topic.
   - cap by `max_passages` (and/or a token budget).
 - Reads palace via `scrt_core::palace::FilePalace` / `palace::ops`.
-- `discover::run(&cfg) -> DiscoveredContext` (SDK) + `scrt-evolve discover`
+- `discover::run(&cfg) -> DiscoveredContext` (SDK) + `evolve train discover`
   (CLI) writing `discovered.json`.
 
 ## Constraints

@@ -227,9 +227,9 @@ addressed with code + tests, ML-free, the track-15 transaction untouched:
 (`ingest_ledger.rs` + `queue/ingested.ledger`) so re-mined-but-identical rows
 don't retrain, with idle-on-nothing-new (the top correctness risk — stale-data
 recycling); **Q2** transient-vs-catastrophe **retries** + supervisor cap +
-`daemon health` + per-source `gen` stamps; **Q3** wall-clock training budget
+`watch health` + per-source `gen` stamps; **Q3** wall-clock training budget
 (`[daemon].max_minutes_per_hour`); **Q4** probe-correctness **trend**
-(`trend.rs`) in `daemon status/health/trend`. Live-verified against the running
+(`trend.rs`) in `watch status/health/trend`. Live-verified against the running
 work dir.
 
 **Diverged.** Nothing of substance — this lane was scoped *from* the live run's

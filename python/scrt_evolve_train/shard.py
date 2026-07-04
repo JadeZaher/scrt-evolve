@@ -220,6 +220,10 @@ def train_sharded(args: Any) -> None:
         build_batch(pairs, tokenizer, step, args.batch_size, args.max_seq_len)
         for step in range(n_batches)
     ]
+    # Live calib: when the dataset is large enough, draw fresh inputs each step
+    # rather than recycling the same n_batches fixed tensors via step % len.
+    # Falls back to the fixed batches when fewer than n_batches pairs are present.
+    _use_live_calib = len(pairs) >= n_batches
 
     # Optional shard selection (train one shard per process for true
     # decentralization). --shard-index N trains only shard N.
@@ -231,9 +235,13 @@ def train_sharded(args: Any) -> None:
         selected = [(only, shards[only])]
         print(f"INFO[shard]: training ONLY shard {only} = layers {shards[only]}", file=sys.stderr)
 
-    # Layer kwargs: decoder layers need at least position info on some arches.
-    # We keep it minimal/generic — most HF layers accept just hidden_states.
-    layer_kwargs: dict[str, Any] = {}
+    # Layer kwargs: build rotary position embeddings for RoPE arches; returns {}
+    # for Mamba/other arches that don't expose model.rotary_emb (safe no-op).
+    # Re-computed once here with a dummy tensor sized to max_seq_len; the same
+    # positions are reused across calib steps (all sequences share [0..seq-1]).
+    _dummy_hidden = torch.zeros(1, args.max_seq_len, model.config.hidden_size,
+                                device=device, dtype=dtype)
+    layer_kwargs: dict[str, Any] = _rotary_kwargs(model, _dummy_hidden, device)
 
     out_dir = Path(args.out) if args.out else Path(args.dataset).parent / "adapter"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -324,7 +332,16 @@ def train_sharded(args: Any) -> None:
             first_loss = None
             last_loss = 0.0
             for step in range(args.steps):
-                in_k = per_batch_in[step % len(per_batch_in)].to(device).to(dtype)
+                # Live calib: build a fresh input from the dataset each step when
+                # the pool is large enough; fall back to recycled fixed batches.
+                if _use_live_calib:
+                    _batch = build_batch(pairs, tokenizer, step, args.batch_size, args.max_seq_len)
+                    with torch.no_grad():
+                        _emb = embed(_batch["input_ids"].to(device)).to(dtype)
+                    _caps = capture_boundaries(model, layers, [a], _emb, device, layer_kwargs)
+                    in_k = _caps[a].to(device).to(dtype)
+                else:
+                    in_k = per_batch_in[step % len(per_batch_in)].to(device).to(dtype)
 
                 # Teacher: frozen block (LoRA delta off) — adapters disabled.
                 with torch.no_grad():
@@ -366,6 +383,23 @@ def train_sharded(args: Any) -> None:
             "final_loss": round(last_loss, 6),
             "peak_vram_gb": peak,
         })
+
+    # Refresh the FLAT single-file adapter (adapter.safetensors + adapter_config
+    # .json) from every shard present in out_dir. The eval scorer + infer path
+    # (apply_adapter) read the flat layout, not the per-shard files; without this
+    # the ambient daemon's eval step fails ("adapter_config.json not found") on
+    # every fractional step and rolls back. Merging here means the flat adapter
+    # always reflects ALL blocks trained so far (this run's shard + any earlier
+    # daemon steps' shards that persist in out_dir), so it compounds across steps.
+    # Best-effort: a merge hiccup must not fail a successful training run.
+    try:
+        from scrt_evolve_gguf.merge_shards import merge_shard_adapters
+        ms = merge_shard_adapters(out_dir)
+        print(f"INFO[shard]: merged flat adapter ← {ms.get('n_shards')} shard(s), "
+              f"{ms.get('n_tensors')} tensors", file=sys.stderr)
+    except Exception as e:  # noqa: BLE001 — never let merge sink a good train run
+        print(f"WARN[shard]: flat-adapter merge failed ({e!r}); eval may not find "
+              f"adapter.safetensors", file=sys.stderr)
 
     summary = {
         "mode": "sharded",
@@ -1129,6 +1163,17 @@ def train_distill(args: Any) -> None:
 
     if phase in ("train", "both"):
         summary = _distill_train(args, cache_dir)
+        # Same flat-adapter refresh as train_sharded: the cross-model distill path
+        # also emits per-shard files, and eval/infer read the flat layout. Merge so
+        # the daemon's eval step can load the adapter. Best-effort.
+        try:
+            from scrt_evolve_gguf.merge_shards import merge_shard_adapters
+            out_dir = Path(summary["out"]) if summary.get("out") else Path(args.out)
+            ms = merge_shard_adapters(out_dir)
+            print(f"INFO[distill]: merged flat adapter ← {ms.get('n_shards')} shard(s), "
+                  f"{ms.get('n_tensors')} tensors", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001
+            print(f"WARN[distill]: flat-adapter merge failed ({e!r})", file=sys.stderr)
         print(json.dumps(summary))
     elif phase == "capture":
         print(json.dumps({"mode": "distill", "phase": "capture", "cache": str(cache_dir.resolve())}))

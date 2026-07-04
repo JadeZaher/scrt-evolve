@@ -18,6 +18,7 @@
 //! ML is opt-in behind the `train` feature (candle); the Python bridge is
 //! opt-in behind `pyo3`. A default build pulls neither.
 
+pub mod arbitration;
 pub mod branch;
 pub mod config;
 pub mod daemon;
@@ -32,14 +33,17 @@ pub mod harvest;
 pub mod ingest;
 pub mod ingest_ledger;
 pub mod interview;
+pub mod judge;
 pub mod living_queue;
 pub mod model;
 pub mod model_store;
+pub mod nudge;
 pub mod plan;
 pub mod project;
 pub mod regulate;
 pub mod rounds;
 pub mod scaffold;
+pub mod serve;
 pub mod toolspec;
 pub mod train;
 pub mod trend;
@@ -50,6 +54,9 @@ pub mod workdir;
 #[cfg(feature = "pyo3")]
 pub mod bridge;
 
+pub use arbitration::{
+    append_served_ready, read_served_ready, select_mode, Mode, ServedReady,
+};
 pub use branch::{
     BranchManifest, BranchRef, BranchRegistry, BranchRouter, Lineage, LocalBranchRouter,
     RouterSignature,
@@ -57,13 +64,13 @@ pub use branch::{
 pub use config::{
     BranchConfig, BranchEnsembleConfig, BranchRouterConfig, BranchServeConfig, ExportConfig,
     FractionalConfig, HardwareConfig, MergeShardsConfig, RegulateConfig, RuntimeConfig,
-    SamplingConfig,
+    SamplingConfig, ServeConfig, ServeMode,
 };
 pub use config::{
     ConfigError, DaemonConfig, EvalConfig, EvolveConfig, GoalConfig, IngestConfig, StoreConfig,
 };
 pub use daemon::{run_daemon, DaemonHooks, DaemonOptions, DaemonReport, DaemonStep};
-pub use dataset::{Dataset, GenExample};
+pub use dataset::{Dataset, GenExample, Outcome, Tier, Verdict};
 pub use directive::TrainingDirective;
 pub use discover::DiscoveredContext;
 pub use eval::{ProbeSet, ScoreReport, StepVerdict};
@@ -71,11 +78,16 @@ pub use export::{export_llamacpp, ExportReport, ToolFormat};
 pub use goals::{GoalRun, GoalsReport};
 pub use harvest::{capture_and_harvest, HarvestResult, TranscriptEntry};
 pub use ingest::{
-    doc_completion_rows, filter_relevant, interaction_log_rows, LlmRelevanceJudge, RelevanceJudge,
-    INGEST_GEN_STAMP,
+    append_rejected, doc_completion_rows, filter_outcomes, filter_relevant, interaction_log_rows,
+    LlmRelevanceJudge, OutcomeFilter, RelevanceJudge, INGEST_GEN_STAMP, REJECTED_SIDECAR,
 };
 pub use ingest_ledger::{content_hash, FilterOutcome, IngestLedger};
+pub use judge::{
+    dataset_signal_stats, dataset_tier, expand_dataset, judge_rows, rejection_sample, JudgedRows,
+    LlmPairJudge, OnError, PairJudge,
+};
 pub use living_queue::{Lane, LivingQueue, QueuedItem};
+pub use nudge::{apply_nudge, take_nudge, write_nudge, Nudge, NudgeOutcome};
 pub use model_store::{ModelStore, ModelVersion, ResolvedVersion, StoreManifest};
 pub use regulate::{
     CheckpointStore, EvolutionLogEntry, Quarantine, Regulator, StepAction, TxnOutcome,
@@ -83,7 +95,9 @@ pub use regulate::{
 pub use rounds::{
     run_round, run_schedule, RoundHooks, RoundReport, SchedulePolicy, ScheduleReport,
 };
-pub use trend::{from_log as trend_from_log, TrendPoint, TrendSummary};
+pub use trend::{
+    from_log as trend_from_log, steering_compliance_from_log, TrendPoint, TrendSummary,
+};
 
 use std::path::PathBuf;
 

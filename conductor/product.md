@@ -55,7 +55,7 @@ clean and uniform. The cross-language contracts (`dataset.jsonl`,
 **Ambient / DevEx (unattended evolution).** The ambient daemon is the
 hands-off mode of the same product: `scrt-evolve --ambient --dir <project>`
 trains an expert on a project's living corpus, eval-gated every step through the
-track-15 transaction, managed by `daemon status/stop/health/trend`. Hardening
+track-15 transaction, managed by `watch status`/`ambient stop`/`watch health`/`watch trend`. Hardening
 (track 31) made it production-robust — judge-model preflight, a content-hash
 dedup ledger that idles instead of recycling stale data, transient-vs-catastrophe
 retries with a supervisor cap, and a wall-clock training budget — so it can run

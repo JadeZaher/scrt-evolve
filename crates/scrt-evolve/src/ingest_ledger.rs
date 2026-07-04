@@ -18,6 +18,8 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use crate::dataset::GenExample;
+#[cfg(test)]
+use crate::dataset::{Outcome, Tier, Verdict};
 
 /// File name under `work_dir/queue/` holding one content-hash per line.
 const LEDGER_FILE: &str = "ingested.ledger";
@@ -188,6 +190,11 @@ mod tests {
             command: cmd.into(),
             source: Some("transcript".into()),
             gen: Some("ingest".into()),
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         }
     }
 
@@ -225,9 +232,31 @@ mod tests {
             command: "scrt --mp-stash x".into(),
             source: Some("other-file".into()),
             gen: Some("ingest:doc".into()),
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         };
         let out = led.filter_new(vec![other]).unwrap();
         assert_eq!(out.new.len(), 0, "same content, different provenance → dup");
+        assert_eq!(out.skipped, 1);
+    }
+
+    #[test]
+    fn v1_1_meta_does_not_change_hash() {
+        // Track 37: a re-mined identical interaction that now carries a parsed
+        // outcome/tier/judge stamp must still hash as a DUPLICATE — the ledger
+        // keys on content, not metadata.
+        let dir = tmp("meta");
+        let mut led = IngestLedger::open(&dir).unwrap();
+        led.filter_new(vec![cli("scrt --mp-stash x")]).unwrap();
+        let mut stamped = cli("scrt --mp-stash x");
+        stamped.set_outcome(Outcome::Success);
+        stamped.set_tier(Tier::Shared);
+        stamped.set_judge(0.9, Verdict::Keep);
+        let out = led.filter_new(vec![stamped]).unwrap();
+        assert_eq!(out.new.len(), 0, "meta stamp must not change the hash");
         assert_eq!(out.skipped, 1);
     }
 

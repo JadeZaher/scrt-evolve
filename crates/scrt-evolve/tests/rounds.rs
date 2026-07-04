@@ -6,7 +6,7 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 
-use scrt_evolve::dataset::{Dataset, GenExample};
+use scrt_evolve::dataset::{Dataset, GenExample, Outcome, Tier, Verdict};
 use scrt_evolve::discover::{DiscoveredContext, Passage};
 use scrt_evolve::eval::ScoreReport;
 use scrt_evolve::regulate::StepAction;
@@ -62,6 +62,11 @@ fn dataset_with(n: usize, gen_stamp: &str) -> Dataset {
             command: format!("scrt \"q{i}\" --mp-stash s{i}"),
             source: Some("g".to_string()),
             gen: Some(gen_stamp.to_string()),
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         })
         .collect();
     Dataset::new(rows)

@@ -25,7 +25,7 @@ resource: ./metadata.json
    round-robin sample across clusters for topic spread). -- evidence: discover.rs:285-328 `cluster_round_robin`
 7. [x] Apply `max_passages` (+ optional token budget) cap. -- evidence: `max_passages_is_honored` test, discover.rs:124
 8. [x] `discover::run(&cfg) -> DiscoveredContext` SDK entry. -- evidence: `discovers_passages_with_provenance` test, discover.rs:56-127
-9. [x] `scrt-evolve discover --config evolve.toml` writes
+9. [x] `evolve train discover --config evolve.toml` writes
    `work_dir/discovered.json`; round-trips back. -- evidence: `discovered_context_round_trips_json` test, main.rs:140-143, 202-215
 10. [ ] Build a small fixture palace + corpus under `tests/fixtures/`. -- (carry-forward: not yet present; tests use temp directories instead)
 11. [x] Final sweep: `cargo test` (default, ML-free), `cargo clippy`. -- evidence: all 5 discover tests pass, 51-test suite green, clippy clean

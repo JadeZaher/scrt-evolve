@@ -1,0 +1,8 @@
+{
+  "id": "39-native-inference",
+  "type": "feature",
+  "status": "planned",
+  "description": "Native candle inference as the ONLY serving path (llama.cpp sidecar retired after per-family parity gates; GGUF stays export-only). Model-generic via an ArchAdapter layer-enumeration seam (branch-from-any-base invariant: trainable => servable or refused at preflight). Arbitrary interleaved gpu_shards placement, in-process adapter hot-reload at keep-commit, per-arch seam_points() as the structural/instrumentation fundamental. Granite Mamba2 ops implemented in-runtime (Phase B) rather than falling back.",
+  "created_at": "2026-07-03T00:00:00Z",
+  "updated_at": "2026-07-03T00:00:00Z"
+}

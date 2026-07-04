@@ -2,10 +2,12 @@
 //! judging. Design rationale: see `src/AGENTS.md` (§`ingest.rs`).
 
 use std::collections::BTreeSet;
+use std::io::Write;
+use std::path::Path;
 
 use serde_json::Value;
 
-use crate::dataset::GenExample;
+use crate::dataset::{GenExample, Outcome, Tier, Verdict};
 use crate::generate::api::{ChatMessage, ChatTransport};
 
 /// Provenance stamp prefix for ingested rows (the quarantine key root). Kept for
@@ -20,16 +22,28 @@ pub const INGEST_GEN_DOC: &str = "ingest:doc";
 
 /// Cap on a fallback intent prompt taken from a (possibly huge) user message.
 const MAX_FALLBACK_PROMPT: usize = 400;
-/// Drop a command / tool-args / answer longer than this (heredocs, pasted files).
+/// Drop an `unknown`-outcome command / tool-args / answer longer than this
+/// (heredocs, pasted files). Outcome-verified successes get a larger cap
+/// ([`MAX_ROW_CHARS_VERIFIED`]) — long successful interactions are the
+/// info-dense ones the old flat cap discarded (track 37 finding 3).
 const MAX_ROW_CHARS: usize = 2000;
+/// Larger cap for `outcome = success` rows — a verified success is worth keeping
+/// even when long.
+const MAX_ROW_CHARS_VERIFIED: usize = 8000;
 
 /// Parse one Claude Code interaction log (native JSONL) into mixed candidate rows
-/// (`Bash`→`Cli`, other tool→`ToolCall`, prose turn→`Qa`). Pure; no relevance
-/// filtering (that's [`RelevanceJudge`]). See `src/AGENTS.md` §`ingest.rs`.
+/// (`Bash`→`Cli`, other tool→`ToolCall`, prose turn→`Qa`), stamping each mined
+/// tool row with its execution [`Outcome`] by correlating `tool_use.id` → the
+/// following `tool_result` block. Pure; no relevance filtering (that's
+/// [`RelevanceJudge`]) and no retry-collapse (that's [`ingest_outcomes`]). All
+/// rows default to `tier = Private`; see `src/AGENTS.md` §`ingest.rs`.
 pub fn interaction_log_rows(jsonl: &str) -> Vec<GenExample> {
     let mut rows = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut last_user: Option<String> = None;
+    // tool_use.id → index into `rows`, for outcome stamping when the next user
+    // turn carries the matching tool_result.
+    let mut pending: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
     for line in jsonl.lines() {
         let line = line.trim();
@@ -41,6 +55,9 @@ pub fn interaction_log_rows(jsonl: &str) -> Vec<GenExample> {
         };
         match v.get("type").and_then(Value::as_str) {
             Some("user") => {
+                // A user turn may carry tool_result blocks (the outcome of the
+                // prior assistant tool_use) AND/OR human text.
+                stamp_tool_results(&v, &pending, &mut rows);
                 if let Some(text) = user_text(&v) {
                     last_user = Some(text);
                 }
@@ -61,7 +78,12 @@ pub fn interaction_log_rows(jsonl: &str) -> Vec<GenExample> {
                         Some("tool_use") => {
                             had_tool = true;
                             if let Some(row) = tool_use_row(blk, last_user.as_deref()) {
-                                push_unique(&mut rows, &mut seen, row);
+                                let id = blk.get("id").and_then(Value::as_str).map(str::to_string);
+                                if let Some(idx) = push_unique(&mut rows, &mut seen, row) {
+                                    if let Some(id) = id {
+                                        pending.insert(id, idx);
+                                    }
+                                }
                             }
                         }
                         Some("text") => {
@@ -72,6 +94,7 @@ pub fn interaction_log_rows(jsonl: &str) -> Vec<GenExample> {
                                 prose.push_str(t);
                             }
                         }
+                        // Foreign extensible string values (e.g. "thinking", future block types).
                         _ => {}
                     }
                 }
@@ -89,16 +112,252 @@ pub fn interaction_log_rows(jsonl: &str) -> Vec<GenExample> {
                                     completion: prose.to_string(),
                                     source: Some("transcript".to_string()),
                                     gen: Some(INGEST_GEN_TRANSCRIPT.to_string()),
+                                    outcome: Outcome::Unknown,
+                                    judge_score: None,
+                                    judge_verdict: Verdict::Unjudged,
+                                    tier: Tier::Private,
+                                    chosen_over: None,
                                 },
                             );
                         }
                     }
                 }
             }
+            // Foreign extensible log entry types (e.g. "queue-operation", "system").
             _ => {}
         }
     }
     rows
+}
+
+/// Stamp `outcome` on the mined rows whose `tool_use.id` matches a `tool_result`
+/// block in this user turn. Reads `is_error` (the primary signal) plus a text
+/// heuristic for Bash results that report failure without the flag.
+fn stamp_tool_results(
+    user_entry: &Value,
+    pending: &std::collections::HashMap<String, usize>,
+    rows: &mut [GenExample],
+) {
+    let Some(content) = user_entry
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    for blk in content {
+        if blk.get("type").and_then(Value::as_str) != Some("tool_result") {
+            continue;
+        }
+        let Some(id) = blk.get("tool_use_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(&idx) = pending.get(id) else {
+            continue;
+        };
+        let outcome = tool_result_outcome(blk);
+        if let Some(row) = rows.get_mut(idx) {
+            row.set_outcome(outcome);
+        }
+    }
+}
+
+/// Derive an [`Outcome`] from one `tool_result` block. `is_error:true` ⇒
+/// `Failure`; otherwise a conservative text scan for failure markers (non-zero
+/// exit, `error:`/`fatal:`), else `Success`. Errs toward `Unknown` only when the
+/// block carries no usable signal.
+fn tool_result_outcome(blk: &Value) -> Outcome {
+    if let Some(is_err) = blk.get("is_error").and_then(Value::as_bool) {
+        return if is_err {
+            Outcome::Failure
+        } else {
+            Outcome::Success
+        };
+    }
+    let text = tool_result_text(blk);
+    if text.is_empty() {
+        return Outcome::Unknown;
+    }
+    let low = text.to_ascii_lowercase();
+    // Bash results without an explicit flag: look for common failure markers.
+    const FAIL_MARKERS: &[&str] = &[
+        "command not found",
+        "no such file",
+        "fatal:",
+        "error:",
+        "traceback (most recent call last)",
+        "permission denied",
+        "exit code 1",
+        "exit status 1",
+    ];
+    if FAIL_MARKERS.iter().any(|m| low.contains(m)) {
+        Outcome::Failure
+    } else {
+        Outcome::Success
+    }
+}
+
+/// Extract the text payload from a `tool_result` block (string or content-array).
+fn tool_result_text(blk: &Value) -> String {
+    match blk.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|it| it.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        // Foreign serde_json::Value variants (Null, Bool, Number, Object) or None
+        // carry no extractable text.
+        _ => String::new(),
+    }
+}
+
+/// The result of applying outcome-based filtering to a parsed log: `kept` rows
+/// are training-worthy; `rejected` rows (bare failures) are excluded from
+/// training but preserved for the audit sidecar (`rejected.jsonl`).
+#[derive(Debug, Default)]
+pub struct OutcomeFilter {
+    pub kept: Vec<GenExample>,
+    pub rejected: Vec<GenExample>,
+}
+
+/// Apply Phase-A outcome filtering to stamped rows (from [`interaction_log_rows`]):
+/// 1. **Retry-collapse** — a run of ~same-command `Failure`s immediately followed
+///    by a `Success` collapses to the ONE success row, which records the last
+///    failed variant's content key in `chosen_over` (the DPO preference pair,
+///    recorded not trained). The collapsed failures move to `rejected`.
+/// 2. **Bare-failure exclusion** — any remaining `Failure` row is excluded from
+///    training (moved to `rejected` for audit).
+/// 3. **Length enforcement** — a non-`Success` row over [`MAX_ROW_CHARS`] is
+///    dropped (rejected); `Success` rows survive up to [`MAX_ROW_CHARS_VERIFIED`].
+/// 4. **Tier stamp** — every kept row inherits `tier`.
+pub fn filter_outcomes(rows: Vec<GenExample>, tier: Tier) -> OutcomeFilter {
+    let mut out = OutcomeFilter::default();
+    let mut i = 0;
+    while i < rows.len() {
+        let row = &rows[i];
+        // A failure that is followed (later in the log) by a ~same-command
+        // success: fold the whole failed run into that success.
+        if row.outcome() == Outcome::Failure {
+            if let Some(succ_idx) = find_following_success(&rows, i) {
+                // Collect the failed run [i, succ_idx).
+                let mut last_failed_key: Option<String> = None;
+                for f in &rows[i..succ_idx] {
+                    if f.outcome() == Outcome::Failure && similar_command(f, &rows[succ_idx]) {
+                        last_failed_key = Some(content_key(f));
+                    }
+                    out.rejected.push(f.clone());
+                }
+                let mut success = rows[succ_idx].clone();
+                if let Some(k) = last_failed_key {
+                    success.set_chosen_over(k);
+                }
+                emit_kept(&mut out, success, tier);
+                i = succ_idx + 1;
+                continue;
+            }
+            // Bare failure with no recovering success: exclude from training.
+            out.rejected.push(row.clone());
+            i += 1;
+            continue;
+        }
+        emit_kept(&mut out, row.clone(), tier);
+        i += 1;
+    }
+    out
+}
+
+/// Push a kept row after enforcing the outcome-aware length cap and stamping tier.
+fn emit_kept(out: &mut OutcomeFilter, mut row: GenExample, tier: Tier) {
+    let cap = if row.outcome() == Outcome::Success {
+        MAX_ROW_CHARS_VERIFIED
+    } else {
+        MAX_ROW_CHARS
+    };
+    if row.payload_len() > cap {
+        out.rejected.push(row);
+        return;
+    }
+    row.set_tier(tier);
+    out.kept.push(row);
+}
+
+/// The next `Success` row at/after `from+1` whose command is ~similar to the
+/// failure at `from` — the recovering attempt. `None` if none before a break.
+fn find_following_success(rows: &[GenExample], from: usize) -> Option<usize> {
+    let base = &rows[from];
+    for (offset, r) in rows.iter().enumerate().skip(from + 1) {
+        if !similar_command(base, r) {
+            // A different command breaks the retry chain.
+            continue;
+        }
+        match r.outcome() {
+            Outcome::Success => return Some(offset),
+            Outcome::Failure => {} // another attempt at the same command
+            Outcome::Unknown => {}
+        }
+    }
+    None
+}
+
+/// Normalized-prefix similarity for retry detection — NOT equality. Two `Cli`
+/// rows are "the same command" if their normalized command prefixes match; two
+/// `ToolCall` rows are similar if they invoke the same tool. All other variant
+/// combinations are not considered similar (errs toward NOT-similar).
+fn similar_command(a: &GenExample, b: &GenExample) -> bool {
+    match (a, b) {
+        (GenExample::Cli { command: ca, .. }, GenExample::Cli { command: cb, .. }) => {
+            normalized_prefix(ca) == normalized_prefix(cb)
+        }
+        (GenExample::ToolCall { tool: ta, .. }, GenExample::ToolCall { tool: tb, .. }) => ta == tb,
+        // All other variant combinations are structurally distinct — not a retry.
+        (GenExample::Qa { .. }, _)
+        | (GenExample::Instruction { .. }, _)
+        | (GenExample::Completion { .. }, _)
+        | (GenExample::Contrastive { .. }, _)
+        | (GenExample::Skill { .. }, _)
+        | (GenExample::ReasoningEdit { .. }, _)
+        | (GenExample::Cli { .. }, _)
+        | (GenExample::ToolCall { .. }, _) => false,
+    }
+}
+
+/// The normalized command prefix used for retry similarity: the first two
+/// whitespace-separated tokens (program + subcommand/first-arg), lowercased.
+/// Captures "same command, tweaked args" without collapsing unrelated commands.
+fn normalized_prefix(command: &str) -> String {
+    command
+        .split_whitespace()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+/// File name (under `work_dir/queue/`) of the excluded-rows audit sidecar.
+pub const REJECTED_SIDECAR: &str = "rejected.jsonl";
+
+/// Append rejected (excluded-from-training) rows to the audit sidecar under
+/// `work_dir/queue/`. Provenance-preserving: the rows keep their `outcome`/
+/// `chosen_over` stamps so the sidecar is a full audit trail. No-op on empty.
+pub fn append_rejected(work_dir: &Path, rejected: &[GenExample]) -> anyhow::Result<()> {
+    if rejected.is_empty() {
+        return Ok(());
+    }
+    let dir = work_dir.join("queue");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| anyhow::anyhow!("ingest sidecar: creating {}: {e}", dir.display()))?;
+    let path = dir.join(REJECTED_SIDECAR);
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| anyhow::anyhow!("ingest sidecar: opening {}: {e}", path.display()))?;
+    for row in rejected {
+        let line = serde_json::to_string(row)?;
+        writeln!(f, "{line}")?;
+    }
+    Ok(())
 }
 
 /// One `tool_use` block → a row (`Bash`→`Cli`, else `ToolCall`). `None` if empty
@@ -114,7 +373,9 @@ fn tool_use_row(blk: &Value, last_user: Option<&str>) -> Option<GenExample> {
 
     if name.eq_ignore_ascii_case("Bash") {
         let command = input.get("command").and_then(Value::as_str)?.trim();
-        if command.is_empty() || command.len() > MAX_ROW_CHARS {
+        // Keep up to the verified cap here; the post-pass ([`retry_collapse`])
+        // drops any row still over MAX_ROW_CHARS once its outcome is known.
+        if command.is_empty() || command.len() > MAX_ROW_CHARS_VERIFIED {
             return None;
         }
         return Some(GenExample::Cli {
@@ -122,6 +383,11 @@ fn tool_use_row(blk: &Value, last_user: Option<&str>) -> Option<GenExample> {
             command: command.to_string(),
             source: Some("transcript".to_string()),
             gen: Some(INGEST_GEN_TRANSCRIPT.to_string()),
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         });
     }
 
@@ -130,7 +396,7 @@ fn tool_use_row(blk: &Value, last_user: Option<&str>) -> Option<GenExample> {
     if let Some(obj) = args.as_object_mut() {
         obj.remove("description");
     }
-    if serde_json::to_string(&args).map(|s| s.len()).unwrap_or(0) > MAX_ROW_CHARS {
+    if serde_json::to_string(&args).map(|s| s.len()).unwrap_or(0) > MAX_ROW_CHARS_VERIFIED {
         return None;
     }
     Some(GenExample::ToolCall {
@@ -139,6 +405,11 @@ fn tool_use_row(blk: &Value, last_user: Option<&str>) -> Option<GenExample> {
         arguments: args,
         source: Some("transcript".to_string()),
         gen: Some(INGEST_GEN_TRANSCRIPT.to_string()),
+        outcome: Outcome::Unknown,
+        judge_score: None,
+        judge_verdict: Verdict::Unjudged,
+        tier: Tier::Private,
+        chosen_over: None,
     })
 }
 
@@ -160,6 +431,12 @@ pub fn doc_completion_rows(text: &str, source: &str, max_rows: usize) -> Vec<Gen
             rows.push(GenExample::Completion {
                 text: block.to_string(),
                 source: Some(source.to_string()),
+                gen: None,
+                outcome: Outcome::Unknown,
+                judge_score: None,
+                judge_verdict: Verdict::Unjudged,
+                tier: Tier::Private,
+                chosen_over: None,
             });
         }
     }
@@ -182,6 +459,7 @@ pub struct LlmRelevanceJudge<T: ChatTransport> {
 }
 
 impl<T: ChatTransport> LlmRelevanceJudge<T> {
+    /// Construct a judge with the given transport and batch size (minimum 1).
     pub fn new(transport: T, batch: usize) -> Self {
         Self {
             transport,
@@ -347,8 +625,9 @@ fn strip_noise(s: &str) -> String {
         match ch {
             '<' => in_tag = true,
             '>' => in_tag = false,
+            // char is exhaustive; these two guards cover all remaining code points.
             _ if !in_tag => out.push(ch),
-            _ => {}
+            _ => {} // inside a tag — discard
         }
     }
     out
@@ -381,10 +660,18 @@ fn truncate(s: &str, max: usize) -> String {
     t.chars().take(max).collect::<String>().trim().to_string()
 }
 
-/// Push a row only if its content key is new (dedup within a log).
-fn push_unique(rows: &mut Vec<GenExample>, seen: &mut BTreeSet<String>, row: GenExample) {
+/// Push a row only if its content key is new (dedup within a log). Returns the
+/// index of the pushed row, or `None` if it was a duplicate.
+fn push_unique(
+    rows: &mut Vec<GenExample>,
+    seen: &mut BTreeSet<String>,
+    row: GenExample,
+) -> Option<usize> {
     if seen.insert(content_key(&row)) {
         rows.push(row);
+        Some(rows.len() - 1)
+    } else {
+        None
     }
 }
 
@@ -526,11 +813,24 @@ mod tests {
 
     #[test]
     fn over_long_payloads_are_dropped() {
-        let big = "x".repeat(MAX_ROW_CHARS + 10);
+        // Beyond the VERIFIED cap, parsing itself drops the row.
+        let huge = "x".repeat(MAX_ROW_CHARS_VERIFIED + 10);
         let log = format!(
-            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"tool_use","name":"Bash","input":{{"command":"{big}"}}}}]}}}}"#
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"tool_use","name":"Bash","input":{{"command":"{huge}"}}}}]}}}}"#
         );
         assert!(interaction_log_rows(&log).is_empty());
+
+        // Between MAX_ROW_CHARS and the VERIFIED cap: parsing KEEPS it (track 37),
+        // but an unknown-outcome row over MAX_ROW_CHARS is dropped by the outcome
+        // filter (only verified successes earn the larger cap).
+        let mid = "x".repeat(MAX_ROW_CHARS + 10);
+        let log = format!(
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"tool_use","name":"Bash","input":{{"command":"{mid}"}}}}]}}}}"#
+        );
+        let rows = interaction_log_rows(&log);
+        assert_eq!(rows.len(), 1, "parse keeps it (below verified cap)");
+        let filtered = filter_outcomes(rows, Tier::Private);
+        assert!(filtered.kept.is_empty(), "unknown over MAX_ROW_CHARS dropped");
     }
 
     #[test]
@@ -558,6 +858,11 @@ mod tests {
             command: cmd.into(),
             source: None,
             gen: None,
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         }
     }
 
@@ -576,7 +881,13 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 GenExample::Cli { command, .. } => Some(command.as_str()),
-                _ => None,
+                GenExample::Qa { .. }
+                | GenExample::Instruction { .. }
+                | GenExample::Completion { .. }
+                | GenExample::Contrastive { .. }
+                | GenExample::ToolCall { .. }
+                | GenExample::Skill { .. }
+                | GenExample::ReasoningEdit { .. } => None,
             })
             .collect();
         assert_eq!(cmds, vec!["a", "c"]);
@@ -609,5 +920,118 @@ mod tests {
             10,
         );
         assert!(filter_relevant(&judge, "c", vec![]).unwrap().is_empty());
+    }
+
+    // --- Phase A: outcome stamping + retry-collapse ---
+
+    /// A tool_use turn + a following user turn carrying its tool_result.
+    fn tool_and_result(cmd: &str, id: &str, is_error: bool) -> String {
+        [
+            format!(
+                r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"{id}","name":"Bash","input":{{"command":"{cmd}","description":"run {cmd}"}}}}]}}}}"#
+            ),
+            format!(
+                r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{id}","is_error":{is_error},"content":"out"}}]}}}}"#
+            ),
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn tool_result_stamps_outcome_on_rows() {
+        let log = [
+            tool_and_result("cargo build", "t1", true),
+            tool_and_result("cargo test", "t2", false),
+        ]
+        .join("\n");
+        let rows = interaction_log_rows(&log);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].outcome(), Outcome::Failure);
+        assert_eq!(rows[1].outcome(), Outcome::Success);
+    }
+
+    #[test]
+    fn retry_chain_collapses_to_one_success_with_chosen_over() {
+        // fail × 3 then a success of the ~same command → exactly 1 kept row.
+        let log = [
+            tool_and_result("cargo build --release", "a", true),
+            tool_and_result("cargo build --release --verbose", "b", true),
+            tool_and_result("cargo build --release --locked", "c", true),
+            tool_and_result("cargo build --release --frozen", "d", false),
+        ]
+        .join("\n");
+        let rows = interaction_log_rows(&log);
+        assert_eq!(rows.len(), 4, "four distinct commands parsed pre-collapse");
+
+        let filtered = filter_outcomes(rows, Tier::Private);
+        assert_eq!(filtered.kept.len(), 1, "collapsed to one success");
+        assert_eq!(filtered.rejected.len(), 3, "three failures in the sidecar");
+        assert_eq!(filtered.kept[0].outcome(), Outcome::Success);
+        assert!(
+            filtered.kept[0].chosen_over().is_some(),
+            "success records the rejected preference pair"
+        );
+    }
+
+    #[test]
+    fn bare_failure_is_excluded_from_training() {
+        let log = tool_and_result("rm -rf /nope", "x", true);
+        let rows = interaction_log_rows(&log);
+        let filtered = filter_outcomes(rows, Tier::Private);
+        assert!(filtered.kept.is_empty(), "bare failure not trained");
+        assert_eq!(filtered.rejected.len(), 1, "kept for audit");
+    }
+
+    #[test]
+    fn long_success_kept_but_long_unknown_dropped() {
+        // A 5000-char command: as a verified success it survives; as unknown it
+        // exceeds MAX_ROW_CHARS and is dropped.
+        let long = "echo ".to_string() + &"x".repeat(5000);
+        let succ = GenExample::Cli {
+            prompt: "p".into(),
+            command: long.clone(),
+            source: None,
+            gen: None,
+            outcome: Outcome::Success,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
+        };
+        let unk = GenExample::Cli {
+            prompt: "p".into(),
+            command: long,
+            source: None,
+            gen: None,
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
+        };
+        let f1 = filter_outcomes(vec![succ], Tier::Private);
+        assert_eq!(f1.kept.len(), 1, "long verified success kept");
+        let f2 = filter_outcomes(vec![unk], Tier::Private);
+        assert_eq!(f2.kept.len(), 0, "long unknown dropped");
+    }
+
+    #[test]
+    fn tier_stamped_on_kept_rows() {
+        let log = tool_and_result("ls", "t", false);
+        let rows = interaction_log_rows(&log);
+        let filtered = filter_outcomes(rows, Tier::Shared);
+        assert_eq!(filtered.kept.len(), 1);
+        assert_eq!(filtered.kept[0].tier(), Tier::Shared);
+    }
+
+    #[test]
+    fn text_heuristic_marks_failure_without_is_error_flag() {
+        let log = [
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"z","name":"Bash","input":{"command":"foo","description":"run foo"}}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"z","content":"foo: command not found"}]}}"#,
+        ]
+        .join("\n");
+        let rows = interaction_log_rows(&log);
+        assert_eq!(rows[0].outcome(), Outcome::Failure);
     }
 }

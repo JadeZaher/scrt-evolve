@@ -10,7 +10,7 @@
 //! by VRAM; data is updated dynamically by user activity."
 //!
 //! Per step:
-//! 1. **stop check** — explicit `daemon stop` drops a stop-file; honored at the
+//! 1. **stop check** — explicit `evolve ambient stop` drops a stop-file; honored at the
 //!    top of every iteration (no signals — works on Windows + WSL alike).
 //! 2. **VRAM gate** — if a free-VRAM probe is available and free < the budget,
 //!    WAIT (self-throttle around the user's other GPU use) instead of training.
@@ -30,6 +30,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::arbitration::ServedReady;
 use crate::config::EvolveConfig;
 use crate::dataset::Dataset;
 use crate::eval::ScoreReport;
@@ -43,12 +44,22 @@ use crate::workdir::WorkDir;
 pub type DegradeHook<'a> =
     &'a dyn Fn(&EvolveConfig) -> anyhow::Result<crate::eval::DegradationReport>;
 
+/// The track-37 Phase-D live-nudge poll hook (consume-once at the step boundary).
+pub type NudgeHook<'a> = &'a dyn Fn() -> anyhow::Result<Option<crate::Nudge>>;
+
+/// The track-37 Phase-D steering-compliance sampler hook (fraction 0–1).
+pub type ComplianceHook<'a> = &'a dyn Fn(&EvolveConfig) -> anyhow::Result<f64>;
+
 /// The injected effects the daemon needs. Kept closure-based so production
 /// (subprocess + GPU probe) and tests (deterministic) share one loop.
 pub struct DaemonHooks<'a> {
     /// Probe free VRAM in GB. `None` ⇒ unknown (the VRAM gate is skipped — we
     /// can't throttle what we can't measure). Production: parse `nvidia-smi`.
     pub free_vram_gb: &'a dyn Fn() -> Option<f64>,
+    /// Probe free HOST RAM in GB. `None` ⇒ unknown (the RAM gate is skipped).
+    /// Production: read `/proc/meminfo` `MemAvailable` (Linux/WSL). Guards against
+    /// freezing the machine on a big model load.
+    pub free_ram_gb: &'a dyn Fn() -> Option<f64>,
     /// Probe whether ANOTHER process is using the GPU. `Some(true)` ⇒ yield the
     /// GPU (gentle-background: don't contend with a game/video). `None` ⇒ unknown
     /// (treated as not-busy). Production: `nvidia-smi --query-compute-apps=pid`
@@ -75,6 +86,25 @@ pub struct DaemonHooks<'a> {
     /// tests inject a deterministic report. Runs AFTER `train`, on the mutated
     /// adapter (so the candidate is what gets sampled).
     pub degrade: Option<DegradeHook<'a>>,
+    /// Track 37 Phase D — the OPTIONAL live-nudge poll. `Some` ⇒ called at the top
+    /// of each step (after the stop-check, before work) to fetch + consume a
+    /// pending [`crate::Nudge`]; the returned nudge is merged into the live config
+    /// via the safe-live allowlist. `None` ⇒ no live steering (nudges ignored).
+    /// Production reads/deletes `nudge.json`; tests inject a deterministic nudge.
+    pub take_nudge: Option<NudgeHook<'a>>,
+    /// Track 37 Phase D — the OPTIONAL steering-compliance sampler. `Some` ⇒ after
+    /// a committed step, sample K generated rows and judge them against the
+    /// composed steering text, returning the compliance fraction (0–1). `None` ⇒
+    /// no compliance metric (no judge call). Recorded in the step log for
+    /// `watch trend`.
+    pub steering_compliance: Option<ComplianceHook<'a>>,
+    /// Track 33 — the OPTIONAL commit-swap emit. `Some` ⇒ called at the KEEP
+    /// branch (after the merged flat adapter is the committed truth) with a
+    /// [`ServedReady`] carrying the incremented version; the live server tails it
+    /// to hot-swap. Rollback/catastrophe emit NOTHING. `None` ⇒ no emission
+    /// (back-compat). Production appends to `<state>/served-ready.jsonl` via
+    /// [`crate::arbitration::append_served_ready`]; tests assert emit count.
+    pub served_ready_emit: Option<&'a dyn Fn(ServedReady)>,
 }
 
 /// Tunables for a daemon run. `[daemon]` config + CLI flags populate these.
@@ -83,13 +113,24 @@ pub struct DaemonOptions {
     /// VRAM budget in GB: the daemon trains only when at least this much is FREE
     /// (so it never OOMs the user's foreground work). `None` ⇒ ungated.
     pub max_vram_gb: Option<f64>,
+    /// HOST-RAM floor in GB: the daemon trains only when at least this much system
+    /// RAM is FREE. Guards against freezing the machine when a large f16 model load
+    /// (train, or the A/B eval that loads it TWICE) would otherwise consume all
+    /// host memory. Low RAM ⇒ WAIT (never CPU fallback — CPU uses more RAM).
+    /// `None` ⇒ ungated (back-compat default).
+    pub min_free_ram_gb: Option<f64>,
+    /// Track 33: serve-while-you-train carve-out (GB) reserved for a co-resident
+    /// inference server. Subtracted from usable VRAM headroom BEFORE a block
+    /// starts, so the trainer proceeds only when `free − reservation ≥ budget`.
+    /// `None` ⇒ no carve-out (behavior byte-identical to today).
+    pub serve_reservation_gb: Option<f64>,
     /// Queued items folded into one microshard step.
     pub batch: usize,
     /// Stop after this many transactional steps (`None` ⇒ until stopped). Bounds
-    /// tests and `daemon start --max-steps N`.
+    /// tests and `evolve ambient start --max-steps N`.
     pub max_steps: Option<u64>,
     /// When the queue drains: `true` ⇒ exit (drain-once mode); `false` ⇒ wait for
-    /// new activity (the long-running `daemon start`).
+    /// new activity (the long-running `evolve ambient start`).
     pub exit_when_empty: bool,
     /// How long to wait when throttled or idle (production only; tests don't hit
     /// this path).
@@ -125,6 +166,8 @@ impl Default for DaemonOptions {
     fn default() -> Self {
         Self {
             max_vram_gb: None,
+            min_free_ram_gb: None,
+            serve_reservation_gb: None,
             batch: 1,
             max_steps: None,
             exit_when_empty: false,
@@ -162,6 +205,7 @@ pub fn decide_step(
     ordinal: u64,
     free_vram_gb: Option<f64>,
     gpu_busy: Option<bool>,
+    free_ram_gb: Option<f64>,
     opts: &DaemonOptions,
 ) -> StepDecision {
     let shard = if opts.rotation_blocks > 0 {
@@ -169,11 +213,38 @@ pub fn decide_step(
     } else {
         None
     };
-    let vram_ok = match (opts.max_vram_gb, free_vram_gb) {
+    // HOST-RAM gate (system-freeze guard). Loading a large f16 model for a train
+    // or eval step spikes host RAM (eval's A/B path loads the model TWICE); on a
+    // small box that starves the OS and freezes the machine. Unlike the VRAM gate,
+    // low RAM must NOT fall back to CPU — a CPU step uses MORE host RAM and would
+    // make the freeze worse. So low RAM ⇒ WAIT unconditionally, ignoring
+    // cpu_fallback. Ungated (budget None) or unmeasurable ⇒ don't block on RAM.
+    let ram_ok = match (opts.min_free_ram_gb, free_ram_gb) {
         (Some(budget), Some(free)) => free >= budget,
-        // Ungated or unmeasurable ⇒ don't block on VRAM.
+        // `_ =>` is correct: both fields are `Option<f32>` (stdlib), not an owned
+        // enum — all remaining (None, _) / (_, None) combinations mean "ungated or
+        // unmeasurable", which must not block.
         _ => true,
     };
+    if !ram_ok {
+        return StepDecision::Wait(format!(
+            "paused: free host RAM below budget ({} GB min)",
+            opts.min_free_ram_gb.unwrap_or(0.0)
+        ));
+    }
+    // Track 33: the serve carve-out shrinks usable headroom BEFORE the block —
+    // the trainer sees `free − reservation`, so a co-resident inference server
+    // keeps its slice. `None` ⇒ no carve-out (subtract 0.0 ⇒ byte-identical).
+    let reservation = opts.serve_reservation_gb.unwrap_or(0.0);
+    let vram_ok = match (opts.max_vram_gb, free_vram_gb) {
+        (Some(budget), Some(free)) => (free - reservation) >= budget,
+        // `_ =>` is correct: both fields are `Option<f64>` (stdlib), not an owned
+        // enum. Ungated (None) or unmeasurable (Some probe failed) ⇒ don't block.
+        _ => true,
+    };
+    // Track 33 model-A degrade: a live served inference process registers as
+    // another GPU user, so the existing `pause_on_gpu_process` path already yields
+    // the GPU to it as first-class foreground — no separate predicate needed.
     let other_gpu = gpu_busy.unwrap_or(false);
     let gpu_ok = vram_ok && !(opts.pause_on_gpu_process && other_gpu);
     if gpu_ok {
@@ -254,6 +325,10 @@ fn apply_plan(
     let mut hw = c.hardware.clone().unwrap_or_default();
     hw.device = device.to_string();
     c.hardware = Some(hw);
+    // Apply `[daemon].objective` only when sharding (materializes fractional) or
+    // when fractional already exists — never create one on a non-sharded step
+    // (FractionalConfig::default().enabled = true). See AGENTS.md §objective.
+    let daemon_objective = c.daemon.as_ref().map(|d| d.objective.clone());
     if let Some(idx) = shard {
         let mut tr = c.train.clone().unwrap_or_default();
         let mut frac = tr.fractional.clone().unwrap_or_default();
@@ -261,8 +336,19 @@ fn apply_plan(
         frac.shards = Some(rotation_blocks);
         frac.shard_index = Some(idx);
         frac.granularity = granularity.to_string();
+        if let Some(obj) = daemon_objective {
+            frac.objective = obj;
+        }
         tr.fractional = Some(frac);
         c.train = Some(tr);
+    } else if let Some(obj) = daemon_objective {
+        // Non-sharded step: set the objective ONLY if a fractional config already
+        // exists (don't create one — that would enable fractional by default).
+        if let Some(tr) = c.train.as_mut() {
+            if let Some(frac) = tr.fractional.as_mut() {
+                frac.objective = obj;
+            }
+        }
     }
     c
 }
@@ -297,6 +383,9 @@ pub struct DaemonReport {
     /// Q2: the supervisor gave up after `max_consecutive_failures` consecutive
     /// transient step failures (re-arm/restart required).
     pub gave_up: bool,
+    /// Track 33: the final served-adapter version (bumped once per keep; 0 ⇒
+    /// nothing committed). The latest signal the live server would have swapped to.
+    pub served_version: u64,
 }
 
 impl DaemonReport {
@@ -309,18 +398,18 @@ impl DaemonReport {
     }
 }
 
-/// The stop-file the running daemon polls. `daemon stop` creates it; the loop
+/// The stop-file the running daemon polls. `evolve ambient stop` creates it; the loop
 /// removes it on a clean exit.
 pub fn stop_file(work_dir: &Path) -> PathBuf {
     work_dir.join("daemon.stop")
 }
 
-/// The run marker written while the daemon is active (for `daemon status`).
+/// The run marker written while the daemon is active (for `evolve watch status`).
 pub fn run_file(work_dir: &Path) -> PathBuf {
     work_dir.join("daemon.run")
 }
 
-/// Request the running daemon stop (the `daemon stop` command): drop the
+/// Request the running daemon stop (the `evolve ambient stop` command): drop the
 /// stop-file the loop checks each iteration.
 pub fn request_stop(work_dir: &Path) -> anyhow::Result<()> {
     std::fs::write(stop_file(work_dir), b"stop")?;
@@ -353,6 +442,14 @@ pub fn run_daemon(
     let mut consecutive_failures = 0u32;
     // Q3: sliding (timestamp, train_secs) window for the per-hour wall-clock cap.
     let mut budget_window: Vec<(u64, u64)> = Vec::new();
+    // Track 37 Phase D: the LIVE config a nudge merges into. Ephemeral — TOML
+    // (`cfg`) wins on restart because this copy dies with the loop. An active
+    // focus expires at the recorded ordinal.
+    let mut live_cfg = cfg.clone();
+    let mut focus_expiry: Option<u64> = None;
+    // Track 33: monotonic served-adapter version. Base = 0 (nothing committed
+    // yet); each keep bumps it, so the first committed adapter is version 1.
+    let mut served_version: u64 = 0;
 
     loop {
         if let Some(max) = opts.max_steps {
@@ -363,6 +460,39 @@ pub fn run_daemon(
         if should_stop() {
             report.stopped = true;
             break;
+        }
+
+        // Track 37 Phase D: poll + consume a pending nudge, then merge its
+        // safe-live allowlist into `live_cfg`. Runs at the TOP of the step (after
+        // the stop-check — the loop owns the config here). Consume-once; a
+        // malformed nudge is logged and skipped, never wedges the loop.
+        if let Some(take) = hooks.take_nudge {
+            match take() {
+                Ok(Some(nudge)) => {
+                    let outcome = crate::apply_nudge(&mut live_cfg, &nudge, ordinal);
+                    if let Some((_, expiry)) = outcome.focus {
+                        focus_expiry = Some(expiry);
+                    }
+                    if !outcome.is_empty() {
+                        let _ = append_nudge_log(
+                            &wd,
+                            ordinal,
+                            &outcome.applied,
+                            &outcome.rejected,
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => eprintln!("daemon: nudge poll failed ({e}); ignoring"),
+            }
+        }
+        // Expire a transient focus whose TTL has passed: clear BOTH the tracker
+        // and the ephemeral steering field so base steering is restored.
+        if let Some(exp) = focus_expiry {
+            if ordinal >= exp {
+                focus_expiry = None;
+                live_cfg.evolve.focus = None;
+            }
         }
 
         // (1b) Q3 wall-clock budget gate: if we've trained our per-hour minutes,
@@ -388,7 +518,13 @@ pub fn run_daemon(
 
         // (2) Adaptive gate: GPU when free, CPU when the GPU is busy/starved (if
         // cpu_fallback), else wait — yielding the GPU to the user's foreground work.
-        let decision = decide_step(ordinal, (hooks.free_vram_gb)(), (hooks.gpu_busy)(), opts);
+        let decision = decide_step(
+            ordinal,
+            (hooks.free_vram_gb)(),
+            (hooks.gpu_busy)(),
+            (hooks.free_ram_gb)(),
+            opts,
+        );
         let (device, shard) = match &decision {
             StepDecision::Train { device, shard } => (*device, *shard),
             StepDecision::Wait(reason) => {
@@ -477,12 +613,14 @@ pub fn run_daemon(
 
         // (4) The transaction: train (microshard) → eval → keep|rollback. The
         // per-step config carries the placement plan (device + rotating block).
-        let granularity = cfg
+        // Track 37 Phase D: the step config is derived from `live_cfg` (base TOML
+        // + any merged nudges), so a live nudge takes effect from this step on.
+        let granularity = live_cfg
             .daemon
             .as_ref()
             .map(|d| d.granularity.as_str())
             .unwrap_or("module");
-        let step_cfg = apply_plan(cfg, device, shard, opts.rotation_blocks, granularity);
+        let step_cfg = apply_plan(&live_cfg, device, shard, opts.rotation_blocks, granularity);
         let id = format!("daemon-{ordinal}");
 
         // (4) The transaction WITH Q2 retry: a TRANSIENT failure of EITHER
@@ -556,6 +694,9 @@ pub fn run_daemon(
         let place = match (device, shard) {
             ("cpu", _) => " on cpu".to_string(),
             (_, Some(b)) => format!(" block {b}"),
+            // `_ =>` is correct: `device` is `&str` (not an owned enum) — any
+            // non-"cpu" string with no shard index (e.g. "cuda", ungated) needs no
+            // placement annotation.
             _ => String::new(),
         };
 
@@ -616,6 +757,42 @@ pub fn run_daemon(
             note,
         });
 
+        // Track 33 commit-swap: ONLY on a keep, AFTER the merged flat adapter is
+        // the committed truth, bump the served version and emit the swap signal
+        // for the live server. Rollback/catastrophe fall through here untouched,
+        // so they emit nothing and the version does not advance.
+        if outcome.action == StepAction::Commit {
+            served_version += 1;
+            if let Some(emit) = hooks.served_ready_emit {
+                let adapter_path = wd.adapter_safetensors().to_string_lossy().into_owned();
+                let base_path = live_cfg
+                    .evolve
+                    .model_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                emit(ServedReady {
+                    version: served_version,
+                    adapter_path,
+                    base_path,
+                    timestamp: format!("step-{ordinal}"),
+                });
+            }
+        }
+
+        // Steering-compliance metric (only when steering is set AND the sampler
+        // hook is wired — no judge call otherwise). See AGENTS.md §nudge.
+        if outcome.action == StepAction::Commit && live_cfg.compose_steering().is_some() {
+            if let Some(sampler) = hooks.steering_compliance {
+                match sampler(&step_cfg) {
+                    Ok(frac) => {
+                        let _ = append_compliance_log(&wd, ordinal, frac);
+                    }
+                    Err(e) => eprintln!("daemon: steering-compliance sample failed ({e})"),
+                }
+            }
+        }
+
         ordinal += 1;
         taken += 1;
         if halt {
@@ -630,14 +807,72 @@ pub fn run_daemon(
         }
     }
 
+    report.served_version = served_version;
     Ok(report)
+}
+
+/// The evolution-log path the daemon + `watch` share.
+fn evolution_log(wd: &WorkDir) -> PathBuf {
+    wd.root().join("evolution-log.jsonl")
+}
+
+/// Append a `kind:"nudge"` evolution-log row (track 37 Phase D) recording what a
+/// live nudge applied/rejected, so `watch status`/`health` can surface it. Uses
+/// the benign `Commit` action (a nudge touches no weights) — readers key on
+/// `kind == "nudge"`.
+fn append_nudge_log(
+    wd: &WorkDir,
+    ordinal: u64,
+    applied: &[String],
+    rejected: &[String],
+) -> anyhow::Result<()> {
+    let mut cause = String::new();
+    if !applied.is_empty() {
+        cause.push_str(&format!("applied: {}", applied.join("; ")));
+    }
+    if !rejected.is_empty() {
+        if !cause.is_empty() {
+            cause.push_str(" | ");
+        }
+        cause.push_str(&format!("rejected: {}", rejected.join("; ")));
+    }
+    crate::regulate::log::append(
+        &evolution_log(wd),
+        &crate::regulate::log::EvolutionLogEntry {
+            step: ordinal,
+            checkpoint_id: format!("nudge-{ordinal}"),
+            kind: "nudge".to_string(),
+            verdict: None,
+            metrics: None,
+            action: StepAction::Commit,
+            cause: Some(cause),
+        },
+    )
+}
+
+/// Append a `kind:"steering_compliance"` evolution-log row (track 37 Phase D):
+/// the fraction of sampled generated rows the judge found steering-aligned, so
+/// `watch trend` can chart compliance alongside correctness.
+fn append_compliance_log(wd: &WorkDir, ordinal: u64, fraction: f64) -> anyhow::Result<()> {
+    crate::regulate::log::append(
+        &evolution_log(wd),
+        &crate::regulate::log::EvolutionLogEntry {
+            step: ordinal,
+            checkpoint_id: format!("compliance-{ordinal}"),
+            kind: "steering_compliance".to_string(),
+            verdict: None,
+            metrics: None,
+            action: StepAction::Commit,
+            cause: Some(format!("steering_compliance={fraction:.4}")),
+        },
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{EvalConfig, EvolveConfig, RegulateConfig};
-    use crate::dataset::GenExample;
+    use crate::dataset::{GenExample, Outcome, Tier, Verdict};
     use crate::living_queue::Lane;
     use std::cell::Cell;
 
@@ -647,6 +882,11 @@ mod tests {
             completion: format!("a:{p}"),
             source: None,
             gen: Some("teach".to_string()),
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         }
     }
 
@@ -693,6 +933,7 @@ mod tests {
         q.enqueue_many(Lane::Priority, &[qa("a"), qa("b")]).unwrap();
 
         let free_vram = || Some(40.0);
+        let free_ram = || None::<f64>;
         let train = |_: &EvolveConfig, ds: &Dataset| {
             Ok(vec![ds
                 .rows
@@ -707,12 +948,16 @@ mod tests {
         let gpu_idle = || Some(false);
         let hooks = DaemonHooks {
             free_vram_gb: &free_vram,
+            free_ram_gb: &free_ram,
             gpu_busy: &gpu_idle,
             train: &train,
             score: &score,
             now_secs: &zero_now,
             sleep: &noop_sleep,
             degrade: None,
+            take_nudge: None,
+            steering_compliance: None,
+            served_ready_emit: None,
         };
         let opts = DaemonOptions {
             max_vram_gb: Some(4.0),
@@ -734,17 +979,22 @@ mod tests {
             .unwrap();
 
         let free_vram = || Some(40.0);
+        let free_ram = || None::<f64>;
         let train = |_: &EvolveConfig, _: &Dataset| Ok(vec!["teach".to_string()]);
         let score = |_: &EvolveConfig| Ok(good_score());
         let gpu_idle = || Some(false);
         let hooks = DaemonHooks {
             free_vram_gb: &free_vram,
+            free_ram_gb: &free_ram,
             gpu_busy: &gpu_idle,
             train: &train,
             score: &score,
             now_secs: &zero_now,
             sleep: &noop_sleep,
             degrade: None,
+            take_nudge: None,
+            steering_compliance: None,
+            served_ready_emit: None,
         };
         let opts = DaemonOptions {
             max_vram_gb: Some(4.0),
@@ -770,7 +1020,7 @@ mod tests {
         };
         // Plenty of free VRAM, no other GPU process ⇒ train on GPU.
         assert_eq!(
-            decide_step(0, Some(8.0), Some(false), &opts),
+            decide_step(0, Some(8.0), Some(false), None, &opts),
             StepDecision::Train {
                 device: "cuda",
                 shard: None
@@ -788,7 +1038,7 @@ mod tests {
         };
         // Another GPU process is active (a game) ⇒ yield the GPU, run on CPU.
         assert_eq!(
-            decide_step(0, Some(8.0), Some(true), &opts),
+            decide_step(0, Some(8.0), Some(true), None, &opts),
             StepDecision::Train {
                 device: "cpu",
                 shard: None
@@ -804,10 +1054,56 @@ mod tests {
             cpu_fallback: false,
             ..Default::default()
         };
-        match decide_step(0, Some(8.0), Some(true), &opts) {
+        match decide_step(0, Some(8.0), Some(true), None, &opts) {
             StepDecision::Wait(reason) => assert!(reason.contains("GPU process")),
             other => panic!("expected Wait, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decide_step_waits_when_free_ram_below_floor_even_with_gpu_room() {
+        // The freeze guard: plenty of VRAM + GPU idle, but host RAM is below the
+        // floor ⇒ WAIT (and NOT cpu_fallback — CPU would use even more RAM).
+        let opts = DaemonOptions {
+            max_vram_gb: Some(4.0),
+            min_free_ram_gb: Some(6.0),
+            cpu_fallback: true,
+            ..Default::default()
+        };
+        match decide_step(0, Some(40.0), Some(false), Some(2.0), &opts) {
+            StepDecision::Wait(reason) => assert!(reason.contains("host RAM")),
+            other => panic!("expected Wait (low RAM), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_step_trains_when_ram_above_floor() {
+        let opts = DaemonOptions {
+            max_vram_gb: Some(4.0),
+            min_free_ram_gb: Some(6.0),
+            ..Default::default()
+        };
+        // RAM above floor + VRAM fine ⇒ train.
+        assert_eq!(
+            decide_step(0, Some(40.0), Some(false), Some(20.0), &opts),
+            StepDecision::Train {
+                device: "cuda",
+                shard: None
+            }
+        );
+        // RAM ungated (None floor) ⇒ never blocks on RAM even if probe is low.
+        let ungated = DaemonOptions {
+            max_vram_gb: Some(4.0),
+            min_free_ram_gb: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_step(0, Some(40.0), Some(false), Some(0.5), &ungated),
+            StepDecision::Train {
+                device: "cuda",
+                shard: None
+            }
+        );
     }
 
     #[test]
@@ -819,7 +1115,7 @@ mod tests {
         };
         // Free VRAM below budget (a game holds it) ⇒ wait.
         assert!(matches!(
-            decide_step(0, Some(1.0), Some(false), &opts),
+            decide_step(0, Some(1.0), Some(false), None, &opts),
             StepDecision::Wait(_)
         ));
     }
@@ -830,7 +1126,7 @@ mod tests {
             rotation_blocks: 3,
             ..Default::default()
         };
-        let shard_of = |ord| match decide_step(ord, None, Some(false), &opts) {
+        let shard_of = |ord| match decide_step(ord, None, Some(false), None, &opts) {
             StepDecision::Train { shard, .. } => shard,
             _ => None,
         };
@@ -849,17 +1145,22 @@ mod tests {
         let q = LivingQueue::from_config(&cfg).unwrap();
         q.enqueue_many(Lane::Raw, &[qa("a"), qa("b")]).unwrap();
         let free_vram = || Some(8.0);
+        let free_ram = || None::<f64>;
         let gpu_busy = || Some(true); // a game is running
         let train = |_: &EvolveConfig, _: &Dataset| Ok(vec!["teach".to_string()]);
         let score = |_: &EvolveConfig| Ok(good_score());
         let hooks = DaemonHooks {
             free_vram_gb: &free_vram,
+            free_ram_gb: &free_ram,
             gpu_busy: &gpu_busy,
             train: &train,
             score: &score,
             now_secs: &zero_now,
             sleep: &noop_sleep,
             degrade: None,
+            take_nudge: None,
+            steering_compliance: None,
+            served_ready_emit: None,
         };
         let opts = DaemonOptions {
             max_vram_gb: Some(4.0),
@@ -884,17 +1185,22 @@ mod tests {
             q.enqueue(Lane::Raw, &qa(&format!("q{i}"))).unwrap();
         }
         let free_vram = || Some(40.0);
+        let free_ram = || None::<f64>;
         let train = |_: &EvolveConfig, _: &Dataset| Ok(vec!["teach".to_string()]);
         let score = |_: &EvolveConfig| Ok(good_score());
         let gpu_idle = || Some(false);
         let hooks = DaemonHooks {
             free_vram_gb: &free_vram,
+            free_ram_gb: &free_ram,
             gpu_busy: &gpu_idle,
             train: &train,
             score: &score,
             now_secs: &zero_now,
             sleep: &noop_sleep,
             degrade: None,
+            take_nudge: None,
+            steering_compliance: None,
+            served_ready_emit: None,
         };
         let opts = DaemonOptions {
             max_vram_gb: Some(4.0),
@@ -950,6 +1256,7 @@ mod tests {
         let q = LivingQueue::from_config(&cfg).unwrap();
         q.enqueue(Lane::Raw, &qa("a")).unwrap();
         let free_vram = || Some(40.0);
+        let free_ram = || None::<f64>;
         let train = |_: &EvolveConfig, _: &Dataset| Ok(vec!["teach".to_string()]);
         let attempts = Cell::new(0u32);
         let score = |_: &EvolveConfig| {
@@ -963,12 +1270,16 @@ mod tests {
         let gpu_idle = || Some(false);
         let hooks = DaemonHooks {
             free_vram_gb: &free_vram,
+            free_ram_gb: &free_ram,
             gpu_busy: &gpu_idle,
             train: &train,
             score: &score,
             now_secs: &zero_now,
             sleep: &noop_sleep,
             degrade: None,
+            take_nudge: None,
+            steering_compliance: None,
+            served_ready_emit: None,
         };
         let opts = DaemonOptions {
             max_vram_gb: Some(4.0),
@@ -992,6 +1303,7 @@ mod tests {
         let q = LivingQueue::from_config(&cfg).unwrap();
         q.enqueue(Lane::Raw, &qa("a")).unwrap();
         let free_vram = || Some(40.0);
+        let free_ram = || None::<f64>;
         let attempts = Cell::new(0u32);
         let train = |_: &EvolveConfig, _: &Dataset| {
             let n = attempts.get();
@@ -1005,12 +1317,16 @@ mod tests {
         let gpu_idle = || Some(false);
         let hooks = DaemonHooks {
             free_vram_gb: &free_vram,
+            free_ram_gb: &free_ram,
             gpu_busy: &gpu_idle,
             train: &train,
             score: &score,
             now_secs: &zero_now,
             sleep: &noop_sleep,
             degrade: None,
+            take_nudge: None,
+            steering_compliance: None,
+            served_ready_emit: None,
         };
         let opts = DaemonOptions {
             max_vram_gb: Some(4.0),
@@ -1034,17 +1350,22 @@ mod tests {
         q.enqueue_many(Lane::Raw, &[qa("a"), qa("b"), qa("c")])
             .unwrap();
         let free_vram = || Some(40.0);
+        let free_ram = || None::<f64>;
         let train = |_: &EvolveConfig, _: &Dataset| Ok(vec!["teach".to_string()]);
         let score = |_: &EvolveConfig| anyhow::bail!("eval keeps timing out");
         let gpu_idle = || Some(false);
         let hooks = DaemonHooks {
             free_vram_gb: &free_vram,
+            free_ram_gb: &free_ram,
             gpu_busy: &gpu_idle,
             train: &train,
             score: &score,
             now_secs: &zero_now,
             sleep: &noop_sleep,
             degrade: None,
+            take_nudge: None,
+            steering_compliance: None,
+            served_ready_emit: None,
         };
         let opts = DaemonOptions {
             max_vram_gb: Some(4.0),
@@ -1072,6 +1393,7 @@ mod tests {
         let q = LivingQueue::from_config(&cfg).unwrap();
         q.enqueue(Lane::Raw, &qa("a")).unwrap();
         let free_vram = || Some(40.0);
+        let free_ram = || None::<f64>;
         let train = |_: &EvolveConfig, _: &Dataset| Ok(vec!["teach".to_string()]);
         let score = |_: &EvolveConfig| Ok(good_score());
         let gpu_idle = || Some(false);
@@ -1085,12 +1407,16 @@ mod tests {
         };
         let hooks = DaemonHooks {
             free_vram_gb: &free_vram,
+            free_ram_gb: &free_ram,
             gpu_busy: &gpu_idle,
             train: &train,
             score: &score,
             now_secs: &now,
             sleep: &noop_sleep,
             degrade: None,
+            take_nudge: None,
+            steering_compliance: None,
+            served_ready_emit: None,
         };
         let opts = DaemonOptions {
             max_vram_gb: Some(4.0),
@@ -1127,17 +1453,22 @@ mod tests {
         q.enqueue_many(Lane::Raw, &[qa("a"), qa("b"), qa("c")])
             .unwrap();
         let free_vram = || Some(40.0);
+        let free_ram = || None::<f64>;
         let train = |_: &EvolveConfig, _: &Dataset| Ok(vec!["teach".to_string()]);
         let score = |_: &EvolveConfig| Ok(good_score());
         let gpu_idle = || Some(false);
         let hooks = DaemonHooks {
             free_vram_gb: &free_vram,
+            free_ram_gb: &free_ram,
             gpu_busy: &gpu_idle,
             train: &train,
             score: &score,
             now_secs: &zero_now,
             sleep: &noop_sleep,
             degrade: None,
+            take_nudge: None,
+            steering_compliance: None,
+            served_ready_emit: None,
         };
         let opts = DaemonOptions {
             max_vram_gb: Some(4.0),
@@ -1161,17 +1492,22 @@ mod tests {
         q.enqueue_many(Lane::Raw, &[qa("a"), qa("b"), qa("c"), qa("d")])
             .unwrap();
         let free_vram = || Some(40.0);
+        let free_ram = || None::<f64>;
         let train = |_: &EvolveConfig, _: &Dataset| Ok(vec!["teach".to_string()]);
         let score = |_: &EvolveConfig| Ok(good_score());
         let gpu_idle = || Some(false);
         let hooks = DaemonHooks {
             free_vram_gb: &free_vram,
+            free_ram_gb: &free_ram,
             gpu_busy: &gpu_idle,
             train: &train,
             score: &score,
             now_secs: &zero_now,
             sleep: &noop_sleep,
             degrade: None,
+            take_nudge: None,
+            steering_compliance: None,
+            served_ready_emit: None,
         };
         let opts = DaemonOptions {
             max_vram_gb: Some(4.0),
@@ -1193,6 +1529,7 @@ mod tests {
         let q = LivingQueue::from_config(&cfg).unwrap();
         q.enqueue(Lane::Raw, &qa("a")).unwrap();
         let free_vram = || Some(40.0);
+        let free_ram = || None::<f64>;
         let train = |_: &EvolveConfig, _: &Dataset| Ok(vec!["teach".to_string()]);
         let score = |_: &EvolveConfig| Ok(good_score()); // correctness fine…
         let gpu_idle = || Some(false);
@@ -1206,12 +1543,16 @@ mod tests {
         };
         let hooks = DaemonHooks {
             free_vram_gb: &free_vram,
+            free_ram_gb: &free_ram,
             gpu_busy: &gpu_idle,
             train: &train,
             score: &score,
             now_secs: &zero_now,
             sleep: &noop_sleep,
             degrade: Some(&degrade),
+            take_nudge: None,
+            steering_compliance: None,
+            served_ready_emit: None,
         };
         let opts = DaemonOptions {
             max_vram_gb: Some(4.0),
@@ -1235,6 +1576,7 @@ mod tests {
         let q = LivingQueue::from_config(&cfg).unwrap();
         q.enqueue(Lane::Raw, &qa("a")).unwrap();
         let free_vram = || Some(40.0);
+        let free_ram = || None::<f64>;
         let train = |_: &EvolveConfig, _: &Dataset| Ok(vec!["teach".to_string()]);
         let mut low = good_score();
         low.correctness = 0.30;
@@ -1249,12 +1591,16 @@ mod tests {
         };
         let hooks = DaemonHooks {
             free_vram_gb: &free_vram,
+            free_ram_gb: &free_ram,
             gpu_busy: &gpu_idle,
             train: &train,
             score: &score,
             now_secs: &zero_now,
             sleep: &noop_sleep,
             degrade: Some(&degrade),
+            take_nudge: None,
+            steering_compliance: None,
+            served_ready_emit: None,
         };
         // Baseline at 0.40 — under the OLD gate a drop to 0.30 would Regress; the
         // judge gate accepts because no degradation was detected.
@@ -1271,5 +1617,366 @@ mod tests {
             1,
             "no degradation ⇒ accept despite low/dropped correctness"
         );
+    }
+
+    // --- Track 37 Phase E: daemon objective defaults to end_task ---
+
+    #[test]
+    fn daemon_step_objective_defaults_to_end_task() {
+        // apply_plan on a daemon config (no explicit objective) yields end_task on
+        // the fractional config the trainer reads — the knowledge signal.
+        let dir = tmp("objective");
+        let mut cfg = cfg_for(&dir);
+        cfg.daemon = Some(crate::config::DaemonConfig::default());
+        let planned = apply_plan(&cfg, "cuda", Some(0), 4, "block");
+        let obj = planned
+            .train
+            .and_then(|t| t.fractional)
+            .map(|f| f.objective)
+            .expect("fractional objective present");
+        assert_eq!(obj, "end_task", "daemon steps default to the knowledge signal");
+    }
+
+    #[test]
+    fn non_sharded_step_does_not_silently_enable_fractional() {
+        // Safety guard: FractionalConfig::default().enabled = true, so a
+        // non-sharded apply_plan must NOT create a fractional config on a config
+        // that had none — else a dense daemon step silently becomes fractional.
+        let dir = tmp("no-frac");
+        let mut cfg = cfg_for(&dir);
+        cfg.daemon = Some(crate::config::DaemonConfig::default());
+        cfg.train = None; // no [train] at all
+        let planned = apply_plan(&cfg, "cpu", None, 0, "module");
+        assert!(
+            planned.train.and_then(|t| t.fractional).is_none(),
+            "non-sharded step must not materialize a fractional config"
+        );
+    }
+
+    // --- Track 37 Phase D: live nudge + steering-compliance ---
+
+    #[test]
+    fn injected_nudge_is_consumed_once_and_logged() {
+        let dir = tmp("nudge");
+        let cfg = cfg_for(&dir);
+        let q = LivingQueue::from_config(&cfg).unwrap();
+        q.enqueue(Lane::Raw, &qa("a")).unwrap();
+        q.enqueue(Lane::Raw, &qa("b")).unwrap();
+        let free_vram = || Some(40.0);
+        let free_ram = || None::<f64>;
+        let train = |_: &EvolveConfig, _: &Dataset| Ok(vec!["teach".to_string()]);
+        let score = move |_: &EvolveConfig| Ok(good_score());
+        let gpu_idle = || Some(false);
+        // Serve a nudge exactly once (first poll), None after.
+        let served = Cell::new(false);
+        let take = || -> anyhow::Result<Option<crate::Nudge>> {
+            if served.get() {
+                Ok(None)
+            } else {
+                served.set(true);
+                Ok(Some(crate::Nudge {
+                    judge_min_score: Some(0.75),
+                    ..Default::default()
+                }))
+            }
+        };
+        let hooks = DaemonHooks {
+            free_vram_gb: &free_vram,
+            free_ram_gb: &free_ram,
+            gpu_busy: &gpu_idle,
+            train: &train,
+            score: &score,
+            now_secs: &zero_now,
+            sleep: &noop_sleep,
+            degrade: None,
+            take_nudge: Some(&take),
+            steering_compliance: None,
+            served_ready_emit: None,
+        };
+        let opts = DaemonOptions {
+            max_vram_gb: Some(4.0),
+            exit_when_empty: true,
+            ..Default::default()
+        };
+        run_daemon(&cfg, &opts, &good_score(), &hooks, &|| false).unwrap();
+        // The nudge produced a kind:"nudge" evolution-log row.
+        let log = crate::regulate::log::read_all(
+            &WorkDir::from_config(&cfg).root().join("evolution-log.jsonl"),
+        )
+        .unwrap();
+        let nudge_rows: Vec<_> = log.iter().filter(|e| e.kind == "nudge").collect();
+        assert_eq!(nudge_rows.len(), 1, "consumed once → exactly one nudge row");
+        assert!(nudge_rows[0]
+            .cause
+            .as_deref()
+            .unwrap()
+            .contains("judge.min_score"));
+    }
+
+    #[test]
+    fn steering_compliance_logged_when_steering_set() {
+        let dir = tmp("compliance");
+        let mut cfg = cfg_for(&dir);
+        cfg.evolve.constitution = Some("Be correct and concise.".to_string());
+        let q = LivingQueue::from_config(&cfg).unwrap();
+        q.enqueue(Lane::Raw, &qa("a")).unwrap();
+        let free_vram = || Some(40.0);
+        let free_ram = || None::<f64>;
+        let train = |_: &EvolveConfig, _: &Dataset| Ok(vec!["teach".to_string()]);
+        let score = move |_: &EvolveConfig| Ok(good_score());
+        let gpu_idle = || Some(false);
+        let compliance = |_: &EvolveConfig| Ok(0.5f64);
+        let hooks = DaemonHooks {
+            free_vram_gb: &free_vram,
+            free_ram_gb: &free_ram,
+            gpu_busy: &gpu_idle,
+            train: &train,
+            score: &score,
+            now_secs: &zero_now,
+            sleep: &noop_sleep,
+            degrade: None,
+            take_nudge: None,
+            steering_compliance: Some(&compliance),
+            served_ready_emit: None,
+        };
+        let opts = DaemonOptions {
+            max_vram_gb: Some(4.0),
+            exit_when_empty: true,
+            ..Default::default()
+        };
+        run_daemon(&cfg, &opts, &good_score(), &hooks, &|| false).unwrap();
+        let log = crate::regulate::log::read_all(
+            &WorkDir::from_config(&cfg).root().join("evolution-log.jsonl"),
+        )
+        .unwrap();
+        let comp: Vec<_> = log
+            .iter()
+            .filter(|e| e.kind == "steering_compliance")
+            .collect();
+        assert_eq!(comp.len(), 1, "one compliance row for the committed step");
+        assert!(comp[0]
+            .cause
+            .as_deref()
+            .unwrap()
+            .contains("steering_compliance=0.5"));
+    }
+
+    // ───────────────────── Track 33: reservation gating + swap-signal emit ─────────────────────
+
+    #[test]
+    fn reservation_subtracts_from_usable_headroom() {
+        // budget 4, free 8 ⇒ 4 usable headroom. A 3 GB reservation leaves 5 free
+        // ⇒ still ≥ 4 (fits); a 5 GB reservation leaves 3 free ⇒ < 4 (starved).
+        let opts_fits = DaemonOptions {
+            max_vram_gb: Some(4.0),
+            serve_reservation_gb: Some(3.0),
+            cpu_fallback: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_step(0, Some(8.0), Some(false), None, &opts_fits),
+            StepDecision::Train {
+                device: "cuda",
+                shard: None
+            },
+            "free − reservation still clears the budget ⇒ train"
+        );
+
+        let opts_starved = DaemonOptions {
+            max_vram_gb: Some(4.0),
+            serve_reservation_gb: Some(5.0),
+            cpu_fallback: false,
+            ..Default::default()
+        };
+        assert!(
+            matches!(
+                decide_step(0, Some(8.0), Some(false), None, &opts_starved),
+                StepDecision::Wait(_)
+            ),
+            "reservation eats the headroom below budget ⇒ wait"
+        );
+
+        // Reservation None ⇒ byte-identical to today (8 − 0 ≥ 4 ⇒ train).
+        let opts_none = DaemonOptions {
+            max_vram_gb: Some(4.0),
+            serve_reservation_gb: None,
+            cpu_fallback: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_step(0, Some(8.0), Some(false), None, &opts_none),
+            StepDecision::Train {
+                device: "cuda",
+                shard: None
+            }
+        );
+    }
+
+    #[test]
+    fn keep_emits_exactly_one_served_ready() {
+        let dir = tmp("emit-keep");
+        let cfg = cfg_for(&dir);
+        let q = LivingQueue::from_config(&cfg).unwrap();
+        q.enqueue(Lane::Raw, &qa("a")).unwrap();
+        let free_vram = || Some(40.0);
+        let free_ram = || None::<f64>;
+        let train = |_: &EvolveConfig, _: &Dataset| Ok(vec!["teach".to_string()]);
+        let score = |_: &EvolveConfig| Ok(good_score());
+        let gpu_idle = || Some(false);
+        let emitted = std::cell::RefCell::new(Vec::<ServedReady>::new());
+        let emit = |r: ServedReady| emitted.borrow_mut().push(r);
+        let hooks = DaemonHooks {
+            free_vram_gb: &free_vram,
+            free_ram_gb: &free_ram,
+            gpu_busy: &gpu_idle,
+            train: &train,
+            score: &score,
+            now_secs: &zero_now,
+            sleep: &noop_sleep,
+            degrade: None,
+            take_nudge: None,
+            steering_compliance: None,
+            served_ready_emit: Some(&emit),
+        };
+        let opts = DaemonOptions {
+            max_vram_gb: Some(4.0),
+            exit_when_empty: true,
+            ..Default::default()
+        };
+        let report = run_daemon(&cfg, &opts, &good_score(), &hooks, &|| false).unwrap();
+        assert_eq!(report.committed(), 1);
+        let recs = emitted.borrow();
+        assert_eq!(recs.len(), 1, "one keep ⇒ exactly one served-ready record");
+        assert_eq!(recs[0].version, 1, "first commit is version 1");
+        assert_eq!(report.served_version, 1);
+    }
+
+    #[test]
+    fn rollback_emits_no_served_ready() {
+        // The judge gate reports degradation ⇒ Rollback despite good correctness;
+        // a rollback must emit NOTHING and leave the version at 0.
+        let dir = tmp("emit-rollback");
+        let cfg = cfg_for(&dir);
+        let q = LivingQueue::from_config(&cfg).unwrap();
+        q.enqueue(Lane::Raw, &qa("a")).unwrap();
+        let free_vram = || Some(40.0);
+        let free_ram = || None::<f64>;
+        let train = |_: &EvolveConfig, _: &Dataset| Ok(vec!["teach".to_string()]);
+        let score = |_: &EvolveConfig| Ok(good_score());
+        let gpu_idle = || Some(false);
+        let degrade = |_: &EvolveConfig| {
+            Ok(crate::eval::DegradationReport {
+                n: 2,
+                regressed: 1,
+                worse: vec![false, true],
+            })
+        };
+        let emitted = std::cell::RefCell::new(Vec::<ServedReady>::new());
+        let emit = |r: ServedReady| emitted.borrow_mut().push(r);
+        let hooks = DaemonHooks {
+            free_vram_gb: &free_vram,
+            free_ram_gb: &free_ram,
+            gpu_busy: &gpu_idle,
+            train: &train,
+            score: &score,
+            now_secs: &zero_now,
+            sleep: &noop_sleep,
+            degrade: Some(&degrade),
+            take_nudge: None,
+            steering_compliance: None,
+            served_ready_emit: Some(&emit),
+        };
+        let opts = DaemonOptions {
+            max_vram_gb: Some(4.0),
+            exit_when_empty: true,
+            ..Default::default()
+        };
+        let report = run_daemon(&cfg, &opts, &good_score(), &hooks, &|| false).unwrap();
+        assert_eq!(report.committed(), 0, "degradation ⇒ rolled back");
+        assert!(emitted.borrow().is_empty(), "rollback emits no signal");
+        assert_eq!(report.served_version, 0, "version does not advance on rollback");
+    }
+
+    #[test]
+    fn catastrophe_emits_no_served_ready() {
+        // Correctness below the catastrophe floor (0.10) ⇒ rollback + quarantine +
+        // halt; the catastrophe branch must emit NOTHING.
+        let dir = tmp("emit-catastrophe");
+        let cfg = cfg_for(&dir);
+        let q = LivingQueue::from_config(&cfg).unwrap();
+        q.enqueue(Lane::Raw, &qa("a")).unwrap();
+        let free_vram = || Some(40.0);
+        let free_ram = || None::<f64>;
+        let train = |_: &EvolveConfig, _: &Dataset| Ok(vec!["teach".to_string()]);
+        // Collapse below the 0.10 floor ⇒ Catastrophic.
+        let mut collapsed = good_score();
+        collapsed.correctness = 0.02;
+        let score = move |_: &EvolveConfig| Ok(collapsed.clone());
+        let gpu_idle = || Some(false);
+        let emitted = std::cell::RefCell::new(Vec::<ServedReady>::new());
+        let emit = |r: ServedReady| emitted.borrow_mut().push(r);
+        let hooks = DaemonHooks {
+            free_vram_gb: &free_vram,
+            free_ram_gb: &free_ram,
+            gpu_busy: &gpu_idle,
+            train: &train,
+            score: &score,
+            now_secs: &zero_now,
+            sleep: &noop_sleep,
+            degrade: None,
+            take_nudge: None,
+            steering_compliance: None,
+            served_ready_emit: Some(&emit),
+        };
+        let opts = DaemonOptions {
+            max_vram_gb: Some(4.0),
+            exit_when_empty: true,
+            ..Default::default()
+        };
+        let report = run_daemon(&cfg, &opts, &good_score(), &hooks, &|| false).unwrap();
+        assert!(report.halted, "a collapse halts the loop");
+        assert_eq!(report.committed(), 0);
+        assert!(emitted.borrow().is_empty(), "catastrophe emits no signal");
+        assert_eq!(report.served_version, 0);
+    }
+
+    #[test]
+    fn served_version_is_monotonic_across_keeps() {
+        // Three clean keeps ⇒ versions 1, 2, 3 in order; final report carries 3.
+        let dir = tmp("emit-monotonic");
+        let cfg = cfg_for(&dir);
+        let q = LivingQueue::from_config(&cfg).unwrap();
+        q.enqueue_many(Lane::Raw, &[qa("a"), qa("b"), qa("c")])
+            .unwrap();
+        let free_vram = || Some(40.0);
+        let free_ram = || None::<f64>;
+        let train = |_: &EvolveConfig, _: &Dataset| Ok(vec!["teach".to_string()]);
+        let score = |_: &EvolveConfig| Ok(good_score());
+        let gpu_idle = || Some(false);
+        let emitted = std::cell::RefCell::new(Vec::<ServedReady>::new());
+        let emit = |r: ServedReady| emitted.borrow_mut().push(r);
+        let hooks = DaemonHooks {
+            free_vram_gb: &free_vram,
+            free_ram_gb: &free_ram,
+            gpu_busy: &gpu_idle,
+            train: &train,
+            score: &score,
+            now_secs: &zero_now,
+            sleep: &noop_sleep,
+            degrade: None,
+            take_nudge: None,
+            steering_compliance: None,
+            served_ready_emit: Some(&emit),
+        };
+        let opts = DaemonOptions {
+            max_vram_gb: Some(4.0),
+            exit_when_empty: true,
+            ..Default::default()
+        };
+        let report = run_daemon(&cfg, &opts, &good_score(), &hooks, &|| false).unwrap();
+        assert_eq!(report.committed(), 3);
+        let versions: Vec<u64> = emitted.borrow().iter().map(|r| r.version).collect();
+        assert_eq!(versions, vec![1, 2, 3], "versions increment once per keep");
+        assert_eq!(report.served_version, 3);
     }
 }

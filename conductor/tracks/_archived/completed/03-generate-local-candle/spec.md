@@ -45,7 +45,7 @@ feature.
 - Dedup + quality filter drop a deliberately-degenerate (repeated/empty)
   generation in a unit test.
 - An unsupported architecture yields a clear error (no panic).
-- `scrt-evolve generate --backend local` runs end-to-end on the fixture model.
+- `evolve train generate --backend local` runs end-to-end on the fixture model.
 
 ## Dependencies
 Track 02 (`GenBackend`, `prompts.rs`, `Dataset`), track 00 (`train` feature +

@@ -32,8 +32,8 @@ Deliver the **PRIMARY real-model training and inference path** for scrt-evolve v
    - Reuses `LoRALinear` from trainer for consistency
 
 3. **Rust CLI arms**
-   - `scrt-evolve train --backend transformers --config evolve.toml` — shells out to Python trainer
-   - `scrt-evolve infer --prompt <text> [--adapter <dir>] [--ab]` — shells out to Python inference
+   - `evolve train fit --backend transformers --config evolve.toml` — shells out to Python trainer
+   - `evolve model infer --prompt <text> [--adapter <dir>] [--ab]` — shells out to Python inference
    - Reads model path from `evolve.toml` or CLI override
 
 4. **dataset.jsonl contract**
@@ -59,7 +59,7 @@ Deliver the **PRIMARY real-model training and inference path** for scrt-evolve v
 
 ### Acceptance criteria (end-to-end validated 2026-06-20)
 
-1. **`scrt-evolve train --backend transformers` loads a real RoPE/GQA model** (e.g., TinyLlama-1.1B)
+1. **`evolve train fit --backend transformers` loads a real RoPE/GQA model** (e.g., TinyLlama-1.1B)
    - Evidence: end-to-end run on 2026-06-20; successfully loaded TinyLlama-1.1B, attached LoRA to 22 layers (44 adapters on q_proj/v_proj), overfit on corpus batch
 2. **LoRA attaches to configured target modules**
    - Evidence: 44 adapters created (q_proj + v_proj across 22 layers); adapter tensor shapes correct (A=[rank, in], B=[out, rank])
@@ -71,7 +71,7 @@ Deliver the **PRIMARY real-model training and inference path** for scrt-evolve v
    - Evidence: base vs base+adapter outputs differ as expected; adapter LoRA injection in forward pass works
 6. **dataset.jsonl reads and round-trips**
    - Evidence: trainer reads mixed qa/instruction/completion rows; skips non-training kinds; computes prompt-masked loss
-7. **CLI subprocess dispatch works** (`scrt-evolve train --backend transformers` + `scrt-evolve infer`)
+7. **CLI subprocess dispatch works** (`evolve train fit --backend transformers` + `evolve model infer`)
    - Evidence: Rust CLI receives subprocess stdout (JSON summary from trainer), parses, reports to caller
 
 ### Acceptance definition (NOT yet final sign-off)

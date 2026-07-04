@@ -10,7 +10,7 @@
 | Output rows validate against the same `Dataset` schema as the API backend (interchangeable) | `generate_local.rs::local_and_api_rows_are_schema_interchangeable` (line 101) — local row (`gen="local"`) and api row (`gen="api"`) round-trip through JSONL identically, proving schema equivalence. |
 | Dedup + quality filter drop a deliberately-degenerate generation in a unit test | `generate_local.rs::degenerate_output_is_filtered` (line 58) — filter drops empty, too-short, repeated-char, and echo completions; keeps only the one good unique row. Implemented in `local.rs::filter_degenerate` (line 221). |
 | An unsupported architecture yields a clear error (no panic) | `model.rs::tests::unsupported_arch_errors_not_panics` (line 734) — config.json with `MambaForCausalLM` yields `ModelError::UnsupportedArch`, not a panic. Validation in `model.rs::arch_supported` (line 150). |
-| `scrt-evolve generate --backend local` runs end-to-end on the fixture model | `generate_local.rs::local_backend_produces_valid_rows_on_fixture` (line 30) — uses `run_with_backend` with LocalCandle over a fixture passage + fixture context. |
+| `evolve train generate --backend local` runs end-to-end on the fixture model | `generate_local.rs::local_backend_produces_valid_rows_on_fixture` (line 30) — uses `run_with_backend` with LocalCandle over a fixture passage + fixture context. |
 
 ## Full sweep result
 
@@ -20,7 +20,7 @@
   - **Total integration: 51 tests pass** (default ML-free suite + train feature suite combined).
 - `cargo clippy --all-targets --features train -D warnings`: clean.
 - `cargo fmt --check` (repo-wide): clean.
-- Default build (without `--features train`): stays ML-free; `candle-core`, `candle-nn`, `safetensors`, `pyo3` absent from dependency tree; `scrt-evolve generate --backend local` bails with clear "requires the train feature" message (dispatch at `generate/mod.rs:90-100`).
+- Default build (without `--features train`): stays ML-free; `candle-core`, `candle-nn`, `safetensors`, `pyo3` absent from dependency tree; `evolve train generate --backend local` bails with clear "requires the train feature" message (dispatch at `generate/mod.rs:90-100`).
 - Schema interchangeability verified: `LocalCandle` reuses `prompts::` templates + `api::parse_examples` parser verbatim, then re-stamps `gen="local"` (only provenance changes); both local and api rows serialize identically through `Dataset::to_jsonl()` / `Dataset::from_jsonl()`.
 - Determinism verified: same `seed` (SplitMix64 in `generate_text`) + same fixture config + same prompt → byte-identical generation (test: `same_seed_same_generation`).
 

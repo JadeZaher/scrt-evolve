@@ -58,6 +58,8 @@ impl ToolFormat {
         match s.to_lowercase().as_str() {
             "openai" => ToolFormat::OpenAi,
             "anthropic" => ToolFormat::Anthropic,
+            // Free-form string field; unrecognised values default to Gemma
+            // (the only fully-implemented renderer). `_` is correct here.
             _ => ToolFormat::Gemma,
         }
     }

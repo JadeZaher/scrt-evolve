@@ -25,7 +25,7 @@ export** so Python training tooling can consume the dataset.
 - `dataset.rs`: the JSONL contract from DESIGN.md §Dataset format — rows
   `kind = qa | instruction | completion | contrastive` with `source` + `gen`
   provenance. Writer + reader, one object per line.
-- `generate::run(&cfg, &ctx) -> Dataset` (SDK) + `scrt-evolve generate
+- `generate::run(&cfg, &ctx) -> Dataset` (SDK) + `evolve train generate
   [--in discovered.json] [--backend api]` (CLI) → `dataset.jsonl`.
 - **PyO3 bridge (first real surface):** under `--features pyo3`, expose a
   `read_dataset(path) -> list[dict]` (and an iterator) so `transformers`/`peft`
@@ -52,7 +52,7 @@ export** so Python training tooling can consume the dataset.
 - `turns > 1` issues the refine turn(s) (assert on the mock).
 - Under `--features pyo3`, a Python test loads `dataset.jsonl` via the bridge
   and sees the same rows (schema parity test, Rust-written ↔ Python-read).
-- `scrt-evolve generate --in discovered.json --backend api` writes the dataset
+- `evolve train generate --in discovered.json --backend api` writes the dataset
   without invoking discover.
 
 ## Dependencies

@@ -52,9 +52,9 @@ real model + real corpus.
 ## Acceptance
 - The CC adapter converts real `~/.claude/projects` sessions to valid generic
   transcript JSONL (verified: 5 sessions → 876 entries; 1 session → 48).
-- `scrt-evolve discover --config bench/evolve.toml` yields passages from the
+- `evolve train discover --config bench/evolve.toml` yields passages from the
   adapted corpus (verified: 120 passages).
-- `scrt-evolve evolve --schedule --config bench/evolve.toml` starts, runs
+- `evolve train auto --schedule --config bench/evolve.toml` starts, runs
   discover, and reaches live generation against the LM Studio teacher (verified
   during bring-up).
 - A bounded end-to-end smoke completes a full discover→generate→train→eval→

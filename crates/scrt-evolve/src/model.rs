@@ -68,6 +68,11 @@ pub use placeholder::LoadedModel;
 pub use train_impl::{LoadedModel, ModelConfig, ModelError};
 
 #[cfg(feature = "train")]
+pub mod arch;
+#[cfg(feature = "train")]
+pub use arch::{ArchAdapter, LayerDesc, LayerKind, LlamaAdapter, LoraTargetWeights, LoraWeights, SeamPoint};
+
+#[cfg(feature = "train")]
 mod train_impl {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -473,6 +478,96 @@ mod train_impl {
         /// logits `[batch, seq, vocab_size]`. Differentiable (track 04 loss).
         pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor, ModelError> {
             self.model.forward(input_ids)
+        }
+
+        /// Number of decoder layers (arch introspection for `arch::ArchAdapter`).
+        pub(crate) fn num_layers(&self) -> usize {
+            self.config.num_layers
+        }
+
+        /// Token + learned-positional embedding for `input_ids: [batch, seq]`.
+        /// Returns `[batch, seq, hidden]`. Used by `arch::LlamaAdapter`.
+        pub(crate) fn embed(&self, input_ids: &Tensor) -> Result<Tensor, ModelError> {
+            let (_b, seq) = input_ids.dims2()?;
+            let mut x = self.model.embed_tokens.forward(input_ids)?;
+            let positions = Tensor::arange(0u32, seq as u32, &self.device)?;
+            let pos = self.model.pos_embed.forward(&positions)?.unsqueeze(0)?;
+            x = x.broadcast_add(&pos)?;
+            Ok(x)
+        }
+
+        /// Run exactly decoder layer `idx` on `x: [batch, seq, hidden]` with a
+        /// causal mask matching `seq`. Byte-identical to the slice inside
+        /// `TinyLlama::forward`.
+        pub(crate) fn apply_layer(&self, idx: usize, x: &Tensor) -> Result<Tensor, ModelError> {
+            let (_b, seq, _h) = x.dims3()?;
+            let mask = causal_mask(seq, &self.device)?;
+            self.model.layers[idx].forward(x, &mask)
+        }
+
+        /// Final norm + lm_head, matching the tail of `TinyLlama::forward`.
+        pub(crate) fn head(&self, x: &Tensor) -> Result<Tensor, ModelError> {
+            let x = self.model.norm.forward(x)?;
+            Ok(self.model.lm_head.forward(&x)?)
+        }
+
+        /// Overwrite a set of named weights and re-materialise the internal
+        /// graph so `forward`/`apply_layer` reflect the update.
+        ///
+        /// candle's built `Linear`/`Embedding` modules capture cloned tensor
+        /// snapshots at construction — subsequent `Var::set` or
+        /// `VarMap::set_one` calls do NOT propagate into them. The proven
+        /// happy path (mirroring `LoadedModel::load`) is: save updated
+        /// weights to a safetensors, then rebuild the `VarMap` + graph from
+        /// disk. That's what this helper does, atomically, for the LoRA
+        /// compose-at-load merge.
+        pub(crate) fn overwrite_weights(
+            &mut self,
+            updates: &[(String, Tensor)],
+        ) -> Result<(), ModelError> {
+            // Snapshot the current full weight set, apply the updates, and
+            // rebuild via a temp-safetensors + VarMap::load round-trip.
+            let mut all: HashMap<String, Tensor> = {
+                let data = self.var_map.data().lock().unwrap_or_else(|e| e.into_inner());
+                data.iter()
+                    .map(|(k, v)| (k.clone(), v.as_detached_tensor()))
+                    .collect()
+            };
+            for (name, tensor) in updates {
+                if !all.contains_key(name) {
+                    return Err(ModelError::Shape(format!("unknown weight: {name}")));
+                }
+                all.insert(name.clone(), tensor.clone());
+            }
+            let tmp_dir = std::env::temp_dir().join(format!(
+                "scrt_evolve_merge_{}_{:p}",
+                std::process::id(),
+                self
+            ));
+            std::fs::create_dir_all(&tmp_dir)
+                .map_err(|e| ModelError::Load(format!("{}: {e}", tmp_dir.display())))?;
+            let path = tmp_dir.join("merged.safetensors");
+            candle_core::safetensors::save(&all, &path)
+                .map_err(|e| ModelError::Load(format!("{}: {e}", path.display())))?;
+
+            // Build the graph from a tensor-map VarBuilder so the created
+            // Linear/Embedding modules capture the merged tensors directly at
+            // construction time (VarMap-backed builders re-issue Vars that
+            // don't propagate post-hoc mutations into already-built modules).
+            let vb = VarBuilder::from_tensors(all.clone(), DType::F32, &self.device);
+            let model = TinyLlama::new(&self.config, vb, self.device.clone())?;
+            // Also rebuild the VarMap so external readers (LoRA training,
+            // save_safetensors) see the merged weights.
+            let mut new_map = VarMap::new();
+            let vb2 = VarBuilder::from_varmap(&new_map, DType::F32, &self.device);
+            let _ = TinyLlama::new(&self.config, vb2, self.device.clone())?;
+            new_map
+                .load(&path)
+                .map_err(|e| ModelError::Load(format!("{}: {e}", path.display())))?;
+            self.var_map = new_map;
+            self.model = model;
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            Ok(())
         }
 
         /// Encode `text` to token ids (no special tokens added).

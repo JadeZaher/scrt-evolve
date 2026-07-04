@@ -65,6 +65,7 @@ pub struct GenPlan {
 }
 
 impl GenPlan {
+    /// Create a new plan at round 0 from the given specs.
     pub fn new(specs: Vec<GenSpec>) -> Self {
         Self {
             round: 0,
@@ -78,14 +79,17 @@ impl GenPlan {
         self.specs.iter().map(|s| s.count).sum()
     }
 
+    /// Serialize the plan to a pretty-printed JSON string.
     pub fn to_json(&self) -> serde_json::Result<String> {
         serde_json::to_string_pretty(self)
     }
 
+    /// Deserialize a plan from a JSON string.
     pub fn from_json(s: &str) -> anyhow::Result<Self> {
         Ok(serde_json::from_str(s)?)
     }
 
+    /// Write the plan as JSON to `path`, creating parent directories as needed.
     pub fn write(&self, path: impl AsRef<std::path::Path>) -> anyhow::Result<()> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
@@ -97,6 +101,7 @@ impl GenPlan {
         Ok(())
     }
 
+    /// Read and deserialize a plan from a JSON file at `path`.
     pub fn read(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
         Self::from_json(&std::fs::read_to_string(path)?)
     }

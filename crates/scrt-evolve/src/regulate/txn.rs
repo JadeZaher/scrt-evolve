@@ -301,7 +301,7 @@ impl Regulator {
         // (6) Log it.
         let cause = match action {
             StepAction::Quarantine => Some(format!("quarantined provenance: {provenance:?}")),
-            _ => None,
+            StepAction::Commit | StepAction::Rollback => None,
         };
         let entry = EvolutionLogEntry {
             step: ordinal,

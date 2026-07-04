@@ -15,7 +15,7 @@
 ## Full sweep result
 - `cargo test` (default, ML-free): **5 discover tests pass** (`discovers_passages_with_provenance`, `near_duplicate_passages_collapse`, `max_passages_is_honored`, `missing_corpus_dir_errors_clearly`, `discovered_context_round_trips_json`). Part of the larger 51-test default green suite.
 - `cargo clippy --all-targets -- -D warnings` (default): clean.
-- `scrt-evolve discover --help` lists the subcommand; `cmd_discover` writes to `work_dir/discovered.json` as specified.
+- `evolve train discover --help` lists the subcommand; `cmd_discover` writes to `work_dir/discovered.json` as specified.
 - No new dependencies added; scrt-core consumed in-process as required. Deterministic (no unseeded RNG).
 
 ## Notes / carry-forward

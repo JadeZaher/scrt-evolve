@@ -30,8 +30,8 @@ Standalone Python trainer (transformers + hand-rolled LoRA) + inference module, 
   - Adapter config reloaded from adapter_config.json correctly
 
 - [x] **Rust CLI arms wired and build green**
-  - `scrt-evolve train --backend transformers` dispatches to Python trainer via subprocess
-  - `scrt-evolve infer` dispatches to Python inference module
+  - `evolve train fit --backend transformers` dispatches to Python trainer via subprocess
+  - `evolve model infer` dispatches to Python inference module
   - Rust build compiles; no new dependencies in default build
 
 - [x] **Larger dataset generated** (scrt-evolve corpus discovery + generation stages)

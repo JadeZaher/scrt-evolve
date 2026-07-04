@@ -77,7 +77,7 @@ pub fn from_log(entries: &[EvolutionLogEntry], last: usize) -> TrendSummary {
             .map(|w| w[1].correctness - w[0].correctness)
             .collect();
         let mean = deltas.iter().sum::<f64>() / deltas.len() as f64;
-        let total = series.last().unwrap().correctness - series.first().unwrap().correctness;
+        let total = series[series.len() - 1].correctness - series[0].correctness;
         (mean, total)
     };
     let latest = series.last().map(|p| p.correctness);
@@ -88,6 +88,26 @@ pub fn from_log(entries: &[EvolutionLogEntry], last: usize) -> TrendSummary {
         total_change,
         latest,
     }
+}
+
+/// The steering-compliance series (track 37 Phase D): the fraction of sampled
+/// generated rows the judge found steering-aligned, per step. Read from the
+/// `kind:"steering_compliance"` evolution-log rows (value in `cause` as
+/// `steering_compliance=<f>`). Surfaced in `watch trend` alongside correctness.
+pub fn steering_compliance_from_log(entries: &[EvolutionLogEntry], last: usize) -> Vec<(u64, f64)> {
+    let mut series: Vec<(u64, f64)> = entries
+        .iter()
+        .filter(|e| e.kind == "steering_compliance")
+        .filter_map(|e| {
+            let cause = e.cause.as_deref()?;
+            let val = cause.split("steering_compliance=").nth(1)?.trim();
+            val.parse::<f64>().ok().map(|f| (e.step, f))
+        })
+        .collect();
+    if last > 0 && series.len() > last {
+        series = series.split_off(series.len() - last);
+    }
+    series
 }
 
 #[cfg(test)]
@@ -174,5 +194,32 @@ mod tests {
         let t = from_log(&[], 0);
         assert!(t.series.is_empty());
         assert_eq!(t.latest, None);
+    }
+
+    fn compliance_entry(step: u64, frac: f64) -> EvolutionLogEntry {
+        EvolutionLogEntry {
+            step,
+            checkpoint_id: format!("compliance-{step}"),
+            kind: "steering_compliance".into(),
+            verdict: None,
+            metrics: None,
+            action: StepAction::Commit,
+            cause: Some(format!("steering_compliance={frac:.4}")),
+        }
+    }
+
+    #[test]
+    fn steering_compliance_series_parsed_from_cause() {
+        // Interleave with correctness rows to prove the filter is kind-specific.
+        let log = vec![
+            entry(1, 0.4, StepAction::Commit),
+            compliance_entry(1, 0.5),
+            entry(2, 0.5, StepAction::Commit),
+            compliance_entry(2, 0.75),
+        ];
+        let comp = steering_compliance_from_log(&log, 0);
+        assert_eq!(comp, vec![(1, 0.5), (2, 0.75)]);
+        // The correctness trend is unaffected by the compliance rows.
+        assert_eq!(from_log(&log, 0).series.len(), 2);
     }
 }

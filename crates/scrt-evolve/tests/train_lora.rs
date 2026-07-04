@@ -9,7 +9,7 @@
 #![cfg(feature = "train")]
 
 use scrt_evolve::config::{EvolveConfig, LoraConfig, TrainConfig};
-use scrt_evolve::dataset::{Dataset, GenExample};
+use scrt_evolve::dataset::{Dataset, GenExample, Outcome, Tier, Verdict};
 use scrt_evolve::model::{LoadedModel, ModelConfig};
 use scrt_evolve::train::lora::{inject_adapters, load_adapter, LoraPreset};
 
@@ -21,12 +21,22 @@ fn tiny_dataset() -> Dataset {
             completion: "pong".to_string(),
             source: None,
             gen: None,
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         },
         GenExample::Qa {
             prompt: "hi".to_string(),
             completion: "yo".to_string(),
             source: None,
             gen: None,
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         },
         GenExample::Instruction {
             instruction: "echo".to_string(),
@@ -34,6 +44,11 @@ fn tiny_dataset() -> Dataset {
             output: "ok".to_string(),
             source: None,
             gen: None,
+            outcome: Outcome::Unknown,
+            judge_score: None,
+            judge_verdict: Verdict::Unjudged,
+            tier: Tier::Private,
+            chosen_over: None,
         },
     ])
 }
@@ -45,6 +60,7 @@ fn lora_cfg(rank: usize, alpha: usize, epochs: usize) -> LoraConfig {
         target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
         lr: 1e-2,
         epochs,
+        init_adapter: None,
     }
 }
 

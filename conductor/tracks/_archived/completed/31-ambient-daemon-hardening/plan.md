@@ -11,11 +11,11 @@ resource: ./metadata.json
 
 > **DONE (2026-06-28).** All five phases shipped + tested; full sweep green
 > (`cargo test` 0 failures · `clippy --all-targets` clean · `fmt --check` ok).
-> Live-verified: `doctor` (judge_model PASS), `daemon health`, `daemon trend`,
-> `daemon status` all run against the live work dir. Files: `generate/api.rs`
+> Live-verified: `doctor` (judge_model PASS), `watch health`, `watch trend`,
+> `watch status` all run against the live work dir. Files: `generate/api.rs`
 > (`list_models`/`preflight`/`classify_models`), `ingest_ledger.rs`, `trend.rs`,
 > `daemon.rs` (retries/supervisor/budget/clock hooks), `ingest.rs` (per-source
-> stamps), CLI `daemon health`/`trend` + `doctor` judge check + `run_ingest`
+> stamps), CLI `watch health`/`trend` + `doctor` judge check + `run_ingest`
 > ledger wiring + `cmd_ambient` idle-on-empty. **The running daemon must be
 > restarted to pick up the new binary** (the live process predates this code).
 
@@ -62,7 +62,7 @@ then Q4 (measurement).
    in `[daemon]`), then surfaced as a failed-but-non-halting step if exhausted.
 2. [ ] Track consecutive transient failures; exceed a cap ⇒ stop with a clear
    "supervisor giving up" report (auto-restart is the CLI loop re-entering).
-3. [ ] `daemon health`: read run/stop files + the evolution log tail → run-state,
+3. [ ] `watch health`: read run/stop files + the evolution log tail → run-state,
    last ordinal, last verdict, last error, consecutive failures, committed count.
    JSON + human.
 4. [ ] Per-source gen stamps: ingest stamps rows by source slug (e.g.
@@ -84,8 +84,8 @@ then Q4 (measurement).
 1. [ ] `trend.rs` (pure): given the evolution log (or checkpoint manifests),
    compute the committed-checkpoint correctness series + a simple
    slope/delta-over-last-N summary.
-2. [ ] Surface in `daemon status` / `health` (latest correctness + trend arrow)
-   and a small `daemon trend` view (series + summary, JSON + human).
+2. [ ] Surface in `watch status` / `health` (latest correctness + trend arrow)
+   and a small `watch trend` view (series + summary, JSON + human).
 3. [ ] (Optional, behind a flag) A/B infer on a held-out prompt set for a
    behavioral spot-check; defer if it needs the ML subprocess.
 4. [ ] Tests: trend from a synthetic log (rising / flat / noisy).

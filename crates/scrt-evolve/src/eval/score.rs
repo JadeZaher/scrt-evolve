@@ -75,6 +75,7 @@ impl ScoreReport {
 
 /// A model scorer: score a probe set into a [`ScoreReport`].
 pub trait Scorer {
+    /// Score the model on `probe` and return a comparable report.
     fn score(&self, probe: &ProbeSet) -> anyhow::Result<ScoreReport>;
 }
 
@@ -89,7 +90,7 @@ pub struct ApiScorer<T: ChatTransport> {
 }
 
 impl<T: ChatTransport> ApiScorer<T> {
-    /// Build with a transport + a gate.
+    /// Build an `ApiScorer` with the given transport and executable gate.
     pub fn new(transport: T, gate: ExecutableGate) -> Self {
         Self { transport, gate }
     }
@@ -238,6 +239,7 @@ fn strip_fences(s: &str) -> String {
     // Drop an optional language tag on the opening fence's line.
     let t = match t.find('\n') {
         Some(nl) if t[..nl].chars().all(|c| c.is_alphanumeric()) => &t[nl + 1..],
+        // None (no newline) or Some with a non-alphanumeric first line — leave t as-is.
         _ => t,
     };
     let t = t.strip_suffix("```").unwrap_or(t);

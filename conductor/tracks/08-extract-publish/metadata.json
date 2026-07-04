@@ -1,8 +1,8 @@
 {
   "id": "08-extract-publish",
   "type": "chore",
-  "status": "pending",
-  "description": "Finalization: swap the scrt-core git dep and publish artifacts — DESIGN.md phase 9.",
+  "status": "in_progress",
+  "description": "Finalization: swap the scrt-core git dep and publish artifacts — DESIGN.md phase 9. Pre-publish work done 2026-07-03 (docs/CI/sweep/decision + staged swap); remaining verify→flip→tag blocked on the scrt-core crates.io publish.",
   "created_at": "2026-06-19T05:10:41-06:00",
-  "updated_at": "2026-06-19T05:10:41-06:00"
+  "updated_at": "2026-07-03T00:00:00Z"
 }

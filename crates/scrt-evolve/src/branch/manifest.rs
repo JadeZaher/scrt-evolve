@@ -16,6 +16,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::dataset::Tier;
+
 /// The registry schema version. A registry with a different version is refused on
 /// load (forward/backward-incompatible schemas must be migrated, not guessed).
 pub const REGISTRY_SCHEMA_VERSION: u32 = 1;
@@ -81,6 +83,10 @@ pub struct BranchManifest {
     pub gguf_sha: String,
     /// ISO-8601 creation timestamp.
     pub created: String,
+    /// Data-sovereignty tier (track 37): most-restrictive row tier in the branch corpus.
+    /// Additive v1.1 field — legacy manifests without `tier` default to Private. // see AGENTS.md §manifest tier
+    #[serde(default, skip_serializing_if = "tier_is_private")]
+    pub tier: Tier,
 }
 
 impl BranchManifest {
@@ -207,6 +213,13 @@ pub fn sha256_file(path: impl AsRef<Path>) -> std::io::Result<String> {
         hasher.update(&buf[..n]);
     }
     Ok(hex_encode(&hasher.finalize()))
+}
+
+/// Returns `true` when `t` is the default `Private` tier — used by serde
+/// `skip_serializing_if` to keep Private off the wire (legacy manifests parse as Private via
+/// `#[serde(default)]`; Shared is always serialized so peers can see the permission level).
+fn tier_is_private(t: &Tier) -> bool {
+    matches!(t, Tier::Private)
 }
 
 /// Create `path`'s parent directory if it doesn't exist (the atomic writer needs

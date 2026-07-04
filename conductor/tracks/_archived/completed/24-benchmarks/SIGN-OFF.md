@@ -25,7 +25,7 @@ corpus + a live teacher.**
 ## Bring-up evidence (real data, this machine)
 1. **Adapter:** real `~/.claude/projects` sessions → valid generic transcript
    JSONL (5 sessions → 876 entries; 1 → 48). ✓
-2. **Discover:** `scrt-evolve discover --config bench/evolve.toml` → **120
+2. **Discover:** `evolve train discover --config bench/evolve.toml` → **120
    passages** from the adapted transcript corpus. ✓
 3. **Schedule starts + live generation:** `evolve --schedule` ran discover and
    reached LIVE calls to the LM Studio teacher. ✓

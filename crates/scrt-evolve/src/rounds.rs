@@ -199,6 +199,7 @@ pub struct ScheduleReport {
 }
 
 impl ScheduleReport {
+    /// Count rounds whose transaction action was `Commit`.
     pub fn committed(&self) -> usize {
         self.rounds
             .iter()

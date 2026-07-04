@@ -1,0 +1,8 @@
+{
+  "id": "33-concurrent-inference-during-training",
+  "type": "feature",
+  "status": "in-progress",
+  "description": "Serve inference on the evolving model while the ambient daemon trains it, hot-swapping the adapter only at each keep-commit (never mid-block). VRAM-arbitrated co-residence of a served GGUF + one training block on 8GB.",
+  "created_at": "2026-06-30T00:00:00-06:00",
+  "updated_at": "2026-07-03T00:00:00-06:00"
+}

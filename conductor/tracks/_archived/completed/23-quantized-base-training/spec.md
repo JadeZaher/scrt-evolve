@@ -43,8 +43,8 @@ trainable student.
   [--tokenizer <fallback>]`. Final stdout line = JSON {out, arch, n_tensors,
   dtype}.
 
-### 2. Rust CLI: `scrt-evolve dequant`
-- `scrt-evolve dequant --gguf <path> --out <dir>` shells out to the Python
+### 2. Rust CLI: `evolve train dequant`
+- `evolve train dequant --gguf <path> --out <dir>` shells out to the Python
   converter (track-19 subprocess pattern). Auto-detects the llama.cpp `gguf-py`
   on PYTHONPATH like `export-gguf` does.
 - A convenience: if `[evolve].model_path` points at a `.gguf`, the train/eval
@@ -86,8 +86,8 @@ trainable student.
   GGUF → HF → LoRA+QAT → merge → GGUF).
 
 ## Acceptance
-- `scrt-evolve dequant --gguf <granite Q4_K_M> --out base-hf/` produces an HF dir
-  that `transformers` loads and `scrt-evolve infer` runs (smoke).
+- `evolve train dequant --gguf <granite Q4_K_M> --out base-hf/` produces an HF dir
+  that `transformers` loads and `evolve model infer` runs (smoke).
 - A LoRA train run on the dequantized base produces an `adapter.safetensors`
   loadable by infer (the existing track-19 path, base swapped).
 - `--qat Q4_K_M` training runs end-to-end and the fake-quant is exercised

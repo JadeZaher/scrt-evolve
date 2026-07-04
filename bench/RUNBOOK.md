@@ -75,24 +75,24 @@ $PY = "C:/Users/atooz/Documents/Escherbridge/laxame-hivemind/hivemind-models/.ve
 cd C:/Users/atooz/Programming/ai-utils-memory/scrt-evolve
 ```
 
-## Step 1 — Adapt Claude Code transcripts → corpus
-Claude Code stores sessions in its native format; the adapter flattens them to
-the generic transcript shape under `bench/corpus/`.
-```powershell
-& $PY bench/harvest_claude_projects.py `
-  --projects "C:/Users/atooz/.claude/projects" `
-  --out      "bench/corpus" `
-  --max-chars 4000
-# (smoke first: add `--limit-sessions 5`)
+## Step 1 — Ingest Claude Code transcripts → corpus
+Claude Code stores sessions in its native format; the shipped `evolve` ingest
+path flattens them to the generic transcript shape under `bench/corpus/`.
+```bash
+$EVOLVE ingest --from "C:/Users/atooz/.claude/projects" --out "bench/corpus"
 ```
-Output: per-session `<project>__<uuid>.jsonl` of `{role,text,command?}` rows +
-a JSON summary (`sessions_written`, `entries`).
+Output: per-session `<project>__<uuid>.jsonl` of `{role,text,command?}` rows.
+(Under WSL, point `--from` at `/mnt/c/Users/atooz/.claude/projects`.)
 
 ## Step 2 — Build the binary
-```powershell
-cargo build --release -p scrt-evolve-cli
-$EVOLVE = "target/release/scrt-evolve.exe"
+The binary is `evolve`. **For Granite, build + run under WSL** (the native
+Windows venv lacks the mamba kernels — Granite's backward segfaults on it):
+```bash
+# in WSL: source ~/.cargo/env first
+cargo build --release -p scrt-evolve-cli   # → target/release/evolve
+EVOLVE=./target/release/evolve
 ```
+(A CPU-only non-Mamba student can build/run the Windows `evolve.exe` the same way.)
 
 ## Step 3 — SMOKE (bounded) — prove the pipeline end-to-end
 A 2-round schedule confirms discover→generate→train→eval→keep|rollback works on
@@ -105,7 +105,7 @@ edit it), and adapt only a few sessions (`--limit-sessions 5`). Restore
 `max_passages = 120` for the real run. Expect the smoke to still take minutes
 (CPU teacher + CPU Granite train step).
 ```powershell
-& $EVOLVE evolve --schedule `
+& $EVOLVE train auto --schedule `
   --config bench/evolve.toml `
   --max-rounds 2 --policy weighted `
   --python $PY
@@ -113,8 +113,8 @@ edit it), and adapt only a few sessions (`--limit-sessions 5`). Restore
 Watch for: per-round lines with `correctness=` and `[kept|rolled back]`; a
 `work/score.json`; `work/checkpoints/` populated; `work/evolution-log.jsonl`
 rows. If a round catastrophes it halts — inspect with
-`& $EVOLVE quarantine list --config bench/evolve.toml` and re-arm with
-`quarantine clear`.
+`& $EVOLVE watch quarantine list --config bench/evolve.toml` and re-arm with
+`watch quarantine clear`.
 
 ## Step 4 — THE BENCH (long, operator-launched) — multi-day schedule
 Scale the budget up. The schedule is bounded by `--max-rounds` and RESUMABLE
@@ -122,7 +122,7 @@ Scale the budget up. The schedule is bounded by `--max-rounds` and RESUMABLE
 quarantine), so you can stop/restart across days.
 ```powershell
 # e.g. 60 rounds, weighted across the 3 goals. Run in a durable shell.
-& $EVOLVE evolve --schedule `
+& $EVOLVE train auto --schedule `
   --config bench/evolve.toml `
   --max-rounds 60 --policy weighted `
   --python $PY
@@ -130,14 +130,14 @@ quarantine), so you can stop/restart across days.
 Resume after an interruption: just re-run the same command — it picks up where
 it left off. Track progress:
 ```powershell
-& $EVOLVE checkpoints list --config bench/evolve.toml
+& $EVOLVE watch checkpoints list --config bench/evolve.toml
 Get-Content bench/work/evolution-log.jsonl -Tail 20
 ```
 
 ## Step 5 — Export the evolved model to GGUF (for LM Studio)
 After the schedule, merge the kept adapter + export a Q4_K_M GGUF.
 ```powershell
-& $EVOLVE export-gguf `
+& $EVOLVE train export-gguf `
   --config bench/evolve.toml `
   --quant Q4_K_M `
   --python $PY
@@ -147,7 +147,7 @@ After the schedule, merge the kept adapter + export a Q4_K_M GGUF.
 ## Step 6 — Measure the lift (optional)
 Compare base vs evolved on the held-out probe / the demo benchmark:
 ```powershell
-& $EVOLVE eval --config bench/evolve.toml --python $PY   # evolved (adapter applied)
+& $EVOLVE train eval --config bench/evolve.toml --python $PY   # evolved (adapter applied)
 & $PY demo/benchmark.py demo/baseline-static/dataset.jsonl bench/work/goals/scrt-cli-fluency/dataset.jsonl
 ```
 
@@ -161,18 +161,18 @@ empirical, not assertable. Procedure to find the floor:
 foreach ($n in 1,2,4,8) {
   # edit bench/ambient.toml -> [daemon].min_train_pairs = $n  (or copy per-N configs)
   & $EVOLVE --ambient --dir bench            # let it run a bounded while, then stop
-  & $EVOLVE daemon stop   --config bench/ambient.toml
-  & $EVOLVE daemon trend  --config bench/ambient.toml   # record Δtotal / arrow
-  & $EVOLVE daemon health --config bench/ambient.toml   # record committed / last error
+  & $EVOLVE ambient stop  --config bench/ambient.toml
+  & $EVOLVE watch trend   --config bench/ambient.toml   # record Δtotal / arrow
+  & $EVOLVE watch health  --config bench/ambient.toml   # record committed / last error
 }
 ```
 
-Pick the **smallest** `N` whose `daemon trend` slope is non-negative and whose
+Pick the **smallest** `N` whose `watch trend` slope is non-negative and whose
 degradation-judge regress rate is bounded — that's "enough signal per step to not
 overfit" without starving the loop. Default is 4 (half a `batch=8`).
 
 For the **judge gate** (`[regulate].gate = "judge"`): turn it on, run the same
-loop, and compare the commit rate + `daemon trend` against the correctness gate.
+loop, and compare the commit rate + `watch trend` against the correctness gate.
 The judge gate should commit MORE steps (it accepts "no worse" instead of
 requiring "measurably better") while `trend` stays flat-or-up — that's the gate
 doing its job (progress without regression). If the judge endpoint is down, the

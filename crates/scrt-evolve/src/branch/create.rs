@@ -18,11 +18,106 @@ use crate::config::EvolveConfig;
 use crate::dataset::{Dataset, GenExample};
 use crate::discover::DiscoveredContext;
 use crate::eval::{ProbeSet, ScoreReport};
+use crate::judge::{dataset_signal_stats, dataset_tier};
 use crate::regulate::{Regulator, StepAction};
 use crate::workdir::WorkDir;
 
 use super::manifest::{sha256_file, BranchManifest, BranchRegistry, Lineage, MANIFEST_VERSION};
 use super::router::{admit, corpus_signature, AdmitOutcome};
+
+// ── Servability preflight (PC-4) ─────────────────────────────────────────────
+//
+// Source of truth: `model.rs::train_impl::arch_supported` — kept in sync
+// manually; if that list grows, update this mirror too.
+// NOTE: `arch_supported` is `fn`-private inside `#[cfg(feature="train")]` so
+// it is NOT reachable from this crate-level module.  When model.rs makes
+// `arch_supported` pub (or exposes a pub `arch_is_servable`), replace this
+// mirror with a direct call.
+//
+// Supported (llama-family + fixture, Phase A):
+//   LlamaForCausalLM  — all llama/mistral/vicuna/phi checkpoints
+//   LlamaModel        — HF variant without the CausalLM head wrapper
+//   ScrtEvolveTinyCausalLM — random-fixture model (CI/tests)
+//
+// Refused (Phase B / never):
+//   GraniteForCausalLM / GraniteModel — IBM Granite-4-h; not yet wired
+//     (Phase B target: add Granite seam to arch.rs).
+//   MambaForCausalLM / MixedMambaForCausalLM — pure-Mamba / MoE-Mamba;
+//     state-space kernels incompatible with the current attention-only seam;
+//     refused indefinitely until a Mamba ArchAdapter is added.
+//   MixtralForCausalLM / PhiMoEForCausalLM — pure-MoE routing; no MoE seam.
+//   (anything else) — unknown; refused until an explicit seam exists.
+
+fn arch_is_servable(arch: &str) -> bool {
+    matches!(
+        arch,
+        "LlamaForCausalLM" | "LlamaModel" | "ScrtEvolveTinyCausalLM"
+    )
+}
+
+/// Why a given `architectures` string is refused — surfaced verbatim in the
+/// doctor-style error message.
+fn arch_refuse_reason(arch: &str) -> &'static str {
+    match arch {
+        "GraniteForCausalLM" | "GraniteModel" => {
+            "IBM Granite is not yet wired to the native inference seam \
+(Phase B target: add Granite ArchAdapter to arch.rs)"
+        }
+        "MambaForCausalLM" | "MixedMambaForCausalLM" => {
+            "pure-Mamba / Mamba-MoE architectures use state-space kernels that \
+are incompatible with the current attention-only ArchAdapter; \
+refused until a Mamba seam is added"
+        }
+        "MixtralForCausalLM" | "PhiMoEForCausalLM" => {
+            "sparse MoE routing is not supported by the current linear-layer ArchAdapter; \
+refused until a MoE seam is added"
+        }
+        _ => "architecture has no registered native-inference seam; \
+add an ArchAdapter in arch.rs before creating branches on this model",
+    }
+}
+
+/// Read `<model_dir>/config.json` and confirm every listed architecture is
+/// servable by native candle inference.  Returns `Ok(())` on success or an
+/// `Err` with a doctor-style message that names the arch and why it is refused.
+/// If `model_path` is `None` (no base model configured) the check is skipped
+/// — the hook pipeline will fail later with a more specific message.
+fn preflight_arch(model_path: Option<&std::path::Path>) -> anyhow::Result<()> {
+    let mpath = match model_path {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+    let config_json = mpath.join("config.json");
+    if !config_json.exists() {
+        // No config.json on disk (e.g. fixture path) — silently skip; the
+        // loader will surface the missing-file error at a later stage.
+        return Ok(());
+    }
+    let raw = std::fs::read_to_string(&config_json)
+        .map_err(|e| anyhow::anyhow!("preflight: could not read {}: {e}", config_json.display()))?;
+    let v: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| anyhow::anyhow!("preflight: could not parse {}: {e}", config_json.display()))?;
+
+    if let Some(archs) = v.get("architectures").and_then(|a| a.as_array()) {
+        for arch_val in archs {
+            if let Some(arch) = arch_val.as_str() {
+                if !arch_is_servable(arch) {
+                    let reason = arch_refuse_reason(arch);
+                    return Err(anyhow::anyhow!(
+                        "[preflight] branch creation refused — \
+architecture `{arch}` is not servable by native inference.\n\
+  reason : {reason}\n\
+  model  : {}\n\
+  fix    : choose a llama-family model (LlamaForCausalLM / LlamaModel) \
+or wait for the Phase B seam for this architecture.",
+                        mpath.display()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Similarity at/above which a new branch is a near-duplicate of an existing one
 /// and merges instead of spawning a twin (styleguide §2.5; reuses track-14 shape).
@@ -87,6 +182,11 @@ pub fn create(
     hooks: &BranchHooks,
 ) -> anyhow::Result<CreateReport> {
     let scoped = scope_config(cfg, name, base, corpus);
+
+    // PC-4: trainable ⇒ servable invariant — refuse early if the base model's
+    // architecture cannot be served by native candle inference.
+    preflight_arch(scoped.evolve.model_path.as_deref())?;
+
     let reg = Regulator::new(&scoped)?;
     let branch_wd = WorkDir::from_config(&scoped);
     branch_wd.ensure()?;
@@ -194,17 +294,21 @@ pub fn create(
                     .unwrap_or_else(|| "<palace>".to_string())
             );
 
+            let mut eval_report = score_to_map(outcome.metrics.as_ref());
+            eval_report.extend(dataset_signal_stats(&dataset.rows)); // track 37: signal stats
+            let corpus_tier = dataset_tier(&dataset.rows); // track 37: data-sovereignty tier
             let manifest = BranchManifest {
                 name: name.to_string(),
                 base_model,
                 domain: domain.unwrap_or("").to_string(),
                 corpus_descriptor,
                 router_signature,
-                eval_report: score_to_map(outcome.metrics.as_ref()),
+                eval_report,
                 lineage: Lineage::default(),
                 version: MANIFEST_VERSION.to_string(),
                 gguf_sha,
                 created: created.to_string(),
+                tier: corpus_tier,
             };
             manifest.write(branch_wd.root().join("manifest.json"))?;
 
@@ -344,4 +448,126 @@ fn score_to_map(report: Option<&ScoreReport>) -> std::collections::BTreeMap<Stri
 
 fn path_to_string(p: &Path) -> String {
     p.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::{arch_is_servable, arch_refuse_reason, preflight_arch};
+    use std::io::Write;
+
+    fn tmp_model_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join("scrt_evolve_pc4_tests")
+            .join(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_config(dir: &std::path::Path, archs: &[&str]) {
+        let arch_strs: Vec<String> = archs.iter().map(|a| format!("\"{a}\"")).collect();
+        let json = format!("{{\"architectures\": [{}]}}", arch_strs.join(", "));
+        let mut f = std::fs::File::create(dir.join("config.json")).unwrap();
+        f.write_all(json.as_bytes()).unwrap();
+    }
+
+    // ── arch_is_servable unit tests ────────────────────────────────────
+
+    #[test]
+    fn llama_family_is_servable() {
+        assert!(arch_is_servable("LlamaForCausalLM"));
+        assert!(arch_is_servable("LlamaModel"));
+        assert!(arch_is_servable("ScrtEvolveTinyCausalLM"));
+    }
+
+    #[test]
+    fn unsupported_arches_refused() {
+        for arch in &[
+            "GraniteForCausalLM",
+            "GraniteModel",
+            "MambaForCausalLM",
+            "MixedMambaForCausalLM",
+            "MixtralForCausalLM",
+            "PhiMoEForCausalLM",
+            "FalconForCausalLM",
+            "SomeNewModel",
+        ] {
+            assert!(!arch_is_servable(arch), "{arch} should be refused");
+        }
+    }
+
+    #[test]
+    fn refuse_reason_granite_mentions_phase_b() {
+        let reason = arch_refuse_reason("GraniteForCausalLM");
+        assert!(
+            reason.contains("Phase B"),
+            "Granite reason should mention Phase B: {reason}"
+        );
+    }
+
+    #[test]
+    fn refuse_reason_mamba_mentions_state_space() {
+        let reason = arch_refuse_reason("MambaForCausalLM");
+        assert!(
+            reason.contains("state-space"),
+            "Mamba reason should mention state-space: {reason}"
+        );
+    }
+
+    // ── preflight_arch integration tests (real config.json on tmp dir) ────────
+
+    #[test]
+    fn preflight_passes_for_llama() {
+        let dir = tmp_model_dir("llama");
+        write_config(&dir, &["LlamaForCausalLM"]);
+        preflight_arch(Some(&dir)).expect("LlamaForCausalLM should pass preflight");
+    }
+
+    #[test]
+    fn preflight_refused_for_granite() {
+        let dir = tmp_model_dir("granite");
+        write_config(&dir, &["GraniteForCausalLM"]);
+        let err = preflight_arch(Some(&dir))
+            .expect_err("GraniteForCausalLM should be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("GraniteForCausalLM"), "error should name the arch: {msg}");
+        assert!(msg.contains("Phase B"), "error should mention Phase B: {msg}");
+        assert!(msg.contains("[preflight]"), "error should be tagged preflight: {msg}");
+    }
+
+    #[test]
+    fn preflight_refused_for_mamba() {
+        let dir = tmp_model_dir("mamba");
+        write_config(&dir, &["MambaForCausalLM"]);
+        let err = preflight_arch(Some(&dir))
+            .expect_err("MambaForCausalLM should be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("MambaForCausalLM"), "error should name the arch: {msg}");
+        assert!(msg.contains("state-space"), "error body should explain why: {msg}");
+    }
+
+    #[test]
+    fn preflight_refused_for_moe() {
+        let dir = tmp_model_dir("moe");
+        write_config(&dir, &["MixtralForCausalLM"]);
+        let err = preflight_arch(Some(&dir))
+            .expect_err("MixtralForCausalLM should be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("MixtralForCausalLM"), "{msg}");
+        assert!(msg.contains("MoE") || msg.contains("routing"), "{msg}");
+    }
+
+    #[test]
+    fn preflight_skips_missing_config_json() {
+        // A directory with no config.json (e.g. fixture path) — silently skip.
+        let dir = tmp_model_dir("no_config");
+        // Remove config.json if a previous run wrote one.
+        let _ = std::fs::remove_file(dir.join("config.json"));
+        preflight_arch(Some(&dir)).expect("missing config.json should be skipped");
+    }
+
+    #[test]
+    fn preflight_skips_none_model_path() {
+        // No model configured at all — skip preflight.
+        preflight_arch(None).expect("None model_path should be skipped");
+    }
 }

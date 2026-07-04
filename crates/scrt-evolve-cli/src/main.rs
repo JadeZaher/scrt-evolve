@@ -6,7 +6,7 @@
 //! llama.cpp fine-tune files, `train` → `adapter.safetensors` (candle, behind
 //! the `train` feature).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
@@ -18,22 +18,24 @@ use config_reference::{CONFIG_REFERENCE, CONFIG_TEMPLATE};
 
 #[derive(Parser)]
 #[command(
-    name = "scrt-evolve",
+    name = "evolve",
     version,
-    about = "Make a model better at its own corpus — discover → generate → train → export → run.",
-    long_about = "scrt-evolve — opinionated local LLM training + model tooling.\n\n\
-        Everything is driven by a TOML config. Run `scrt-evolve config-reference` for the\n\
-        FULL annotated schema of every block, or `scrt-evolve init` to scaffold one (run\n\
+    about = "Make a model better at its own corpus — ambient control · training/generation · monitoring.",
+    long_about = "evolve — opinionated local LLM training + model tooling.\n\n\
+        Everything is driven by a TOML config. Run `evolve config reference` for the\n\
+        FULL annotated schema of every block, or `evolve init` to scaffold one (run\n\
         `init` again in a configured dir to VALIDATE it).\n\n\
+        Commands are grouped by intent:\n\
+        • `evolve ambient …`  — the always-on loop + steering: start | stop | teach | ingest\n\
+        • `evolve train …`    — training/generation pipeline: discover | plan | generate |\n\
+                                 run | export-gguf | eval | dequant | probe\n\
+        • `evolve watch …`    — monitoring: status | health | trend | checkpoints | quarantine\n\
+        • `evolve model …`    — inference/serving: infer | run\n\
+        • `evolve branch …`   — standalone domain-expert branches (BTM)\n\n\
         AMBIENT (one command, hands-off): put an `ambient.toml` in a folder, then\n\
-        `scrt-evolve --ambient --dir <folder>` runs the self-feeding evolution loop —\n\
+        `evolve --ambient --dir <folder>` runs the self-feeding evolution loop —\n\
         seed adapter → auto-ingest real activity (your agent logs, LLM-judged for\n\
-        relevance) → eval-gated train → repeat, until `scrt-evolve daemon stop`. This is\n\
-        the surface a desktop app drives (one project per folder).\n\n\
-        PIPELINE (granular): discover → generate → train (dense | fractional/sharded GPU)\n\
-        → export (merge → GGUF → quantize → place) → run-model. `evolve --schedule` is the\n\
-        eval-gated multi-goal loop; `branch *` builds standalone domain-expert branches;\n\
-        `daemon {ingest,start,status,stop}` + `teach` drive the ambient queue directly.\n\n\
+        relevance) → eval-gated train → repeat, until `evolve ambient stop`.\n\n\
         Global flags: `--dir <folder>` scopes config+state to a project folder; `--json`\n\
         adds a machine-readable summary line for agents."
 )]
@@ -43,7 +45,7 @@ struct Cli {
     /// `branch list|route|create`, `discover`, `probe build`, …), in addition
     /// to the human-readable output. The JSON object is always the LAST line on
     /// stdout. Intended for coding agents driving the CLI. Accepted in either
-    /// position (`scrt-evolve --json generate` or `scrt-evolve generate --json`).
+    /// position (`evolve --json train generate` or `evolve train generate --json`).
     #[arg(long, global = true)]
     json: bool,
     /// Working directory for an ambient evolution PROJECT: its config
@@ -106,6 +108,240 @@ enum Command {
         #[arg(long, default_value = "evolve.toml")]
         path: PathBuf,
     },
+    /// Preflight check: validate config parse, model_path, the python/ package
+    /// dir, the `--python` interpreter's ML deps, llama.cpp auto-detect, and a
+    /// writable work_dir. Prints PASS/FAIL + a fix for each — turns "long run
+    /// dies at minute 9" into "told you in 2 seconds". `--json` for agents.
+    Doctor {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// Python interpreter to check for torch/transformers (default: python).
+        #[arg(long)]
+        python: Option<String>,
+    },
+    /// Config inspection + reference: annotated schema, resolved config, data
+    /// shapes.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+    /// Print a machine-readable manifest of every subcommand (name, summary,
+    /// flags) — the command-surface analogue of `config-reference`. Use `--json`
+    /// for a parseable object; default prints a readable list.
+    Commands,
+    /// Ambient continuous-evolution **daemon** (track 26): the always-on,
+    /// VRAM-bounded background trainer fed by the living activity queue + the
+    /// steering surface (start | stop | ingest | teach). Every step is eval-gated
+    /// through the track-15 transaction (keep|rollback), so ambient training can
+    /// never silently degrade the model.
+    Ambient {
+        #[command(subcommand)]
+        command: AmbientCommand,
+    },
+    /// Training/generation pipeline: discover | interview | plan | generate | run
+    /// | fit | export | export-gguf | eval | dequant | probe | auto.
+    Train {
+        #[command(subcommand)]
+        command: TrainCommand,
+    },
+    /// Monitoring: run-state, health, correctness trend, checkpoints, quarantine.
+    Watch {
+        #[command(subcommand)]
+        command: WatchCommand,
+    },
+    /// Inference/serving: A/B compare (infer) + the config-driven runtime (run).
+    Model {
+        #[command(subcommand)]
+        command: ModelCommand,
+    },
+    /// Branch-Train-Merge **branch factory** (track 29): create, list, route +
+    /// serve standalone domain-specialized branches (BTM Expert LMs).
+    Branch {
+        #[command(subcommand)]
+        command: BranchCommand,
+    },
+    /// Dataset operations on an on-disk `dataset.jsonl` (track 37, stage-
+    /// independent): `judge` (score+filter every row via the data judge) and
+    /// `expand` (Evol/Self-Instruct volume synthesis). Both run standalone — no
+    /// daemon required.
+    Dataset {
+        #[command(subcommand)]
+        command: DatasetCommand,
+    },
+}
+
+/// `evolve dataset …` — standalone operations over a `dataset.jsonl`.
+#[derive(Subcommand)]
+enum DatasetCommand {
+    /// Score every row 0–1 with the LLM data judge ([judge] + [generate.api]);
+    /// keep rows ≥ `min_score`, write dropped rows to a sidecar. Rewrites the
+    /// dataset in place (or `--out`).
+    Judge {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// The dataset JSONL to judge.
+        #[arg(long = "in")]
+        input: PathBuf,
+        /// Write kept rows here (default: overwrite `--in`).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Override `[judge].min_score`.
+        #[arg(long)]
+        min_score: Option<f32>,
+    },
+    /// Evol/Self-Instruct expansion: derive new rows from seed rows via the chat
+    /// transport, judge each, admit the kept ones. Appends to `--out` (or `--in`).
+    Expand {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// Seed dataset JSONL (mined + taught rows).
+        #[arg(long = "in")]
+        input: PathBuf,
+        /// Write the expanded dataset here (default: overwrite `--in`).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Evolution ops to apply per seed (default: deepen, broaden, concretize).
+        #[arg(long = "op")]
+        ops: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Print the full annotated `evolve.toml` config schema — every block, field,
+    /// default, and purpose. The recommended reference for coding agents
+    /// configuring scrt-evolve for a user. `--toml` prints a copy-pasteable
+    /// commented template; default prints the reference doc.
+    Reference {
+        /// Print a copy-pasteable commented evolve.toml template instead of the
+        /// reference doc.
+        #[arg(long)]
+        toml: bool,
+    },
+    /// Print the fully-resolved `EvolveConfig` (defaults applied) as JSON.
+    /// Answers "what will actually run?" without launching anything — the loaded
+    /// config after parsing, including defaults for blocks you omitted.
+    Show {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+    },
+    /// Print the `dataset.jsonl` row schema + the branch `manifest.json` /
+    /// `registry.json` schema — the cross-language/cross-repo contracts. The
+    /// command-surface analogue of `config-reference` for data shapes.
+    Dataset,
+}
+
+#[derive(Subcommand)]
+enum AmbientCommand {
+    /// Start the ambient loop — runs until `daemon stop`. Pops the living queue
+    /// microshard-by-microshard, training ONLY when free VRAM ≥ the budget, every
+    /// step through the track-15 transaction. Resumes from the queue cursor.
+    Start {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// Python interpreter for the train + score subprocesses.
+        #[arg(long)]
+        python: Option<String>,
+        /// VRAM budget in GB (override `[daemon].max_vram_gb`): train only when at
+        /// least this much is free. 0 ⇒ ungated.
+        #[arg(long)]
+        max_vram: Option<f64>,
+        /// Stop after N committed/attempted steps (a bound for a supervised run).
+        /// Omit for an unbounded daemon (until `daemon stop`).
+        #[arg(long)]
+        max_steps: Option<u64>,
+        /// Drain mode: process the queue once and exit when it empties (instead
+        /// of waiting for new activity). Good for a one-shot catch-up.
+        #[arg(long)]
+        drain: bool,
+    },
+    /// Signal a running daemon to stop (drops the stop-file it polls each step).
+    Stop {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+    },
+    /// Mine real agent ACTIVITY into the living queue's RAW lane (the passive-tail
+    /// feed) — GENERICALLY, across corpus types. Interaction logs (Claude Code
+    /// transcripts) distill into mixed rows: shell calls → `cli`, other tool calls
+    /// → `tool_call`, prose answers → `qa`; project docs (`--docs`) → `completion`.
+    /// With `--relevance`, an LLM judges which rows are worth keeping (no hardcoded
+    /// domain filter). Rows are deduped + stamped `gen=ingest` (quarantine key).
+    Ingest {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// A transcript dir to scan recursively for `*.jsonl` (repeatable).
+        /// Defaults to the Claude Code projects dir (`~/.claude/projects`).
+        #[arg(long = "from")]
+        from: Vec<PathBuf>,
+        /// A docs dir/file to chunk into `completion` rows (repeatable). `*.md`/`*.txt`.
+        #[arg(long = "docs")]
+        docs: Vec<PathBuf>,
+        /// LLM relevance criterion: keep only rows the chat endpoint
+        /// (`[generate.api]`) judges relevant to this free-text description (e.g.
+        /// "uses the scrt CLI"). Omit to keep all candidates.
+        #[arg(long)]
+        relevance: Option<String>,
+        /// Cheap substring pre-filter (repeatable, generic): before any LLM call,
+        /// skip transcript files + candidate rows containing none of these. A cost
+        /// bound for the relevance pass; not domain-specific.
+        #[arg(long = "match")]
+        match_: Vec<String>,
+        /// Cap total rows enqueued (0 = no cap).
+        #[arg(long, default_value_t = 0)]
+        max: usize,
+        /// Enqueue onto the PRIORITY lane (trusted, drains first) instead of RAW.
+        #[arg(long)]
+        priority: bool,
+        /// Report what WOULD be enqueued without writing to the queue.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Teach the daemon explicitly: enqueue a prompt→completion pair onto the
+    /// PRIORITY lane of the living queue (skips the relevance filter, trains
+    /// before passive activity). The cheap "learn this" capture.
+    Teach {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// The prompt / user intent the model should learn to handle.
+        #[arg(long)]
+        prompt: String,
+        /// The desired completion for that prompt.
+        #[arg(long)]
+        completion: String,
+    },
+    /// Steer a RUNNING daemon live (track 37 Phase D / track 35): write an atomic
+    /// `nudge.json` the loop consumes ONCE at the next step boundary. Only the
+    /// safe-live allowlist applies; restart-required knobs are rejected with a
+    /// reason. Nudges are ephemeral — the TOML wins on restart.
+    Nudge {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// Bump a goal's scheduler weight (by goal name/tag/topic).
+        #[arg(long)]
+        goal: Option<String>,
+        #[arg(long)]
+        weight: Option<f64>,
+        /// A transient focus topic (expires after --steps steps).
+        #[arg(long)]
+        focus: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        steps: u64,
+        /// Data-layer knobs.
+        #[arg(long = "judge-min-score")]
+        judge_min_score: Option<f32>,
+        #[arg(long = "modality-mix")]
+        modality_mix: Vec<String>,
+        #[arg(long = "candidates-per-seed")]
+        candidates_per_seed: Option<usize>,
+        #[arg(long = "synthesis-rate")]
+        synthesis_rate: Option<f32>,
+        #[arg(long = "gate-mode")]
+        gate_mode: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum TrainCommand {
     /// Discover context from the corpus + palace → work_dir/discovered.json.
     Discover {
         #[arg(long, default_value = "evolve.toml")]
@@ -153,16 +389,13 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         gap_rounds: usize,
     },
-    /// Export the dataset to llama.cpp fine-tune format (for GGUF models).
-    Export {
+    /// Run discover → generate (→ export) in one shot.
+    Run {
         #[arg(long, default_value = "evolve.toml")]
         config: PathBuf,
-        /// Override the dataset input (default: work_dir/dataset.jsonl).
+        /// Also export to llama.cpp fine-tune format after generating.
         #[arg(long)]
-        data: Option<PathBuf>,
-        /// The base GGUF model to adapt (default: [evolve].model_path).
-        #[arg(long)]
-        model: Option<PathBuf>,
+        export: bool,
     },
     /// Train a model from a dataset → adapter.
     ///
@@ -172,7 +405,7 @@ enum Command {
     /// (`python/scrt_evolve_train`) which loads a REAL HuggingFace causal-LM
     /// (RoPE/GQA/BF16) via `transformers` and LoRA-trains it — the real-model
     /// path. The dataset.jsonl is the shared contract between both.
-    Train {
+    Fit {
         #[arg(long, default_value = "evolve.toml")]
         config: PathBuf,
         #[arg(long)]
@@ -196,100 +429,16 @@ enum Command {
         #[arg(long, default_value_t = 256)]
         max_seq_len: usize,
     },
-    /// Run discover → generate (→ export) in one shot.
-    Run {
+    /// Export the dataset to llama.cpp fine-tune format (for GGUF models).
+    Export {
         #[arg(long, default_value = "evolve.toml")]
         config: PathBuf,
-        /// Also export to llama.cpp fine-tune format after generating.
+        /// Override the dataset input (default: work_dir/dataset.jsonl).
         #[arg(long)]
-        export: bool,
-    },
-    /// Run inference with an optional LoRA adapter; compare base vs adapter (--ab).
-    ///
-    /// Shells out to `python -m scrt_evolve_infer`. Reads the base model path
-    /// from [evolve].model_path in the config. When --adapter is omitted, defaults
-    /// to work_dir/adapter (the standard output location of `train --backend
-    /// transformers`). Use --ab to see base and adapter outputs side-by-side.
-    Infer {
-        #[arg(long, default_value = "evolve.toml")]
-        config: PathBuf,
-        /// Directory containing adapter.safetensors + adapter_config.json.
-        /// Default: work_dir/adapter.
+        data: Option<PathBuf>,
+        /// The base GGUF model to adapt (default: [evolve].model_path).
         #[arg(long)]
-        adapter: Option<PathBuf>,
-        /// The prompt to generate from. Required.
-        #[arg(long)]
-        prompt: String,
-        /// Show base model and adapter outputs side-by-side.
-        #[arg(long)]
-        ab: bool,
-        /// Maximum number of new tokens to generate. Default: 128.
-        #[arg(long, default_value_t = 128)]
-        max_new_tokens: usize,
-        /// Sampling temperature. 0 = greedy (default). >0 = sampling.
-        #[arg(long, default_value_t = 0.0)]
-        temperature: f32,
-        /// Wrap the prompt in the tokenizer's chat template before generating.
-        #[arg(long)]
-        chat: bool,
-        /// Python interpreter (must have torch + transformers + safetensors).
-        /// Default: python.
-        #[arg(long)]
-        python: Option<String>,
-    },
-    /// Run a model for generation through the config-driven inference RUNTIME.
-    ///
-    /// Driven by the `[runtime]` block in evolve.toml (backend / model_path /
-    /// n_ctx / n_gpu_layers / n_threads / [runtime.sampling]). `backend =
-    /// "llamacpp"` serves a GGUF efficiently via llama.cpp's `llama-completion`
-    /// (the right path for hybrid-SSM models whose naive transformers forward
-    /// OOMs); `backend = "transformers"` runs a HF dir via Python. This is the
-    /// serving lane; use `infer` for HF base-vs-adapter A/B comparison.
-    RunModel {
-        #[arg(long, default_value = "evolve.toml")]
-        config: PathBuf,
-        /// The prompt to generate from. Required.
-        #[arg(long)]
-        prompt: String,
-        /// Python interpreter for the `transformers` backend. Default: python.
-        #[arg(long)]
-        python: Option<String>,
-    },
-    /// Print the full annotated `evolve.toml` config schema — every block, field,
-    /// default, and purpose. The recommended reference for coding agents
-    /// configuring scrt-evolve for a user. `--toml` prints a copy-pasteable
-    /// commented template; default prints the reference doc.
-    ConfigReference {
-        /// Print a copy-pasteable commented evolve.toml template instead of the
-        /// reference doc.
-        #[arg(long)]
-        toml: bool,
-    },
-    /// Print the fully-resolved `EvolveConfig` (defaults applied) as JSON.
-    /// Answers "what will actually run?" without launching anything — the loaded
-    /// config after parsing, including defaults for blocks you omitted.
-    ConfigShow {
-        #[arg(long, default_value = "evolve.toml")]
-        config: PathBuf,
-    },
-    /// Print the `dataset.jsonl` row schema + the branch `manifest.json` /
-    /// `registry.json` schema — the cross-language/cross-repo contracts. The
-    /// command-surface analogue of `config-reference` for data shapes.
-    DatasetReference,
-    /// Print a machine-readable manifest of every subcommand (name, summary,
-    /// flags) — the command-surface analogue of `config-reference`. Use `--json`
-    /// for a parseable object; default prints a readable list.
-    Commands,
-    /// Preflight check: validate config parse, model_path, the python/ package
-    /// dir, the `--python` interpreter's ML deps, llama.cpp auto-detect, and a
-    /// writable work_dir. Prints PASS/FAIL + a fix for each — turns "long run
-    /// dies at minute 9" into "told you in 2 seconds". `--json` for agents.
-    Doctor {
-        #[arg(long, default_value = "evolve.toml")]
-        config: PathBuf,
-        /// Python interpreter to check for torch/transformers (default: python).
-        #[arg(long)]
-        python: Option<String>,
+        model: Option<PathBuf>,
     },
     /// Merge a LoRA adapter into the base model and export a quantized GGUF
     /// (for LM Studio / llama.cpp).
@@ -371,45 +520,6 @@ enum Command {
         #[command(subcommand)]
         command: ProbeCommand,
     },
-    /// Checkpoint store inspection (track 15 — the transactional homeostasis
-    /// layer). Checkpoints are produced by eval-gated steps.
-    Checkpoints {
-        #[command(subcommand)]
-        command: CheckpointCommand,
-    },
-    /// Quarantine management (track 15): the provenance stamps the loop skips
-    /// after a catastrophe.
-    Quarantine {
-        #[command(subcommand)]
-        command: QuarantineCommand,
-    },
-    /// Branch-Train-Merge **branch factory** (track 29): create, list, route +
-    /// serve standalone domain-specialized branches (BTM Expert LMs).
-    Branch {
-        #[command(subcommand)]
-        command: BranchCommand,
-    },
-    /// Ambient continuous-evolution **daemon** (track 26): an always-on,
-    /// VRAM-bounded background trainer fed by the living activity queue. Every
-    /// step is eval-gated through the track-15 transaction (keep|rollback), so
-    /// ambient training can never silently degrade the model.
-    Daemon {
-        #[command(subcommand)]
-        command: DaemonCommand,
-    },
-    /// Teach the daemon explicitly: enqueue a prompt→completion pair onto the
-    /// PRIORITY lane of the living queue (skips the relevance filter, trains
-    /// before passive activity). The cheap "learn this" capture.
-    Teach {
-        #[arg(long, default_value = "evolve.toml")]
-        config: PathBuf,
-        /// The prompt / user intent the model should learn to handle.
-        #[arg(long)]
-        prompt: String,
-        /// The desired completion for that prompt.
-        #[arg(long)]
-        completion: String,
-    },
     /// Point at a PROJECT directory: auto-detect its mpg palace + corpus and run
     /// the whole self-routing pipeline (discover → plan → generate → export).
     ///
@@ -422,12 +532,12 @@ enum Command {
     /// use `--schedule`. The regen flywheel (track 11) remains optional/un-wired.
     ///
     /// Three distinct invocations (the flags pick the mode):
-    ///   scrt-evolve evolve ./my-project          # single-project self-route
-    ///   scrt-evolve evolve --goals               # multi-goal generate (no gate)
-    ///   scrt-evolve evolve --schedule --max-rounds 4   # eval-gated multi-goal loop
+    ///   evolve train auto ./my-project          # single-project self-route
+    ///   evolve train auto --goals               # multi-goal generate (no gate)
+    ///   evolve train auto --schedule --max-rounds 4   # eval-gated multi-goal loop
     /// In `--goals` / `--schedule` mode the `project` positional is ignored
     /// (goals carry their own scoping); without either, `project` is REQUIRED.
-    Evolve {
+    Auto {
         /// The project directory to evolve a model against. Optional in
         /// `--goals` mode.
         project: Option<PathBuf>,
@@ -460,6 +570,98 @@ enum Command {
         #[arg(long, default_value = "weighted")]
         policy: String,
         /// Python interpreter for the schedule's train + score subprocesses.
+        #[arg(long)]
+        python: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum WatchCommand {
+    /// Show the daemon run-state + the living queue's pending counts per lane.
+    Status {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+    },
+    /// Health view (track 31 Q2): run-state, last step + verdict, last error,
+    /// consecutive failures, committed count — read from the evolution log.
+    Health {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+    },
+    /// Probe-correctness TREND (track 31 Q4): the committed-checkpoint correctness
+    /// series + a slope/delta summary, so "is behavior actually changing?" is
+    /// visible (loss ≠ behavior).
+    Trend {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// Summarize the trend over the last N committed checkpoints (0 = all).
+        #[arg(long, default_value_t = 0)]
+        last: usize,
+    },
+    /// Checkpoint store inspection (track 15 — the transactional homeostasis
+    /// layer). Checkpoints are produced by eval-gated steps.
+    Checkpoints {
+        #[command(subcommand)]
+        command: CheckpointCommand,
+    },
+    /// Quarantine management (track 15): the provenance stamps the loop skips
+    /// after a catastrophe.
+    Quarantine {
+        #[command(subcommand)]
+        command: QuarantineCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModelCommand {
+    /// Run inference with an optional LoRA adapter; compare base vs adapter (--ab).
+    ///
+    /// Shells out to `python -m scrt_evolve_infer`. Reads the base model path
+    /// from [evolve].model_path in the config. When --adapter is omitted, defaults
+    /// to work_dir/adapter (the standard output location of `train --backend
+    /// transformers`). Use --ab to see base and adapter outputs side-by-side.
+    Infer {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// Directory containing adapter.safetensors + adapter_config.json.
+        /// Default: work_dir/adapter.
+        #[arg(long)]
+        adapter: Option<PathBuf>,
+        /// The prompt to generate from. Required.
+        #[arg(long)]
+        prompt: String,
+        /// Show base model and adapter outputs side-by-side.
+        #[arg(long)]
+        ab: bool,
+        /// Maximum number of new tokens to generate. Default: 128.
+        #[arg(long, default_value_t = 128)]
+        max_new_tokens: usize,
+        /// Sampling temperature. 0 = greedy (default). >0 = sampling.
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f32,
+        /// Wrap the prompt in the tokenizer's chat template before generating.
+        #[arg(long)]
+        chat: bool,
+        /// Python interpreter (must have torch + transformers + safetensors).
+        /// Default: python.
+        #[arg(long)]
+        python: Option<String>,
+    },
+    /// Run a model for generation through the config-driven inference RUNTIME.
+    ///
+    /// Driven by the `[runtime]` block in evolve.toml (backend / model_path /
+    /// n_ctx / n_gpu_layers / n_threads / [runtime.sampling]). `backend =
+    /// "llamacpp"` serves a GGUF efficiently via llama.cpp's `llama-completion`
+    /// (the right path for hybrid-SSM models whose naive transformers forward
+    /// OOMs); `backend = "transformers"` runs a HF dir via Python. This is the
+    /// serving lane; use `infer` for HF base-vs-adapter A/B comparison.
+    Run {
+        #[arg(long, default_value = "evolve.toml")]
+        config: PathBuf,
+        /// The prompt to generate from. Required.
+        #[arg(long)]
+        prompt: String,
+        /// Python interpreter for the `transformers` backend. Default: python.
         #[arg(long)]
         python: Option<String>,
     },
@@ -637,94 +839,6 @@ enum BranchCommand {
 }
 
 #[derive(Subcommand)]
-enum DaemonCommand {
-    /// Start the ambient loop — runs until `daemon stop`. Pops the living queue
-    /// microshard-by-microshard, training ONLY when free VRAM ≥ the budget, every
-    /// step through the track-15 transaction. Resumes from the queue cursor.
-    Start {
-        #[arg(long, default_value = "evolve.toml")]
-        config: PathBuf,
-        /// Python interpreter for the train + score subprocesses.
-        #[arg(long)]
-        python: Option<String>,
-        /// VRAM budget in GB (override `[daemon].max_vram_gb`): train only when at
-        /// least this much is free. 0 ⇒ ungated.
-        #[arg(long)]
-        max_vram: Option<f64>,
-        /// Stop after N committed/attempted steps (a bound for a supervised run).
-        /// Omit for an unbounded daemon (until `daemon stop`).
-        #[arg(long)]
-        max_steps: Option<u64>,
-        /// Drain mode: process the queue once and exit when it empties (instead
-        /// of waiting for new activity). Good for a one-shot catch-up.
-        #[arg(long)]
-        drain: bool,
-    },
-    /// Mine real agent ACTIVITY into the living queue's RAW lane (the passive-tail
-    /// feed) — GENERICALLY, across corpus types. Interaction logs (Claude Code
-    /// transcripts) distill into mixed rows: shell calls → `cli`, other tool calls
-    /// → `tool_call`, prose answers → `qa`; project docs (`--docs`) → `completion`.
-    /// With `--relevance`, an LLM judges which rows are worth keeping (no hardcoded
-    /// domain filter). Rows are deduped + stamped `gen=ingest` (quarantine key).
-    Ingest {
-        #[arg(long, default_value = "evolve.toml")]
-        config: PathBuf,
-        /// A transcript dir to scan recursively for `*.jsonl` (repeatable).
-        /// Defaults to the Claude Code projects dir (`~/.claude/projects`).
-        #[arg(long = "from")]
-        from: Vec<PathBuf>,
-        /// A docs dir/file to chunk into `completion` rows (repeatable). `*.md`/`*.txt`.
-        #[arg(long = "docs")]
-        docs: Vec<PathBuf>,
-        /// LLM relevance criterion: keep only rows the chat endpoint
-        /// (`[generate.api]`) judges relevant to this free-text description (e.g.
-        /// "uses the scrt CLI"). Omit to keep all candidates.
-        #[arg(long)]
-        relevance: Option<String>,
-        /// Cheap substring pre-filter (repeatable, generic): before any LLM call,
-        /// skip transcript files + candidate rows containing none of these. A cost
-        /// bound for the relevance pass; not domain-specific.
-        #[arg(long = "match")]
-        match_: Vec<String>,
-        /// Cap total rows enqueued (0 = no cap).
-        #[arg(long, default_value_t = 0)]
-        max: usize,
-        /// Enqueue onto the PRIORITY lane (trusted, drains first) instead of RAW.
-        #[arg(long)]
-        priority: bool,
-        /// Report what WOULD be enqueued without writing to the queue.
-        #[arg(long)]
-        dry_run: bool,
-    },
-    /// Signal a running daemon to stop (drops the stop-file it polls each step).
-    Stop {
-        #[arg(long, default_value = "evolve.toml")]
-        config: PathBuf,
-    },
-    /// Show the daemon run-state + the living queue's pending counts per lane.
-    Status {
-        #[arg(long, default_value = "evolve.toml")]
-        config: PathBuf,
-    },
-    /// Health view (track 31 Q2): run-state, last step + verdict, last error,
-    /// consecutive failures, committed count — read from the evolution log.
-    Health {
-        #[arg(long, default_value = "evolve.toml")]
-        config: PathBuf,
-    },
-    /// Probe-correctness TREND (track 31 Q4): the committed-checkpoint correctness
-    /// series + a slope/delta summary, so "is behavior actually changing?" is
-    /// visible (loss ≠ behavior).
-    Trend {
-        #[arg(long, default_value = "evolve.toml")]
-        config: PathBuf,
-        /// Summarize the trend over the last N committed checkpoints (0 = all).
-        #[arg(long, default_value_t = 0)]
-        last: usize,
-    },
-}
-
-#[derive(Subcommand)]
 enum ProbeCommand {
     /// Carve a held-out probe set out of a dataset (asserted zero-overlap with
     /// the training remainder). Writes `probe.jsonl` + the training remainder.
@@ -792,192 +906,314 @@ fn run() -> Result<()> {
     };
     match command {
         Command::Init { path } => cmd_init(&resolve_in_dir(cli.dir.as_deref(), &path)),
-        Command::Discover { config } => {
-            let cfg = EvolveConfig::load(&config)?;
-            cmd_discover(&cfg)
-        }
-        Command::Interview {
-            config,
-            input,
-            answers,
-            core_only,
-        } => {
-            let cfg = EvolveConfig::load(&config)?;
-            cmd_interview(&cfg, input, answers, core_only)
-        }
-        Command::Plan { config, input } => {
-            let cfg = EvolveConfig::load(&config)?;
-            cmd_plan(&cfg, input)
-        }
-        Command::Generate {
-            config,
-            input,
-            backend,
-            self_route,
-            gap_rounds,
-        } => {
-            let mut cfg = EvolveConfig::load(&config)?;
-            if let Some(b) = backend {
-                cfg.generate.get_or_insert_with(Default::default).backend = b;
-            }
-            if self_route {
-                cmd_generate_self_routed(&cfg, input, gap_rounds)
-            } else {
-                cmd_generate(&cfg, input)
-            }
-        }
-        Command::Export {
-            config,
-            data,
-            model,
-        } => {
-            let cfg = EvolveConfig::load(&config)?;
-            cmd_export(&cfg, data, model)
-        }
-        Command::Train {
-            config,
-            data,
-            preset,
-            backend,
-            python,
-            out,
-            steps,
-            max_seq_len,
-        } => {
-            let mut cfg = EvolveConfig::load(&config)?;
-            if let Some(p) = preset {
-                cfg.train.get_or_insert_with(Default::default).preset = p;
-            }
-            match backend.as_str() {
-                "candle" => cmd_train(&cfg, data),
-                "transformers" => {
-                    cmd_train_transformers(&cfg, data, python, out, steps, max_seq_len)
-                }
-                other => anyhow::bail!(
-                    "train: unknown backend \"{other}\" (expected candle | transformers)"
-                ),
-            }
-        }
-        Command::Infer {
-            config,
-            adapter,
-            prompt,
-            ab,
-            max_new_tokens,
-            temperature,
-            chat,
-            python,
-        } => {
-            let cfg = EvolveConfig::load(&config)?;
-            cmd_infer(
-                &cfg,
-                adapter,
-                &prompt,
-                ab,
-                max_new_tokens,
-                temperature,
-                chat,
-                python,
-            )
-        }
-        Command::RunModel {
-            config,
-            prompt,
-            python,
-        } => {
-            let cfg = EvolveConfig::load(&config)?;
-            cmd_run_model(&cfg, &prompt, python)
-        }
-        Command::ConfigReference { toml } => {
-            print!(
-                "{}",
-                if toml {
-                    CONFIG_TEMPLATE
-                } else {
-                    CONFIG_REFERENCE
-                }
-            );
-            Ok(())
-        }
-        Command::ConfigShow { config } => {
-            let cfg = EvolveConfig::load(&config)?;
-            cmd_config_show(&cfg)
-        }
-        Command::DatasetReference => {
-            print!("{}", config_reference::DATASET_REFERENCE);
-            Ok(())
-        }
-        Command::Commands => cmd_commands(),
         Command::Doctor { config, python } => cmd_doctor(&config, python),
-        Command::ExportGguf {
-            config,
-            adapter,
-            out,
-            quant,
-            llama_cpp,
-            keep_intermediates,
-            python,
-        } => {
-            let cfg = EvolveConfig::load(&config)?;
-            cmd_export_gguf(
-                &cfg,
+        Command::Config { command } => match command {
+            ConfigCommand::Reference { toml } => {
+                print!(
+                    "{}",
+                    if toml {
+                        CONFIG_TEMPLATE
+                    } else {
+                        CONFIG_REFERENCE
+                    }
+                );
+                Ok(())
+            }
+            ConfigCommand::Show { config } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_config_show(&cfg)
+            }
+            ConfigCommand::Dataset => {
+                print!("{}", config_reference::DATASET_REFERENCE);
+                Ok(())
+            }
+        },
+        Command::Commands => cmd_commands(),
+        Command::Ambient { command } => match command {
+            AmbientCommand::Start {
+                config,
+                python,
+                max_vram,
+                max_steps,
+                drain,
+            } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_daemon_start(&cfg, python, max_vram, max_steps, drain)
+            }
+            AmbientCommand::Stop { config } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_daemon_stop(&cfg)
+            }
+            AmbientCommand::Ingest {
+                config,
+                from,
+                docs,
+                relevance,
+                match_,
+                max,
+                priority,
+                dry_run,
+            } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_daemon_ingest(&cfg, from, docs, relevance, match_, max, priority, dry_run)
+            }
+            AmbientCommand::Teach {
+                config,
+                prompt,
+                completion,
+            } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_teach(&cfg, &prompt, &completion)
+            }
+            AmbientCommand::Nudge {
+                config,
+                goal,
+                weight,
+                focus,
+                steps,
+                judge_min_score,
+                modality_mix,
+                candidates_per_seed,
+                synthesis_rate,
+                gate_mode,
+            } => {
+                let cfg = EvolveConfig::load(&config)?;
+                let nudge = scrt_evolve::Nudge {
+                    goal,
+                    weight,
+                    focus,
+                    focus_steps: Some(steps),
+                    judge_min_score,
+                    modality_mix,
+                    candidates_per_seed,
+                    synthesis_rate,
+                    gate_mode,
+                    rejected_probe: Vec::new(),
+                };
+                cmd_ambient_nudge(&cfg, nudge)
+            }
+        },
+        Command::Train { command } => match command {
+            TrainCommand::Discover { config } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_discover(&cfg)
+            }
+            TrainCommand::Interview {
+                config,
+                input,
+                answers,
+                core_only,
+            } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_interview(&cfg, input, answers, core_only)
+            }
+            TrainCommand::Plan { config, input } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_plan(&cfg, input)
+            }
+            TrainCommand::Generate {
+                config,
+                input,
+                backend,
+                self_route,
+                gap_rounds,
+            } => {
+                let mut cfg = EvolveConfig::load(&config)?;
+                if let Some(b) = backend {
+                    cfg.generate.get_or_insert_with(Default::default).backend = b;
+                }
+                if self_route {
+                    cmd_generate_self_routed(&cfg, input, gap_rounds)
+                } else {
+                    cmd_generate(&cfg, input)
+                }
+            }
+            TrainCommand::Run { config, export } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_discover(&cfg)?;
+                cmd_generate(&cfg, None)?;
+                if export {
+                    cmd_export(&cfg, None, None)?;
+                }
+                Ok(())
+            }
+            TrainCommand::Fit {
+                config,
+                data,
+                preset,
+                backend,
+                python,
+                out,
+                steps,
+                max_seq_len,
+            } => {
+                let mut cfg = EvolveConfig::load(&config)?;
+                if let Some(p) = preset {
+                    cfg.train.get_or_insert_with(Default::default).preset = p;
+                }
+                match backend.as_str() {
+                    "candle" => cmd_train(&cfg, data),
+                    "transformers" => {
+                        cmd_train_transformers(&cfg, data, python, out, steps, max_seq_len)
+                    }
+                    other => anyhow::bail!(
+                        "train: unknown backend \"{other}\" (expected candle | transformers)"
+                    ),
+                }
+            }
+            TrainCommand::Export {
+                config,
+                data,
+                model,
+            } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_export(&cfg, data, model)
+            }
+            TrainCommand::ExportGguf {
+                config,
                 adapter,
                 out,
                 quant,
                 llama_cpp,
                 keep_intermediates,
                 python,
-            )
-        }
-        Command::Eval {
-            config,
-            probe,
-            python,
-        } => {
-            let cfg = EvolveConfig::load(&config)?;
-            cmd_eval(&cfg, probe, python)
-        }
-        Command::Dequant {
-            gguf,
-            out,
-            dtype,
-            tokenizer,
-            python,
-        } => cmd_dequant(&gguf, &out, &dtype, tokenizer, python),
-        Command::Probe { command } => match command {
-            ProbeCommand::Build {
-                config,
-                from,
-                holdout,
-                out,
-                remainder,
             } => {
                 let cfg = EvolveConfig::load(&config)?;
-                cmd_probe_build(&cfg, from, holdout, out, remainder)
+                cmd_export_gguf(
+                    &cfg,
+                    adapter,
+                    out,
+                    quant,
+                    llama_cpp,
+                    keep_intermediates,
+                    python,
+                )
+            }
+            TrainCommand::Eval {
+                config,
+                probe,
+                python,
+            } => {
+                let cfg = EvolveConfig::load(&config)?;
+                cmd_eval(&cfg, probe, python)
+            }
+            TrainCommand::Dequant {
+                gguf,
+                out,
+                dtype,
+                tokenizer,
+                python,
+            } => cmd_dequant(&gguf, &out, &dtype, tokenizer, python),
+            TrainCommand::Probe { command } => match command {
+                ProbeCommand::Build {
+                    config,
+                    from,
+                    holdout,
+                    out,
+                    remainder,
+                } => {
+                    let cfg = EvolveConfig::load(&config)?;
+                    cmd_probe_build(&cfg, from, holdout, out, remainder)
+                }
+            },
+            TrainCommand::Auto {
+                project,
+                config,
+                gap_rounds,
+                export,
+                goals,
+                schedule,
+                max_rounds,
+                policy,
+                python,
+            } => {
+                if schedule {
+                    let config = config.unwrap_or_else(|| PathBuf::from("evolve.toml"));
+                    let cfg = EvolveConfig::load(&config)?;
+                    cmd_evolve_schedule(&cfg, &policy, max_rounds, python)
+                } else if goals {
+                    let config = config.unwrap_or_else(|| PathBuf::from("evolve.toml"));
+                    let cfg = EvolveConfig::load(&config)?;
+                    cmd_evolve_goals(&cfg)
+                } else {
+                    let project = project.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "evolve: pass a PROJECT directory, or use --goals / --schedule \
+                             to run the multi-goal pipeline over the config's [[goals]]"
+                        )
+                    })?;
+                    cmd_evolve(&project, config, gap_rounds, export)
+                }
             }
         },
-        Command::Checkpoints { command } => match command {
-            CheckpointCommand::List { config } => {
+        Command::Watch { command } => match command {
+            WatchCommand::Status { config } => {
                 let cfg = EvolveConfig::load(&config)?;
-                cmd_checkpoints_list(&cfg)
+                cmd_daemon_status(&cfg)
             }
-            CheckpointCommand::Show { config, id } => {
+            WatchCommand::Health { config } => {
                 let cfg = EvolveConfig::load(&config)?;
-                cmd_checkpoints_show(&cfg, &id)
+                cmd_daemon_health(&cfg)
             }
-            CheckpointCommand::Restore { config, id } => {
+            WatchCommand::Trend { config, last } => {
                 let cfg = EvolveConfig::load(&config)?;
-                cmd_checkpoints_restore(&cfg, &id)
+                cmd_daemon_trend(&cfg, last)
             }
+            WatchCommand::Checkpoints { command } => match command {
+                CheckpointCommand::List { config } => {
+                    let cfg = EvolveConfig::load(&config)?;
+                    cmd_checkpoints_list(&cfg)
+                }
+                CheckpointCommand::Show { config, id } => {
+                    let cfg = EvolveConfig::load(&config)?;
+                    cmd_checkpoints_show(&cfg, &id)
+                }
+                CheckpointCommand::Restore { config, id } => {
+                    let cfg = EvolveConfig::load(&config)?;
+                    cmd_checkpoints_restore(&cfg, &id)
+                }
+            },
+            WatchCommand::Quarantine { command } => match command {
+                QuarantineCommand::List { config } => {
+                    let cfg = EvolveConfig::load(&config)?;
+                    cmd_quarantine_list(&cfg)
+                }
+                QuarantineCommand::Clear { config } => {
+                    let cfg = EvolveConfig::load(&config)?;
+                    cmd_quarantine_clear(&cfg)
+                }
+            },
         },
-        Command::Quarantine { command } => match command {
-            QuarantineCommand::List { config } => {
+        Command::Model { command } => match command {
+            ModelCommand::Infer {
+                config,
+                adapter,
+                prompt,
+                ab,
+                max_new_tokens,
+                temperature,
+                chat,
+                python,
+            } => {
                 let cfg = EvolveConfig::load(&config)?;
-                cmd_quarantine_list(&cfg)
+                cmd_infer(
+                    &cfg,
+                    adapter,
+                    &prompt,
+                    ab,
+                    max_new_tokens,
+                    temperature,
+                    chat,
+                    python,
+                )
             }
-            QuarantineCommand::Clear { config } => {
+            ModelCommand::Run {
+                config,
+                prompt,
+                python,
+            } => {
                 let cfg = EvolveConfig::load(&config)?;
-                cmd_quarantine_clear(&cfg)
+                cmd_run_model(&cfg, &prompt, python)
             }
         },
         Command::Branch { command } => match command {
@@ -1052,93 +1288,26 @@ fn run() -> Result<()> {
                 cmd_branch_serve(&cfg, name, route, prompt, python)
             }
         },
-        Command::Daemon { command } => match command {
-            DaemonCommand::Start {
+        Command::Dataset { command } => match command {
+            DatasetCommand::Judge {
                 config,
-                python,
-                max_vram,
-                max_steps,
-                drain,
+                input,
+                out,
+                min_score,
             } => {
                 let cfg = EvolveConfig::load(&config)?;
-                cmd_daemon_start(&cfg, python, max_vram, max_steps, drain)
+                cmd_dataset_judge(&cfg, &input, out.as_ref(), min_score)
             }
-            DaemonCommand::Ingest {
+            DatasetCommand::Expand {
                 config,
-                from,
-                docs,
-                relevance,
-                match_,
-                max,
-                priority,
-                dry_run,
+                input,
+                out,
+                ops,
             } => {
                 let cfg = EvolveConfig::load(&config)?;
-                cmd_daemon_ingest(&cfg, from, docs, relevance, match_, max, priority, dry_run)
-            }
-            DaemonCommand::Stop { config } => {
-                let cfg = EvolveConfig::load(&config)?;
-                cmd_daemon_stop(&cfg)
-            }
-            DaemonCommand::Status { config } => {
-                let cfg = EvolveConfig::load(&config)?;
-                cmd_daemon_status(&cfg)
-            }
-            DaemonCommand::Health { config } => {
-                let cfg = EvolveConfig::load(&config)?;
-                cmd_daemon_health(&cfg)
-            }
-            DaemonCommand::Trend { config, last } => {
-                let cfg = EvolveConfig::load(&config)?;
-                cmd_daemon_trend(&cfg, last)
+                cmd_dataset_expand(&cfg, &input, out.as_ref(), &ops)
             }
         },
-        Command::Teach {
-            config,
-            prompt,
-            completion,
-        } => {
-            let cfg = EvolveConfig::load(&config)?;
-            cmd_teach(&cfg, &prompt, &completion)
-        }
-        Command::Run { config, export } => {
-            let cfg = EvolveConfig::load(&config)?;
-            cmd_discover(&cfg)?;
-            cmd_generate(&cfg, None)?;
-            if export {
-                cmd_export(&cfg, None, None)?;
-            }
-            Ok(())
-        }
-        Command::Evolve {
-            project,
-            config,
-            gap_rounds,
-            export,
-            goals,
-            schedule,
-            max_rounds,
-            policy,
-            python,
-        } => {
-            if schedule {
-                let config = config.unwrap_or_else(|| PathBuf::from("evolve.toml"));
-                let cfg = EvolveConfig::load(&config)?;
-                cmd_evolve_schedule(&cfg, &policy, max_rounds, python)
-            } else if goals {
-                let config = config.unwrap_or_else(|| PathBuf::from("evolve.toml"));
-                let cfg = EvolveConfig::load(&config)?;
-                cmd_evolve_goals(&cfg)
-            } else {
-                let project = project.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "evolve: pass a PROJECT directory, or use --goals / --schedule \
-                         to run the multi-goal pipeline over the config's [[goals]]"
-                    )
-                })?;
-                cmd_evolve(&project, config, gap_rounds, export)
-            }
-        }
     }
 }
 
@@ -1178,7 +1347,7 @@ fn cmd_init(path: &PathBuf) -> Result<()> {
         // EXPECTED to be absent. Frame it as the next step. `doctor` validates it.
         println!(
             "next: edit [evolve].model_path in {} to point at your HF model dir, \
-             then run `scrt-evolve doctor` to preflight your environment.",
+             then run `evolve doctor` to preflight your environment.",
             path.display()
         );
     }
@@ -1210,7 +1379,7 @@ fn load_dir_config(dir: Option<&std::path::Path>) -> Result<EvolveConfig> {
         }
     }
     anyhow::bail!(
-        "no ambient.toml or evolve.toml in {} — run `scrt-evolve init` first",
+        "no ambient.toml or evolve.toml in {} — run `evolve init` first",
         dir.map(|d| d.display().to_string())
             .unwrap_or_else(|| ".".to_string())
     )
@@ -1243,7 +1412,7 @@ fn load_discovered(wd: &WorkDir, input: Option<PathBuf>) -> Result<scrt_evolve::
     let in_path = input.unwrap_or_else(|| wd.discovered_json());
     if !in_path.exists() {
         anyhow::bail!(
-            "discovered context not found at {} — run `scrt-evolve discover` first",
+            "discovered context not found at {} — run `evolve train discover` first",
             in_path.display()
         );
     }
@@ -1283,7 +1452,7 @@ fn load_directive(wd: &WorkDir) -> scrt_evolve::TrainingDirective {
         Err(_) => {
             eprintln!(
                 "note: no directive.json — planning from signals only. Run \
-                 `scrt-evolve interview` to state training direction."
+                 `evolve train interview` to state training direction."
             );
             scrt_evolve::TrainingDirective::default()
         }
@@ -1471,7 +1640,7 @@ fn cmd_evolve(
     } else {
         eprintln!(
             "evolve: no directive.json in {} — proceeding from signals only. \
-             Run `scrt-evolve interview` first to state training direction.",
+             Run `evolve train interview` first to state training direction.",
             wd.root().display()
         );
         scrt_evolve::TrainingDirective::default()
@@ -1676,8 +1845,8 @@ fn cmd_evolve_schedule(
     }
     if report.halted {
         eprintln!(
-            "\nschedule halted. Inspect: `scrt-evolve quarantine list`, \
-             `scrt-evolve checkpoints list`. Re-arm with `scrt-evolve quarantine clear`."
+            "\nschedule halted. Inspect: `evolve watch quarantine list`, \
+             `evolve watch checkpoints list`. Re-arm with `evolve watch quarantine clear`."
         );
     }
     Ok(())
@@ -1776,7 +1945,7 @@ fn cmd_probe_build(
     let from_path = from.unwrap_or_else(|| wd.dataset_jsonl());
     if !from_path.exists() {
         anyhow::bail!(
-            "probe build: dataset not found at {} — run `scrt-evolve generate` first",
+            "probe build: dataset not found at {} — run `evolve train generate` first",
             from_path.display()
         );
     }
@@ -1906,7 +2075,7 @@ fn cmd_train(cfg: &EvolveConfig, data: Option<PathBuf>) -> Result<()> {
     let data_path = data.unwrap_or_else(|| wd.dataset_jsonl());
     if !data_path.exists() {
         anyhow::bail!(
-            "train(candle): dataset not found at {} — run `scrt-evolve generate` first",
+            "train(candle): dataset not found at {} — run `evolve train generate` first",
             data_path.display()
         );
     }
@@ -2922,7 +3091,7 @@ fn cmd_doctor(config: &std::path::Path, python: Option<String>) -> Result<()> {
             "status": if failed == 0 { "ok" } else { "fail" },
         }));
     } else {
-        println!("scrt-evolve doctor:");
+        println!("evolve doctor:");
         for (name, ok, detail) in &checks {
             println!(
                 "  [{}] {:<16} {detail}",
@@ -2955,6 +3124,23 @@ fn probe_free_vram_gb() -> Option<f64> {
     let text = String::from_utf8_lossy(&out.stdout);
     let mb: f64 = text.lines().next()?.trim().parse().ok()?;
     Some(mb / 1024.0)
+}
+
+/// Probe free HOST RAM in GB — the system-freeze guard. Reads `MemAvailable`
+/// from `/proc/meminfo` (Linux/WSL — where Granite training actually runs). This
+/// is the kernel's estimate of RAM available WITHOUT swapping, so it's the right
+/// number to gate a big model load on. `None` on non-Linux or a parse failure ⇒
+/// the RAM gate is skipped (we can't throttle what we can't measure).
+fn probe_free_ram_gb() -> Option<f64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            // Format: "MemAvailable:   12345678 kB"
+            let kb: f64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb / 1024.0 / 1024.0);
+        }
+    }
+    None
 }
 
 /// Probe whether ANOTHER process is putting real load on the GPU (gentle-background
@@ -3019,12 +3205,18 @@ fn cmd_daemon_start(
         "SCRT_EVOLVE_LOG_FILE",
         wd.root().join("logs").join("daemon.log"),
     );
-    // Clear any stale stop-file; write a run marker for `daemon status`.
+    // Clear any stale stop-file; write a run marker for `daemon status`. The
+    // marker holds the PID so `status`/`health` can tell a LIVE daemon from a
+    // stale run-file left by a crashed/killed process (a bare "running" marker
+    // can't — we hit exactly that during bring-up).
     let _ = std::fs::remove_file(daemon::stop_file(wd.root()));
-    let _ = std::fs::write(daemon::run_file(wd.root()), b"running");
+    let _ = std::fs::write(
+        daemon::run_file(wd.root()),
+        format!("running pid={}", std::process::id()),
+    );
 
     println!(
-        "daemon start: {} (stop with `scrt-evolve daemon stop`)",
+        "daemon start: {} (stop with `evolve ambient stop`)",
         if drain { "drain-once" } else { "continuous" }
     );
 
@@ -3123,6 +3315,7 @@ fn daemon_serve(
         scrt_evolve::eval::run_eval(c, Some(py_score.as_str()))
     };
     let free_vram = probe_free_vram_gb;
+    let free_ram = probe_free_ram_gb;
     let gpu_busy = probe_gpu_busy;
     // Production clock: monotonic seconds since the daemon process started (Q3
     // budget + Q2 backoff). A process-start `Instant` keeps it cheap + monotonic.
@@ -3149,17 +3342,36 @@ fn daemon_serve(
         None
     };
 
+    // Track 37 Phase D: live-nudge poll (consume-once) + steering-compliance
+    // sampler. The nudge poll reads/deletes `nudge.json` at the step boundary;
+    // the compliance sampler judges a sample of pending queue rows against the
+    // composed steering (only wired when [judge] is configured — else `None`,
+    // no judge call). Both are process-scoped closures over the work dir.
+    let nudge_root = wd.root().to_path_buf();
+    let take_nudge = move || scrt_evolve::take_nudge(&nudge_root);
+    let judge_configured = cfg.judge.is_some();
+    let compliance = move |c: &EvolveConfig| -> Result<f64> { sample_steering_compliance(c) };
+    let compliance_ref: Option<scrt_evolve::daemon::ComplianceHook> = if judge_configured {
+        Some(&compliance)
+    } else {
+        None
+    };
+
     let hooks = DaemonHooks {
         free_vram_gb: &free_vram,
+        free_ram_gb: &free_ram,
         gpu_busy: &gpu_busy,
         train: &train,
         score: &score,
         now_secs: &now_secs,
         sleep: &sleep,
         degrade: degrade_ref,
+        take_nudge: Some(&take_nudge),
+        steering_compliance: compliance_ref,
     };
     let opts = DaemonOptions {
         max_vram_gb,
+        min_free_ram_gb: dcfg.min_free_ram_gb,
         batch: dcfg.batch.max(1),
         max_steps,
         exit_when_empty: drain,
@@ -3333,7 +3545,7 @@ fn cmd_ambient(cfg: &EvolveConfig, once: bool) -> Result<()> {
 
     let dcfg = cfg.daemon.clone().unwrap_or_default();
     println!(
-        "ambient: self-feeding evolution loop (auto_ingest={}, stop with `scrt-evolve daemon stop`)",
+        "ambient: self-feeding evolution loop (auto_ingest={}, stop with `evolve ambient stop`)",
         dcfg.auto_ingest
     );
 
@@ -3364,6 +3576,7 @@ fn cmd_ambient(cfg: &EvolveConfig, once: bool) -> Result<()> {
                         &ic.match_,
                         ic.max,
                         lane,
+                        scrt_evolve::Tier::from_config(ic.tier.as_deref()),
                         false,
                         true,
                     )?;
@@ -3485,7 +3698,83 @@ fn cmd_daemon_stop(cfg: &EvolveConfig) -> Result<()> {
     Ok(())
 }
 
-/// `daemon status` — run-state + living-queue pending counts.
+/// `evolve ambient nudge`: write an atomic `nudge.json` a running daemon consumes
+/// once at its next step boundary (track 37 Phase D / track 35).
+fn cmd_ambient_nudge(cfg: &EvolveConfig, nudge: scrt_evolve::Nudge) -> Result<()> {
+    let wd = WorkDir::from_config(cfg);
+    wd.ensure()?;
+    scrt_evolve::write_nudge(wd.root(), &nudge)?;
+    let running = scrt_evolve::daemon::run_file(wd.root()).exists();
+    if !running {
+        eprintln!(
+            "ambient nudge: NOTE — no daemon appears to be running; the nudge will \
+             be consumed when one starts (or is stale-cleared on restart)."
+        );
+    }
+    emit_json(serde_json::json!({
+        "command": "ambient-nudge",
+        "written": scrt_evolve::nudge::nudge_file(wd.root()).display().to_string(),
+        "daemon_running": running,
+        "status": "ok",
+    }));
+    Ok(())
+}
+
+/// Parse `pid=<n>` out of the run-file marker (`"running pid=1234"`). Returns
+/// None for a legacy bare-`running` marker or an unparseable file.
+fn run_file_pid(work_dir: &std::path::Path) -> Option<u32> {
+    let s = std::fs::read_to_string(scrt_evolve::daemon::run_file(work_dir)).ok()?;
+    s.split_whitespace()
+        .find_map(|tok| tok.strip_prefix("pid="))
+        .and_then(|p| p.trim().parse::<u32>().ok())
+}
+
+/// Best-effort liveness check for a PID. Returns Some(true/false) when we can
+/// tell, None when we can't (no PID recorded, or the probe itself failed). On
+/// Windows uses `tasklist`; on Unix `kill -0`.
+fn pid_is_alive(pid: u32) -> Option<bool> {
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .ok()?;
+        let s = String::from_utf8_lossy(&out.stdout);
+        Some(s.contains(&pid.to_string()))
+    }
+    #[cfg(not(windows))]
+    {
+        // signal 0 = existence/permission check, no signal delivered.
+        let out = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .ok()?;
+        Some(out.status.success())
+    }
+}
+
+/// Best-effort GPU VRAM readout via `nvidia-smi` → (used_mib, free_mib). None
+/// when nvidia-smi is absent/failed (CPU-only box). Reads GPU 0.
+fn gpu_vram_mib() -> Option<(u64, u64)> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=memory.used,memory.free",
+            "--format=csv,noheader,nounits",
+            "--id=0",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&out.stdout);
+    let mut it = line.trim().split(',');
+    let used = it.next()?.trim().parse::<u64>().ok()?;
+    let free = it.next()?.trim().parse::<u64>().ok()?;
+    Some((used, free))
+}
+
+/// `daemon status` — run-state + living-queue pending counts + liveness + VRAM.
 fn cmd_daemon_status(cfg: &EvolveConfig) -> Result<()> {
     use scrt_evolve::daemon;
     use scrt_evolve::LivingQueue;
@@ -3493,12 +3782,19 @@ fn cmd_daemon_status(cfg: &EvolveConfig) -> Result<()> {
     wd.ensure()?;
     let queue = LivingQueue::from_config(cfg)?;
     let (prio, raw) = queue.pending();
-    let running = daemon::run_file(wd.root()).exists();
+    let marker = daemon::run_file(wd.root()).exists();
     let stopping = daemon::stop_requested(wd.root());
+    // Liveness: a run-file marker alone can be STALE (crashed/killed daemon). If
+    // it records a PID, cross-check the process actually exists.
+    let pid = run_file_pid(wd.root());
+    let alive = pid.and_then(pid_is_alive);
     let state = if stopping {
         "stopping"
-    } else if running {
-        "running"
+    } else if marker {
+        match alive {
+            Some(false) => "stale", // marker present but the process is gone
+            _ => "running",         // alive, or legacy marker with no PID to check
+        }
     } else {
         "stopped"
     };
@@ -3507,7 +3803,16 @@ fn cmd_daemon_status(cfg: &EvolveConfig) -> Result<()> {
     let trend = read_trend(cfg, 0).unwrap_or_default();
     let latest = trend.latest;
     let arrow = trend.arrow();
+    let vram = gpu_vram_mib();
     println!("daemon status: {state}");
+    if let Some(p) = pid {
+        let live = match alive {
+            Some(true) => "alive",
+            Some(false) => "DEAD (stale run-file — safe to `daemon stop` or delete)",
+            None => "liveness unknown",
+        };
+        println!("  process: pid={p} ({live})");
+    }
     println!("  queue pending: priority={prio} raw={raw}");
     match latest {
         Some(c) => println!(
@@ -3516,13 +3821,36 @@ fn cmd_daemon_status(cfg: &EvolveConfig) -> Result<()> {
         ),
         None => println!("  correctness: (no committed checkpoints yet)"),
     }
+    match vram {
+        Some((used, free)) => {
+            println!("  gpu vram: {used} MiB used / {free} MiB free")
+        }
+        None => println!("  gpu vram: (nvidia-smi unavailable)"),
+    }
+    // Host RAM headroom vs the freeze-guard floor (if configured).
+    let free_ram = probe_free_ram_gb();
+    let ram_floor = cfg.daemon.as_ref().and_then(|d| d.min_free_ram_gb);
+    match (free_ram, ram_floor) {
+        (Some(f), Some(floor)) => {
+            let flag = if f < floor { " ⚠ BELOW floor — steps will WAIT" } else { "" };
+            println!("  host ram: {f:.1} GB free (floor {floor:.1} GB){flag}");
+        }
+        (Some(f), None) => println!("  host ram: {f:.1} GB free (ungated)"),
+        (None, _) => {} // non-Linux / unmeasurable: omit
+    }
     emit_json(serde_json::json!({
         "command": "daemon-status",
         "state": state,
+        "pid": pid,
+        "process_alive": alive,
         "pending_priority": prio,
         "pending_raw": raw,
         "latest_correctness": latest,
         "trend": arrow,
+        "gpu_vram_used_mib": vram.map(|(u, _)| u),
+        "gpu_vram_free_mib": vram.map(|(_, f)| f),
+        "host_ram_free_gb": free_ram,
+        "host_ram_floor_gb": ram_floor,
         "status": "ok",
     }));
     Ok(())
@@ -3548,12 +3876,17 @@ fn cmd_daemon_health(cfg: &EvolveConfig) -> Result<()> {
     use scrt_evolve::{LivingQueue, StepAction};
     let wd = WorkDir::from_config(cfg);
     wd.ensure()?;
-    let running = daemon::run_file(wd.root()).exists();
+    let marker = daemon::run_file(wd.root()).exists();
     let stopping = daemon::stop_requested(wd.root());
+    let pid = run_file_pid(wd.root());
+    let alive = pid.and_then(pid_is_alive);
     let state = if stopping {
         "stopping"
-    } else if running {
-        "running"
+    } else if marker {
+        match alive {
+            Some(false) => "stale",
+            _ => "running",
+        }
     } else {
         "stopped"
     };
@@ -3580,6 +3913,14 @@ fn cmd_daemon_health(cfg: &EvolveConfig) -> Result<()> {
         .unwrap_or(false);
 
     println!("daemon health: {state}");
+    if let Some(p) = pid {
+        let live = match alive {
+            Some(true) => "alive",
+            Some(false) => "DEAD (stale run-file — safe to `daemon stop` or delete)",
+            None => "liveness unknown",
+        };
+        println!("  process: pid={p} ({live})");
+    }
     println!("  committed checkpoints: {committed}");
     match last_step {
         Some(s) => println!(
@@ -3602,6 +3943,8 @@ fn cmd_daemon_health(cfg: &EvolveConfig) -> Result<()> {
     emit_json(serde_json::json!({
         "command": "daemon-health",
         "state": state,
+        "pid": pid,
+        "process_alive": alive,
         "committed": committed,
         "last_step": last_step,
         "last_action": last_action,
@@ -3618,26 +3961,40 @@ fn cmd_daemon_health(cfg: &EvolveConfig) -> Result<()> {
 /// `daemon trend` — Q4: the committed-checkpoint correctness series + a
 /// slope/delta summary. Makes "is behavior changing?" (not just loss) visible.
 fn cmd_daemon_trend(cfg: &EvolveConfig, last: usize) -> Result<()> {
-    let trend = read_trend(cfg, last)?;
-    if trend.series.is_empty() {
+    let entries = scrt_evolve::regulate::log::read_all(&evolution_log_path(cfg))?;
+    let trend = scrt_evolve::trend_from_log(&entries, last);
+    // Track 37 Phase D: the steering-compliance series (kind:"steering_compliance"
+    // rows), charted alongside correctness so "is it following the constitution?"
+    // is visible next to "is behavior changing?".
+    let compliance = scrt_evolve::steering_compliance_from_log(&entries, last);
+    if trend.series.is_empty() && compliance.is_empty() {
         println!("daemon trend: no committed checkpoints yet");
         emit_json(serde_json::json!({
             "command": "daemon-trend", "points": 0, "status": "ok",
         }));
         return Ok(());
     }
-    println!(
-        "daemon trend: {} {} (Δtotal={:+.3}, Δmean/step={:+.4})",
-        trend.latest.map(|c| format!("{c:.3}")).unwrap_or_default(),
-        trend.arrow(),
-        trend.total_change,
-        trend.mean_delta
-    );
-    for p in &trend.series {
+    if !trend.series.is_empty() {
         println!(
-            "  step {:>4}  {:.3}  {}",
-            p.step, p.correctness, p.checkpoint_id
+            "daemon trend: {} {} (Δtotal={:+.3}, Δmean/step={:+.4})",
+            trend.latest.map(|c| format!("{c:.3}")).unwrap_or_default(),
+            trend.arrow(),
+            trend.total_change,
+            trend.mean_delta
         );
+        for p in &trend.series {
+            println!(
+                "  step {:>4}  {:.3}  {}",
+                p.step, p.correctness, p.checkpoint_id
+            );
+        }
+    }
+    if !compliance.is_empty() {
+        let latest = compliance.last().map(|(_, f)| *f).unwrap_or(0.0);
+        println!("steering compliance: {latest:.3} (latest of {} step(s))", compliance.len());
+        for (step, frac) in &compliance {
+            println!("  step {step:>4}  compliance {frac:.3}");
+        }
     }
     emit_json(serde_json::json!({
         "command": "daemon-trend",
@@ -3646,6 +4003,8 @@ fn cmd_daemon_trend(cfg: &EvolveConfig, last: usize) -> Result<()> {
         "total_change": trend.total_change,
         "mean_delta": trend.mean_delta,
         "arrow": trend.arrow(),
+        "steering_compliance": compliance.iter().map(|(s, f)| serde_json::json!({"step": s, "compliance": f})).collect::<Vec<_>>(),
+        "steering_compliance_latest": compliance.last().map(|(_, f)| *f),
         "status": "ok",
     }));
     Ok(())
@@ -3690,6 +4049,7 @@ fn cmd_daemon_ingest(
         Lane::Raw
     };
 
+    let tier = scrt_evolve::Tier::from_config(ic.tier.as_deref());
     let n = run_ingest(
         cfg,
         &from,
@@ -3698,6 +4058,7 @@ fn cmd_daemon_ingest(
         &match_,
         max,
         lane,
+        tier,
         dry_run,
         true,
     )?;
@@ -3726,6 +4087,7 @@ fn run_ingest(
     match_: &[String],
     max: usize,
     lane: scrt_evolve::Lane,
+    tier: scrt_evolve::Tier,
     dry_run: bool,
     verbose: bool,
 ) -> Result<usize> {
@@ -3736,6 +4098,9 @@ fn run_ingest(
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut files_scanned = 0usize;
     let mut files_kept = 0usize;
+    // Phase-A (track 37): outcome filtering runs per-transcript (retry-collapse is
+    // within-transcript), and excluded rows accumulate for the audit sidecar.
+    let mut rejected: Vec<scrt_evolve::GenExample> = Vec::new();
 
     for dir in from {
         for path in collect_files(dir, &["jsonl"]) {
@@ -3747,9 +4112,13 @@ fn run_ingest(
                 continue;
             }
             files_kept += 1;
-            for row in scrt_evolve::interaction_log_rows(&text) {
+            // Stamp outcomes, collapse retries, exclude bare failures, stamp tier.
+            let parsed = scrt_evolve::interaction_log_rows(&text);
+            let filtered = scrt_evolve::filter_outcomes(parsed, tier);
+            for row in filtered.kept {
                 ingest_push(&mut rows, &mut seen, &needles, row);
             }
+            rejected.extend(filtered.rejected);
         }
     }
     let log_rows = rows.len();
@@ -3796,6 +4165,30 @@ fn run_ingest(
         rows.truncate(max);
     }
 
+    // Phase B (track 37): if a data judge is configured, score every candidate
+    // BEFORE it reaches the queue. Sub-threshold rows join the rejected sidecar.
+    // Judge is strictly upstream of the weight-touching span — the track-15 txn
+    // is untouched. Fail-open/closed per [judge].on_error.
+    if cfg.judge.is_some() && !rows.is_empty() {
+        match build_pair_judge(cfg) {
+            Ok(judge) => {
+                let min_score = cfg.judge.clone().unwrap_or_default().min_score;
+                let steering = cfg.compose_steering();
+                let before = rows.len();
+                let judged = scrt_evolve::judge_rows(&judge, rows, min_score, steering.as_deref())?;
+                if verbose {
+                    println!(
+                        "ingest: data judge kept {}/{before} row(s) (min_score={min_score})",
+                        judged.kept.len()
+                    );
+                }
+                rejected.extend(judged.dropped);
+                rows = judged.kept;
+            }
+            Err(e) => eprintln!("ingest: [judge] set but no chat endpoint ({e}); keeping all"),
+        }
+    }
+
     // Q5 dedup: drop rows already ingested in a prior pass (the ledger). This is
     // what stops the self-feed from re-training the same re-mined activity over a
     // stale corpus. Provenance is ignored, so the same usage from a different
@@ -3814,6 +4207,18 @@ fn run_ingest(
             );
         }
         return Ok(0);
+    }
+
+    // Persist excluded rows to the audit sidecar (provenance-stamped).
+    if !rejected.is_empty() {
+        scrt_evolve::append_rejected(wd.root(), &rejected)?;
+        if verbose {
+            println!(
+                "ingest: {} failed/excluded row(s) → queue/{}",
+                rejected.len(),
+                scrt_evolve::REJECTED_SIDECAR
+            );
+        }
     }
 
     let mut led = scrt_evolve::IngestLedger::open(wd.root())?;
@@ -3846,6 +4251,149 @@ fn build_relevance_judge(
         endpoint.into_transport(),
         15,
     ))
+}
+
+/// Build the per-pair data judge (track 37) from `[judge]` + `[generate.api]`.
+fn build_pair_judge(
+    cfg: &EvolveConfig,
+) -> Result<scrt_evolve::LlmPairJudge<impl scrt_evolve::generate::api::ChatTransport>> {
+    use scrt_evolve::generate::api::ApiEndpoint;
+    let jc = cfg.judge.clone().unwrap_or_default();
+    let gcfg = cfg
+        .generate
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("data judge needs a [generate.api] block"))?;
+    let endpoint = ApiEndpoint::from_config(&gcfg)?;
+    Ok(scrt_evolve::LlmPairJudge::new(
+        endpoint.into_transport(),
+        jc.batch,
+        scrt_evolve::OnError::from_config(Some(&jc.on_error)),
+    ))
+}
+
+/// Steering-compliance sampler (track 37 Phase D): judge up to `[judge].sample_k`
+/// pending queue rows against the composed steering text; compliance = fraction
+/// scoring ≥ `[judge].min_score`. `1.0` when nothing to sample (vacuously
+/// compliant). Called once per committed daemon step.
+fn sample_steering_compliance(cfg: &EvolveConfig) -> Result<f64> {
+    use scrt_evolve::LivingQueue;
+    let jc = cfg.judge.clone().unwrap_or_default();
+    let Some(steering) = cfg.compose_steering() else {
+        return Ok(1.0);
+    };
+    if jc.sample_k == 0 {
+        return Ok(1.0);
+    }
+    let queue = LivingQueue::from_config(cfg)?;
+    let sample: Vec<_> = queue.peek(jc.sample_k)?;
+    if sample.is_empty() {
+        return Ok(1.0);
+    }
+    let judge = build_pair_judge(cfg)?;
+    let n = sample.len();
+    let scores = scrt_evolve::judge::PairJudge::score(&judge, &sample, Some(&steering))?;
+    let compliant = scores.iter().filter(|s| **s >= jc.min_score).count();
+    Ok(compliant as f64 / n as f64)
+}
+
+/// `evolve dataset judge`: score an on-disk dataset, keep rows ≥ min_score,
+/// write dropped rows to a sidecar next to the dataset. Stage-independent.
+fn cmd_dataset_judge(
+    cfg: &EvolveConfig,
+    input: &Path,
+    out: Option<&PathBuf>,
+    min_score_override: Option<f32>,
+) -> Result<()> {
+    use scrt_evolve::Dataset;
+    let min_score = min_score_override
+        .unwrap_or_else(|| cfg.judge.clone().unwrap_or_default().min_score)
+        .clamp(0.0, 1.0);
+    let ds = Dataset::read_jsonl(input)?;
+    let total = ds.rows.len();
+    let judge = build_pair_judge(cfg)?;
+    let steering = cfg.compose_steering();
+    let judged = scrt_evolve::judge_rows(&judge, ds.rows, min_score, steering.as_deref())?;
+
+    let out_path = out.map(|p| p.as_path()).unwrap_or(input);
+    Dataset::new(judged.kept.clone()).write_jsonl(out_path)?;
+    // Sidecar of dropped rows for audit (next to the dataset).
+    if !judged.dropped.is_empty() {
+        let sidecar = input.with_extension("dropped.jsonl");
+        Dataset::new(judged.dropped.clone()).write_jsonl(&sidecar)?;
+    }
+    emit_json(serde_json::json!({
+        "command": "dataset-judge",
+        "in": input.display().to_string(),
+        "out": out_path.display().to_string(),
+        "total": total,
+        "kept": judged.kept.len(),
+        "dropped": judged.dropped.len(),
+        "min_score": min_score,
+        "status": "ok",
+    }));
+    Ok(())
+}
+
+/// `evolve dataset expand`: Evol/Self-Instruct volume synthesis over seed rows,
+/// each expanded row judged before admission. Stage-independent.
+fn cmd_dataset_expand(
+    cfg: &EvolveConfig,
+    input: &Path,
+    out: Option<&PathBuf>,
+    ops: &[String],
+) -> Result<()> {
+    use scrt_evolve::Dataset;
+    let ops: Vec<String> = if ops.is_empty() {
+        vec![
+            "deepen".to_string(),
+            "broaden".to_string(),
+            "concretize".to_string(),
+        ]
+    } else {
+        ops.to_vec()
+    };
+    let seeds = Dataset::read_jsonl(input)?;
+    let min_score = cfg.judge.clone().unwrap_or_default().min_score;
+    let judge = build_pair_judge(cfg)?;
+    let steering = cfg.compose_steering();
+
+    let expanded = scrt_evolve::expand_dataset(
+        &build_expand_transport(cfg)?,
+        &seeds.rows,
+        &ops,
+        &judge,
+        min_score,
+        steering.as_deref(),
+    )?;
+
+    // Append expanded rows to the existing dataset (or --out).
+    let mut all = seeds.rows.clone();
+    all.extend(expanded.clone());
+    let out_path = out.map(|p| p.as_path()).unwrap_or(input);
+    Dataset::new(all).write_jsonl(out_path)?;
+    emit_json(serde_json::json!({
+        "command": "dataset-expand",
+        "in": input.display().to_string(),
+        "out": out_path.display().to_string(),
+        "seeds": seeds.rows.len(),
+        "expanded_admitted": expanded.len(),
+        "ops": ops,
+        "status": "ok",
+    }));
+    Ok(())
+}
+
+/// The chat transport used for Evol/Self-Instruct expansion (same endpoint as
+/// generation).
+fn build_expand_transport(
+    cfg: &EvolveConfig,
+) -> Result<impl scrt_evolve::generate::api::ChatTransport> {
+    use scrt_evolve::generate::api::ApiEndpoint;
+    let gcfg = cfg
+        .generate
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("dataset expand needs a [generate.api] block"))?;
+    Ok(ApiEndpoint::from_config(&gcfg)?.into_transport())
 }
 
 /// Case-insensitive substring gate. Empty needles ⇒ always true (no filter).
@@ -3912,6 +4460,7 @@ fn collect_files(root: &std::path::Path, exts: &[&str]) -> Vec<PathBuf> {
 /// `teach` — enqueue an explicit prompt→completion onto the PRIORITY lane.
 fn cmd_teach(cfg: &EvolveConfig, prompt: &str, completion: &str) -> Result<()> {
     use scrt_evolve::{GenExample, Lane, LivingQueue};
+    use scrt_evolve::dataset::{Outcome, Tier, Verdict};
     let wd = WorkDir::from_config(cfg);
     wd.ensure()?;
     let queue = LivingQueue::from_config(cfg)?;
@@ -3920,6 +4469,11 @@ fn cmd_teach(cfg: &EvolveConfig, prompt: &str, completion: &str) -> Result<()> {
         completion: completion.to_string(),
         source: Some("teach".to_string()),
         gen: Some("teach".to_string()),
+        outcome: Outcome::Unknown,
+        judge_score: None,
+        judge_verdict: Verdict::Unjudged,
+        tier: Tier::Private,
+        chosen_over: None,
     };
     queue.enqueue(Lane::Priority, &example)?;
     let (prio, raw) = queue.pending();
@@ -4557,6 +5111,9 @@ fn cmd_branch_register(
     if let Some(c) = correctness {
         eval_report.insert("correctness".to_string(), c);
     }
+    // Track 37: roll the training-signal stats + sovereignty tier into the
+    // manifest (the lexame "marked expertise" fields a peer reads to trust it).
+    eval_report.extend(scrt_evolve::dataset_signal_stats(&ds.rows));
 
     let manifest = BranchManifest {
         name: name.to_string(),
@@ -4569,6 +5126,7 @@ fn cmd_branch_register(
         version: MANIFEST_VERSION.to_string(),
         gguf_sha: sha256_file(gguf)?,
         created: now_iso8601(),
+        tier: scrt_evolve::dataset_tier(&ds.rows),
     };
 
     // Persist the manifest alongside the GGUF (branch dir).
@@ -4768,7 +5326,7 @@ fn cmd_export(cfg: &EvolveConfig, data: Option<PathBuf>, model: Option<PathBuf>)
     let data_path = data.unwrap_or_else(|| wd.dataset_jsonl());
     if !data_path.exists() {
         anyhow::bail!(
-            "export: dataset not found at {} — run `scrt-evolve generate` first",
+            "export: dataset not found at {} — run `evolve train generate` first",
             data_path.display()
         );
     }
